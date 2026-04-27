@@ -348,6 +348,56 @@ confirm() {
     esac
 }
 
+# Ensures Python's `websockets` library is at version >= 13.
+# Background: tnode_telemetry.py uses the new server-handler signature
+# `async def handler(ws):` which only works with websockets >= 11. Older
+# versions (e.g. Ubuntu 22.04's `python3-websockets` apt package ships
+# 9.1) silently RESET incoming TCP connections without logging anything,
+# because the lib invokes the handler with an extra `path` arg and the
+# call fails before the WS upgrade completes. Symptom from the client
+# side: pair-QR scan times out / app shows "no se pudo conectar" with no
+# server-side log entry. Fix: pip-install >= 13 over the apt package.
+ensure_websockets_modern() {
+    local current
+    current="$(/usr/bin/env python3 -c 'import websockets; print(websockets.__version__)' 2>/dev/null || echo 'none')"
+    if [[ "$current" != "none" ]]; then
+        local major
+        major="$(echo "$current" | cut -d. -f1)"
+        if [[ "$major" =~ ^[0-9]+$ ]] && [[ "$major" -ge 13 ]]; then
+            success "websockets ${current} OK (>=13)"
+            return 0
+        fi
+        info "websockets ${current} es muy viejo — actualizando a >=13"
+    else
+        info "websockets no está instalado — instalando >=13"
+    fi
+
+    if ! /usr/bin/env python3 -m pip --version >/dev/null 2>&1; then
+        if command_exists apt-get; then
+            run_with_progress "Instalando python3-pip" --estimate 20 apt-get install -y python3-pip
+        elif command_exists dnf; then
+            run_with_progress "Instalando python3-pip" --estimate 20 dnf install -y python3-pip
+        elif command_exists yum; then
+            run_with_progress "Instalando python3-pip" --estimate 20 yum install -y python3-pip
+        elif [[ "$(uname)" == "Darwin" ]]; then
+            : # macOS python3 trae pip incluido
+        else
+            warn "No hay pip disponible — no se puede actualizar websockets"
+            return 1
+        fi
+    fi
+
+    # Try plain --upgrade first; fall back to --break-system-packages for
+    # PEP 668 (Ubuntu 24.04+, Debian 12+) where system Python is "managed".
+    /usr/bin/env python3 -m pip install --upgrade "websockets>=13,<14" >/dev/null 2>&1 \
+        || /usr/bin/env python3 -m pip install --upgrade --break-system-packages "websockets>=13,<14" >/dev/null 2>&1 \
+        || { warn "No se pudo actualizar websockets — tnode-telemetry no aceptará conexiones"; return 1; }
+
+    local installed
+    installed="$(/usr/bin/env python3 -c 'import websockets; print(websockets.__version__)' 2>&1)"
+    success "websockets actualizado a ${installed}"
+}
+
 # Resolve Homebrew binary
 resolve_brew() {
     local brew=""
@@ -793,6 +843,9 @@ ensure_nodejs() {
             else
                 die "No se encontró package manager (apt/dnf/yum) para instalar Node.js"
             fi
+            # Distro `python3-websockets` packages are often stuck on 9.x —
+            # force-upgrade so the telemetry sidecar can accept WS clients.
+            ensure_websockets_modern
             ;;
     esac
 
@@ -4301,6 +4354,14 @@ HEALTH_STREAM = "health"
 HEALTH_VERSION = 2
 HEALTH_TICK_SEC = float(os.environ.get("TNODE_TELEMETRY_HEALTH_TICK_SEC", "15"))
 
+# TODO Channels v1 → CHANNELS_PROTOCOL_v1.md §2
+# CHANNELS_STREAM = "channels"
+# CHANNELS_VERSION = 1
+# WA_PAIR_PATH = os.environ.get("TNODE_WA_PAIR_PATH", str(OPENCLAW_HOME / "wa-pair" / "wa-pair.js"))
+# WA_AUTH_DIR = OPENCLAW_HOME / "credentials" / "whatsapp" / "default"
+# WA_STATE_FILE = WA_AUTH_DIR / "state.json"
+# WA_PAIR_TIMEOUT_SEC = 180
+
 SESSIONS_STORE_FILE = SESSIONS_DIR / "sessions.json"
 
 
@@ -4481,6 +4542,12 @@ class TelemetryProxy:
         self._auth: Optional[Dict[str, str]] = None
         self._or_cache: Optional[Dict[str, Any]] = None
         self._health_cache: Optional[Dict[str, Any]] = None
+        # TODO Channels v1 → CHANNELS_PROTOCOL_v1.md §4
+        # self._channels_state: Dict[str, Any] = _load_channels_state()
+        # self._channels_cache: Optional[Dict[str, Any]] = None
+        # self._wa_pair_proc: Optional[asyncio.subprocess.Process] = None
+        # self._wa_pair_task: Optional[asyncio.Task] = None
+        # self._wa_pair_lock = asyncio.Lock()
 
     async def start_background(self) -> None:
         self._accumulator.bootstrap()
@@ -4510,8 +4577,17 @@ class TelemetryProxy:
                 "psutil not installed — `health` stream disabled. "
                 "Install with: apt install python3-psutil"
             )
+        # TODO Channels v1 → CHANNELS_PROTOCOL_v1.md §4
+        # No periodic loop — channels is event-driven (RPC-triggered).
+        # On boot we just hydrate the in-memory state from state.json
+        # so initial_snapshots() can serve a `linked` snapshot to
+        # incoming clients without waiting for any event.
+        # self._channels_cache = build_channels_event(self._channels_state, snapshot=True)
 
     async def stop_background(self) -> None:
+        # TODO Channels v1 → kill self._wa_pair_proc if running, then await
+        # self._wa_pair_task. State on disk persists; the next boot will
+        # snapshot whatever was last `linked` or fall back to `unlinked`.
         for task in (
             self._tail_task,
             self._refresh_task,
@@ -4669,6 +4745,12 @@ class TelemetryProxy:
         ))
         if self._health_cache is not None:
             snaps.append(self._health_cache)
+        # TODO Channels v1 → CHANNELS_PROTOCOL_v1.md §5
+        # Always include the channels snapshot — even when state is
+        # `unlinked` we want the client to render the empty card immediately
+        # rather than fall back to defaults.
+        # if self._channels_cache is not None:
+        #     snaps.append(self._channels_cache)
         return snaps
 
 
@@ -4734,6 +4816,15 @@ class ClientSession:
     async def _forward(self, src, dst, direction: str) -> None:
         try:
             async for message in src:
+                # TODO Channels v1 → CHANNELS_PROTOCOL_v1.md §3
+                # Only on the upstream direction (c→u) inspect for
+                # `{"type":"rpc","method":"channels.*"}`. If matched, dispatch
+                # to self._proxy.handle_channels_rpc(method, params) and
+                # send back the rpc-response/rpc-error to self._client
+                # WITHOUT forwarding the message to the gateway. Any other
+                # message (or u→c direction) keeps the current passthrough.
+                # Keep the parse cheap and tolerant — non-JSON or non-rpc
+                # frames must fall through unchanged.
                 await dst.send(message)
         except ConnectionClosed:
             pass

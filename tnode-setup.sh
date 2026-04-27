@@ -348,6 +348,56 @@ confirm() {
     esac
 }
 
+# Ensures Python's `websockets` library is at version >= 13.
+# Background: tnode_telemetry.py uses the new server-handler signature
+# `async def handler(ws):` which only works with websockets >= 11. Older
+# versions (e.g. Ubuntu 22.04's `python3-websockets` apt package ships
+# 9.1) silently RESET incoming TCP connections without logging anything,
+# because the lib invokes the handler with an extra `path` arg and the
+# call fails before the WS upgrade completes. Symptom from the client
+# side: pair-QR scan times out / app shows "no se pudo conectar" with no
+# server-side log entry. Fix: pip-install >= 13 over the apt package.
+ensure_websockets_modern() {
+    local current
+    current="$(/usr/bin/env python3 -c 'import websockets; print(websockets.__version__)' 2>/dev/null || echo 'none')"
+    if [[ "$current" != "none" ]]; then
+        local major
+        major="$(echo "$current" | cut -d. -f1)"
+        if [[ "$major" =~ ^[0-9]+$ ]] && [[ "$major" -ge 13 ]]; then
+            success "websockets ${current} OK (>=13)"
+            return 0
+        fi
+        info "websockets ${current} es muy viejo — actualizando a >=13"
+    else
+        info "websockets no está instalado — instalando >=13"
+    fi
+
+    if ! /usr/bin/env python3 -m pip --version >/dev/null 2>&1; then
+        if command_exists apt-get; then
+            run_with_progress "Instalando python3-pip" --estimate 20 apt-get install -y python3-pip
+        elif command_exists dnf; then
+            run_with_progress "Instalando python3-pip" --estimate 20 dnf install -y python3-pip
+        elif command_exists yum; then
+            run_with_progress "Instalando python3-pip" --estimate 20 yum install -y python3-pip
+        elif [[ "$(uname)" == "Darwin" ]]; then
+            : # macOS python3 trae pip incluido
+        else
+            warn "No hay pip disponible — no se puede actualizar websockets"
+            return 1
+        fi
+    fi
+
+    # Try plain --upgrade first; fall back to --break-system-packages for
+    # PEP 668 (Ubuntu 24.04+, Debian 12+) where system Python is "managed".
+    /usr/bin/env python3 -m pip install --upgrade "websockets>=13,<14" >/dev/null 2>&1 \
+        || /usr/bin/env python3 -m pip install --upgrade --break-system-packages "websockets>=13,<14" >/dev/null 2>&1 \
+        || { warn "No se pudo actualizar websockets — tnode-telemetry no aceptará conexiones"; return 1; }
+
+    local installed
+    installed="$(/usr/bin/env python3 -c 'import websockets; print(websockets.__version__)' 2>&1)"
+    success "websockets actualizado a ${installed}"
+}
+
 # Resolve Homebrew binary
 resolve_brew() {
     local brew=""
@@ -793,6 +843,9 @@ ensure_nodejs() {
             else
                 die "No se encontró package manager (apt/dnf/yum) para instalar Node.js"
             fi
+            # Distro `python3-websockets` packages are often stuck on 9.x —
+            # force-upgrade so the telemetry sidecar can accept WS clients.
+            ensure_websockets_modern
             ;;
     esac
 
@@ -3919,13 +3972,9 @@ install_tnode_telemetry() {
 
 install_telemetry_launchd() {
     # macOS path (Mini etc). The websockets module isn't shipped with
-    # Apple's Python; best-effort install into user site-packages.
-    if ! /usr/bin/env python3 -c "import websockets" >/dev/null 2>&1; then
-        info "Instalando websockets (pip3) para tnode-telemetry..."
-        /usr/bin/env python3 -m pip install --user websockets >/dev/null 2>&1 \
-            || /usr/bin/env python3 -m pip install --break-system-packages websockets >/dev/null 2>&1 \
-            || warn "No se pudo instalar 'websockets' — tnode-telemetry no arrancará hasta instalarlo manualmente"
-    fi
+    # Apple's Python — ensure_websockets_modern handles install + version
+    # validation (>=13 required, see comment on the function).
+    ensure_websockets_modern
 
     local plist_label="com.tbrain.tnode-telemetry"
     local plist_dest="$HOME/Library/LaunchAgents/${plist_label}.plist"
