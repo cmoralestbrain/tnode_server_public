@@ -913,7 +913,9 @@ ensure_nodejs() {
     fi
 }
 
-# Set the model in OpenClaw config (agents.defaults.model.primary)
+# Activate a model in OpenClaw config via agents.defaults.models = {id: {}}.
+# The plural-dict form is required by OpenClaw v2026.4.24+; the legacy
+# singular `model.primary` triggers `Unknown model` for non-registry ids.
 configure_openclaw_model() {
     local model_value="$1"
     local oc_config="$OPENCLAW_HOME/openclaw.json"
@@ -923,7 +925,6 @@ configure_openclaw_model() {
         return 0
     fi
 
-    # Use Python to safely modify nested JSON config
     if command_exists python3; then
         python3 - "$oc_config" "$model_value" <<'PYEOF'
 import json, sys
@@ -931,15 +932,15 @@ config_path, model = sys.argv[1], sys.argv[2]
 try:
     with open(config_path) as f:
         c = json.load(f)
-    # Navigate/create nested path: agents.defaults.model.primary
     agents = c.setdefault("agents", {})
     defaults = agents.setdefault("defaults", {})
-    model_cfg = defaults.setdefault("model", {})
-    old_model = model_cfg.get("primary", "(none)")
-    model_cfg["primary"] = model
+    old_models = list((defaults.get("models") or {}).keys())
+    defaults["models"] = {model: {}}
+    defaults.pop("model", None)  # drop legacy singular key if present
     with open(config_path, "w") as f:
         json.dump(c, f, indent=2)
-    print(f"{old_model} → {model}")
+    old_str = ", ".join(old_models) if old_models else "(none)"
+    print(f"{old_str} → {model}")
 except Exception as e:
     print(f"error: {e}", file=sys.stderr)
     sys.exit(1)
@@ -1485,11 +1486,27 @@ except Exception:
 
         if [[ -n "$gw_token" ]]; then
             local server_url="wss://${TUNNEL_DOMAIN}/ws"
+            # tunnelId (CF UUID) is needed by `deleteAgent` to deprovision the
+            # tunnel cleanly. Read from tunnel.json (written in phase 4b).
+            local tunnel_uuid=""
+            local tunnel_json_path="$OPENCLAW_HOME/tunnel.json"
+            if command -v python3 >/dev/null 2>&1 && [[ -r "$tunnel_json_path" ]]; then
+                tunnel_uuid=$(python3 -c "
+import json
+try:
+    with open('$tunnel_json_path') as f:
+        d = json.load(f)
+    print(d.get('tunnelId') or '')
+except Exception:
+    pass
+" 2>/dev/null || echo "")
+            fi
             local extra_json
             extra_json=$(python3 -c "
 import json
 print(json.dumps({
     'tunnelDomain': '$TUNNEL_DOMAIN',
+    'tunnelId':     '$tunnel_uuid',
     'gatewayToken': '$gw_token',
     'serverUrl':    '$server_url',
 }))
@@ -3006,10 +3023,12 @@ def _apply_provider_to_openclaw(
 ) -> dict:
     """Merge/update a provider block inside openclaw.json. Returns updated cfg.
 
-    Note: we intentionally do NOT set `agents.defaults.model.primary`. OpenClaw
-    auto-selects the first provider with a valid apiKey, which is what VPS 1
-    runs with and works. Setting primary explicitly causes `Unknown model`
-    because OpenClaw expects an internal registry id.
+    Also activates the model via `agents.defaults.models = {model: {}}` (plural
+    dict). OpenClaw v2026.4.24+ no longer auto-selects: without this dict the
+    gateway falls back to the hardcoded `openai/gpt-5.5` and fails with
+    `No API key found for provider "openai"`. Must be the plural form — the
+    singular `agents.defaults.model.primary` triggers `Unknown model` for any
+    id outside OpenClaw's internal registry (e.g. `qwen/qwen3.6-plus`).
     """
     cfg = read_openclaw_json() or {}
     cfg.setdefault("models", {}).setdefault("providers", {})
@@ -3025,6 +3044,9 @@ def _apply_provider_to_openclaw(
             }
         ],
     }
+    agents_defaults = cfg.setdefault("agents", {}).setdefault("defaults", {})
+    agents_defaults["models"] = {model: {}}
+    agents_defaults.pop("model", None)  # drop legacy singular key
     _write_openclaw_json(cfg)
     return cfg
 
