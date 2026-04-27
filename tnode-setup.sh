@@ -4845,13 +4845,15 @@ class MindError(Exception):
 
 def _resolve_mind_dir() -> Optional[Path]:
     """Locate the directory holding the agent's `.md` files. Tries, in
-    order: an explicit override, the conventional `agents/main` and
-    `workspace/agents/main` paths, and finally the first `workspace/agents/*`
-    that contains at least one `.md`."""
+    order: an explicit override, the OpenClaw workspace root (where the
+    main agent's SOUL/IDENTITY/MEMORY/HEARTBEAT etc. actually live), the
+    conventional `agents/main` paths, and finally the first
+    `workspace/agents/*` subdir that contains at least one `.md`."""
     if MIND_DIR_OVERRIDE:
         p = Path(MIND_DIR_OVERRIDE)
         return p if p.is_dir() else None
     candidates = [
+        OPENCLAW_HOME / "workspace",
         OPENCLAW_HOME / "agents" / "main",
         OPENCLAW_HOME / "workspace" / "agents" / "main",
     ]
