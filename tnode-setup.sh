@@ -372,30 +372,78 @@ ensure_websockets_modern() {
         info "websockets no está instalado — instalando >=13"
     fi
 
+    # 1) Ensure pip is available — install directly (no run_with_progress) so
+    # apt/dnf/yum failures surface their real exit code instead of being
+    # hidden behind a spinner that always reports "OK".
     if ! /usr/bin/env python3 -m pip --version >/dev/null 2>&1; then
+        info "Instalando python3-pip (necesario para upgrade de websockets)..."
+        local pip_install_log
+        pip_install_log="$(mktemp)"
+        local pip_install_rc=0
         if command_exists apt-get; then
-            run_with_progress "Instalando python3-pip" --estimate 20 apt-get install -y python3-pip
+            DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip >"$pip_install_log" 2>&1 || pip_install_rc=$?
         elif command_exists dnf; then
-            run_with_progress "Instalando python3-pip" --estimate 20 dnf install -y python3-pip
+            dnf install -y python3-pip >"$pip_install_log" 2>&1 || pip_install_rc=$?
         elif command_exists yum; then
-            run_with_progress "Instalando python3-pip" --estimate 20 yum install -y python3-pip
+            yum install -y python3-pip >"$pip_install_log" 2>&1 || pip_install_rc=$?
         elif [[ "$(uname)" == "Darwin" ]]; then
             : # macOS python3 trae pip incluido
         else
-            warn "No hay pip disponible — no se puede actualizar websockets"
-            return 1
+            rm -f "$pip_install_log"
+            die "No hay package manager (apt/dnf/yum) — instala python3-pip manualmente y reintenta"
         fi
+        if [[ "$pip_install_rc" -ne 0 ]]; then
+            warn "package install de python3-pip falló (exit ${pip_install_rc}). Últimas líneas:"
+            tail -10 "$pip_install_log" >&2 || true
+            rm -f "$pip_install_log"
+            die "No se pudo instalar python3-pip — websockets no se puede actualizar y el sidecar fallará"
+        fi
+        rm -f "$pip_install_log"
+        # Validate: check the install actually produced a working pip. apt
+        # sometimes reports success without doing anything (stale dpkg lock,
+        # bad mirror state) — catch that here instead of letting it cascade.
+        if ! /usr/bin/env python3 -m pip --version >/dev/null 2>&1; then
+            die "python3-pip se instaló sin error, pero 'python3 -m pip' sigue sin responder. Revisa el state de apt/dpkg"
+        fi
+        success "python3-pip OK"
     fi
 
-    # Try plain --upgrade first; fall back to --break-system-packages for
-    # PEP 668 (Ubuntu 24.04+, Debian 12+) where system Python is "managed".
-    /usr/bin/env python3 -m pip install --upgrade "websockets>=13,<14" >/dev/null 2>&1 \
-        || /usr/bin/env python3 -m pip install --upgrade --break-system-packages "websockets>=13,<14" >/dev/null 2>&1 \
-        || { warn "No se pudo actualizar websockets — tnode-telemetry no aceptará conexiones"; return 1; }
+    # 2) pip-install websockets. Try plain --upgrade first; fall back to
+    # --break-system-packages for PEP 668 (Ubuntu 24.04+, Debian 12+) where
+    # system Python is marked "externally managed".
+    info "Actualizando websockets vía pip..."
+    local ws_install_log
+    ws_install_log="$(mktemp)"
+    local ws_install_rc=0
+    /usr/bin/env python3 -m pip install --upgrade "websockets>=13,<14" >"$ws_install_log" 2>&1 || ws_install_rc=$?
+    if [[ "$ws_install_rc" -ne 0 ]] && grep -q "externally-managed-environment" "$ws_install_log"; then
+        info "Reintentando con --break-system-packages (PEP 668)"
+        ws_install_rc=0
+        /usr/bin/env python3 -m pip install --upgrade --break-system-packages "websockets>=13,<14" >"$ws_install_log" 2>&1 || ws_install_rc=$?
+    fi
+    if [[ "$ws_install_rc" -ne 0 ]]; then
+        warn "pip install websockets falló (exit ${ws_install_rc}). Últimas líneas:"
+        tail -10 "$ws_install_log" >&2 || true
+        rm -f "$ws_install_log"
+        die "No se pudo actualizar websockets a >=13 — el sidecar tnode-telemetry resetará todas las conexiones del cliente"
+    fi
+    rm -f "$ws_install_log"
 
-    local installed
-    installed="$(/usr/bin/env python3 -c 'import websockets; print(websockets.__version__)' 2>&1)"
-    success "websockets actualizado a ${installed}"
+    # 3) Validate the install actually landed. pip can report success while
+    # leaving an old shadow copy first in sys.path (e.g. apt's
+    # python3-websockets in /usr/lib/python3/dist-packages takes precedence
+    # over /usr/local/lib/... on some distros). Confirm what tnode user sees.
+    local final_version
+    final_version="$(/usr/bin/env python3 -c 'import websockets; print(websockets.__version__)' 2>/dev/null || echo 'none')"
+    if [[ "$final_version" == "none" ]]; then
+        die "Tras pip install, 'import websockets' falla. Revisa sys.path con: python3 -c 'import sys; print(sys.path)'"
+    fi
+    local final_major
+    final_major="$(echo "$final_version" | cut -d. -f1)"
+    if [[ ! "$final_major" =~ ^[0-9]+$ ]] || [[ "$final_major" -lt 13 ]]; then
+        die "Tras pip install, websockets sigue en ${final_version}. Probablemente apt's python3-websockets está shadowing el pip install — desinstala con: apt remove -y python3-websockets"
+    fi
+    success "websockets actualizado a ${final_version}"
 }
 
 # Resolve Homebrew binary
