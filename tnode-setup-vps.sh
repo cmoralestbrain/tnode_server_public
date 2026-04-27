@@ -926,10 +926,17 @@ try:
         # No tunnel: listen on all interfaces (for Tailscale/LAN access)
         gw["bind"] = "lan"
     gw["mode"] = "local"
-    # Ensure auth token mode is set
+    # Ensure auth token mode is set, AND a token actually exists. The
+    # OpenClaw gateway requires both: setting mode without a token leaves
+    # the gateway in a state where it rejects every request with
+    # "Gateway auth is set to token, but no token is configured", which
+    # blocks `tnode-qr` and any pairing flow. Generate a fresh 48-hex-char
+    # token (24 bytes) when missing — same shape used by older installs.
+    import secrets
     auth = gw.setdefault("auth", {})
-    if not auth.get("mode"):
-        auth["mode"] = "token"
+    auth.setdefault("mode", "token")
+    if auth.get("mode") == "token" and not auth.get("token"):
+        auth["token"] = secrets.token_hex(24)
     with open(config_path, "w") as f:
         json.dump(c, f, indent=2)
     bind_mode = "loopback (tunnel)" if use_tunnel else "lan"
