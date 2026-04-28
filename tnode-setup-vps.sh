@@ -4861,6 +4861,171 @@ class TelemetryProxy:
         return snaps
 
 
+# ── Mind RPC handlers ────────────────────────────────────────────────
+#
+# Intercepts `mind.list / mind.read / mind.write` RPCs from the downstream
+# client and answers them locally instead of proxying to the OpenClaw
+# kernel. The agent's editable .md files (SOUL, IDENTITY, MEMORY, …) live
+# in the agent's workspace dir; we discover the right one at request time.
+
+MIND_DIR_OVERRIDE = os.environ.get("TNODE_TELEMETRY_MIND_DIR")
+_MIND_READ_ONLY_NAMES = {"HEARTBEAT.MD"}
+
+
+class MindError(Exception):
+    """Application-level mind RPC error. The `code` ends up in the
+    `rpc-response.error.code` field so the client can branch on it
+    (e.g. `hash-mismatch` triggers the 3-way conflict UI)."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _resolve_mind_dir() -> Optional[Path]:
+    """Locate the directory holding the agent's `.md` files. Tries, in
+    order: an explicit override, the OpenClaw workspace root (where the
+    main agent's SOUL/IDENTITY/MEMORY/HEARTBEAT etc. actually live), the
+    conventional `agents/main` paths, and finally the first
+    `workspace/agents/*` subdir that contains at least one `.md`."""
+    if MIND_DIR_OVERRIDE:
+        p = Path(MIND_DIR_OVERRIDE)
+        return p if p.is_dir() else None
+    candidates = [
+        OPENCLAW_HOME / "workspace",
+        OPENCLAW_HOME / "agents" / "main",
+        OPENCLAW_HOME / "workspace" / "agents" / "main",
+    ]
+    for c in candidates:
+        if c.is_dir() and any(c.glob("*.md")):
+            return c
+    ws_agents = OPENCLAW_HOME / "workspace" / "agents"
+    if ws_agents.is_dir():
+        for child in sorted(ws_agents.iterdir()):
+            if child.is_dir() and any(child.glob("*.md")):
+                return child
+    return None
+
+
+def _safe_mind_path(name: str, mind_dir: Path) -> Optional[Path]:
+    """Return mind_dir/name only if name is a safe `.md` basename. Rejects
+    path separators, dotfiles, traversal segments, and files outside the
+    resolved mind_dir."""
+    if not name or "/" in name or "\\" in name or name.startswith("."):
+        return None
+    if ".." in name:
+        return None
+    if not name.lower().endswith(".md"):
+        return None
+    try:
+        resolved_dir = mind_dir.resolve()
+        p = (mind_dir / name).resolve()
+        p.relative_to(resolved_dir)
+    except (OSError, ValueError):
+        return None
+    return p
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _is_mind_read_only(name: str) -> bool:
+    return name.upper() in _MIND_READ_ONLY_NAMES
+
+
+def _mind_file_meta(p: Path, content: str) -> Dict[str, Any]:
+    st = p.stat()
+    return {
+        "name": p.name,
+        "size": st.st_size,
+        "modifiedAt": int(st.st_mtime * 1000),
+        "hash": _sha256_text(content),
+        "isReadOnly": _is_mind_read_only(p.name),
+    }
+
+
+def _mind_list(mind_dir: Path) -> Dict[str, Any]:
+    files = []
+    for p in sorted(mind_dir.glob("*.md")):
+        if p.name.startswith("."):
+            continue
+        try:
+            content = p.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning("mind.list skipping %s: %s", p, e)
+            continue
+        files.append(_mind_file_meta(p, content))
+    return {"files": files}
+
+
+def _mind_read(mind_dir: Path, name: str) -> Dict[str, Any]:
+    p = _safe_mind_path(name, mind_dir)
+    if p is None or not p.is_file():
+        raise MindError("not-found", f"File {name!r} not found")
+    content = p.read_text(encoding="utf-8")
+    out = _mind_file_meta(p, content)
+    out["content"] = content
+    return out
+
+
+def _mind_write(
+    mind_dir: Path,
+    name: str,
+    content: str,
+    base_hash: Optional[str],
+    note: Optional[str],
+) -> Dict[str, Any]:
+    p = _safe_mind_path(name, mind_dir)
+    if p is None:
+        raise MindError("invalid-name", f"Invalid file name {name!r}")
+    if _is_mind_read_only(p.name):
+        raise MindError("forbidden", f"{p.name} is read-only")
+    if not p.is_file():
+        raise MindError("not-found", f"File {name!r} not found")
+    current = p.read_text(encoding="utf-8")
+    current_hash = _sha256_text(current)
+    if base_hash and base_hash != current_hash:
+        raise MindError(
+            "hash-mismatch",
+            "File changed in the agent since the editor opened it",
+        )
+    # Atomic replace: write to .tmp, then rename. Avoids partial-write
+    # corruption if the daemon is killed mid-save.
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, p)
+    new_meta = _mind_file_meta(p, content)
+    logger.info(
+        "mind.write %s (%d bytes, note=%r)",
+        p.name, new_meta["size"], note,
+    )
+    return {"ok": True, **new_meta}
+
+
+def _dispatch_mind(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    mind_dir = _resolve_mind_dir()
+    if mind_dir is None:
+        raise MindError(
+            "mind-dir-missing",
+            "No mind directory found on this node",
+        )
+    if method == "mind.list":
+        return _mind_list(mind_dir)
+    if method == "mind.read":
+        return _mind_read(mind_dir, str(params.get("name", "")))
+    if method == "mind.write":
+        return _mind_write(
+            mind_dir,
+            str(params.get("name", "")),
+            str(params.get("content", "")),
+            params.get("baseHash"),
+            params.get("note"),
+        )
+    raise MindError("unknown-method", f"Unknown method {method!r}")
+
+
 class ClientSession:
     """A single downstream client (app WebSocket) paired with an upstream
     connection to the openclaw-gateway. Proxies frames transparently and
@@ -4923,6 +5088,10 @@ class ClientSession:
     async def _forward(self, src, dst, direction: str) -> None:
         try:
             async for message in src:
+                if direction == "c→u" and await self._maybe_handle_mind_rpc(
+                    message
+                ):
+                    continue
                 # TODO Channels v1 → CHANNELS_PROTOCOL_v1.md §3
                 # Only on the upstream direction (c→u) inspect for
                 # `{"type":"rpc","method":"channels.*"}`. If matched, dispatch
@@ -4935,6 +5104,57 @@ class ClientSession:
                 await dst.send(message)
         except ConnectionClosed:
             pass
+
+    async def _maybe_handle_mind_rpc(self, message: Any) -> bool:
+        """If `message` is a `mind.*` RPC, answer it locally and return True
+        so the caller skips the upstream forward. Anything else returns
+        False and is proxied as before."""
+        if not isinstance(message, str):
+            return False
+        try:
+            frame = json.loads(message)
+        except (ValueError, TypeError):
+            return False
+        if not isinstance(frame, dict):
+            return False
+        if frame.get("type") != "req":
+            return False
+        method = frame.get("method")
+        if not isinstance(method, str) or not method.startswith("mind."):
+            return False
+        req_id = frame.get("id", "")
+        raw_params = frame.get("params") or {}
+        params = raw_params if isinstance(raw_params, dict) else {}
+        try:
+            payload = _dispatch_mind(method, params)
+            response = {
+                "type": "res",
+                "id": req_id,
+                "ok": True,
+                "payload": payload,
+            }
+        except MindError as e:
+            response = {
+                "type": "res",
+                "id": req_id,
+                "ok": False,
+                "error": {"code": e.code, "message": e.message},
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.exception("mind rpc %s failed", method)
+            response = {
+                "type": "res",
+                "id": req_id,
+                "ok": False,
+                "error": {"code": "internal", "message": str(e)},
+            }
+        try:
+            await self.send_downstream(
+                json.dumps(response, separators=(",", ":"))
+            )
+        except ConnectionClosed:
+            pass
+        return True
 
 
 # ── Entrypoint ────────────────────────────────────────────────────────
