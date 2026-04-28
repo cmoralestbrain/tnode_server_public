@@ -91,6 +91,12 @@ unset _p
 
 TNODE_SETUP_VERSION="1.7.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
+# Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
+# auto-pair regression where the gateway responds 1008 to unknown devices
+# even with a valid Ed25519 signature + master token, blocking cloud
+# provisioning E2E. Override with `OPENCLAW_PIN_VERSION=` (empty) to take
+# whatever is current.
+OPENCLAW_PIN_VERSION="${OPENCLAW_PIN_VERSION-2026.4.23}"
 TNODE_USER="tnode"
 TNODE_HOME=""      # set in setup_tnode_user()
 OPENCLAW_HOME=""   # set in setup_tnode_user()
@@ -1095,21 +1101,34 @@ phase_openclaw() {
     fi
 
     local openclaw_ok=0
+    local oc_ver=""
     if command_exists openclaw && openclaw --version >/dev/null 2>&1; then
+        oc_ver="$(openclaw --version 2>&1 | head -1 || echo "?")"
         openclaw_ok=1
     fi
 
+    # When pinned, demand exact match. Anything else (older or newer) gets
+    # reinstalled via npm@$OPENCLAW_PIN_VERSION.
+    if [[ "$openclaw_ok" == "1" && -n "$OPENCLAW_PIN_VERSION" ]] \
+       && ! grep -qF "$OPENCLAW_PIN_VERSION" <<<"$oc_ver"; then
+        info "OpenClaw $oc_ver no coincide con pin $OPENCLAW_PIN_VERSION — reinstalando"
+        openclaw_ok=0
+    fi
+
     if [[ "$openclaw_ok" == "1" ]]; then
-        local oc_ver
-        oc_ver="$(openclaw --version 2>&1 | head -1 || echo "?")"
         success "OpenClaw ya instalado: $oc_ver"
         if [[ "$NO_OLLAMA" == "0" ]]; then
             info "Reconfigurando modelo → ollama/$MODEL"
             ollama launch openclaw --model "$MODEL" --yes 2>&1 | tail -5 || true
         fi
     else
-        # Step 3: Install OpenClaw
-        if [[ "$NO_OLLAMA" == "0" ]] && command_exists ollama; then
+        # Step 3: Install OpenClaw.
+        # When pinned, the `ollama launch` path is skipped because it
+        # always pulls whatever is current — bypassing the pin. We go
+        # straight to npm with an explicit version. With pin disabled,
+        # the original ollama-then-npm fallback chain runs.
+        if [[ -z "$OPENCLAW_PIN_VERSION" && "$NO_OLLAMA" == "0" ]] \
+           && command_exists ollama; then
             info "Instalando OpenClaw via ollama launch..."
             if run_with_progress "ollama launch openclaw" --estimate 60 ollama launch openclaw --model "$MODEL" --yes; then
                 hash -r 2>/dev/null || true
@@ -1118,11 +1137,22 @@ phase_openclaw() {
             fi
         fi
 
-        # Fallback: npm install if ollama launch didn't work
+        # npm install (always when pinned; fallback otherwise).
         hash -r 2>/dev/null || true
+        local need_npm_install=0
         if ! command_exists openclaw || ! openclaw --version >/dev/null 2>&1; then
+            need_npm_install=1
+        elif [[ -n "$OPENCLAW_PIN_VERSION" ]] \
+             && ! grep -qF "$OPENCLAW_PIN_VERSION" <<<"$(openclaw --version 2>&1 | head -1)"; then
+            need_npm_install=1
+        fi
+        if [[ "$need_npm_install" == "1" ]]; then
             if command_exists npm; then
-                run_with_progress "Instalando TNode Kernel via npm" --estimate 45 npm install -g openclaw
+                local npm_target="openclaw"
+                if [[ -n "$OPENCLAW_PIN_VERSION" ]]; then
+                    npm_target="openclaw@$OPENCLAW_PIN_VERSION"
+                fi
+                run_with_progress "Instalando TNode Kernel via npm ($npm_target)" --estimate 45 npm install -g "$npm_target"
                 hash -r 2>/dev/null || true
             else
                 warn "npm no disponible — no se puede instalar OpenClaw"
