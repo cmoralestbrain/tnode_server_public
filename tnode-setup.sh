@@ -5020,6 +5020,121 @@ def _dispatch_mind(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
     raise MindError("unknown-method", f"Unknown method {method!r}")
 
 
+# ── agent.model.* RPC ─────────────────────────────────────────────────
+
+
+class AgentError(Exception):
+    """Application-level agent RPC error. The `code` ends up in the
+    `rpc-response.error.code` field so the client can branch on it."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _load_openclaw_json() -> Dict[str, Any]:
+    if not OPENCLAW_JSON.is_file():
+        raise AgentError("openclaw-json-missing", f"missing {OPENCLAW_JSON}")
+    try:
+        return json.loads(OPENCLAW_JSON.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise AgentError("openclaw-json-read", str(e))
+
+
+def _save_openclaw_json_atomic(config: Dict[str, Any]) -> None:
+    tmp = OPENCLAW_JSON.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(
+            json.dumps(config, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(tmp, OPENCLAW_JSON)
+    except OSError as e:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise AgentError("openclaw-json-write", str(e))
+
+
+def _find_agent(config: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
+    lst = config.get("agents", {}).get("list", [])
+    if not isinstance(lst, list):
+        raise AgentError("agent-list-malformed", "agents.list is not an array")
+    for a in lst:
+        if isinstance(a, dict) and a.get("id") == agent_id:
+            return a
+    raise AgentError("agent-not-found", f"agent {agent_id!r} not in config")
+
+
+def _reload_gateway() -> bool:
+    """Best-effort restart of openclaw-gateway. Tries `openclaw daemon
+    restart` first (portable across home/VPS), falls back to systemctl.
+    Returns True on success — RPC still succeeds if reload fails because
+    config is already on disk and applies on next boot."""
+    import subprocess
+    candidates = [
+        ["openclaw", "daemon", "restart"],
+        ["systemctl", "--user", "restart", "openclaw-gateway"],
+        ["sudo", "-n", "systemctl", "restart", "openclaw-gateway"],
+    ]
+    for cmd in candidates:
+        try:
+            result = subprocess.run(
+                cmd, check=False, capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 0:
+                logger.info("gateway reload OK via %s", cmd[0])
+                return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    logger.warning("gateway reload failed — config will apply on next boot")
+    return False
+
+
+def _agent_model_get(agent_id: str) -> Dict[str, Any]:
+    config = _load_openclaw_json()
+    agent = _find_agent(config, agent_id)
+    model = agent.get("model") or {}
+    return {
+        "agentId": agent_id,
+        "primary": model.get("primary"),
+        "fallbacks": list(model.get("fallbacks") or []),
+    }
+
+
+def _agent_model_set(agent_id: str, model_slug: str) -> Dict[str, Any]:
+    if not isinstance(model_slug, str) or "/" not in model_slug:
+        raise AgentError(
+            "invalid-model-slug",
+            f"model must be 'provider/model', got {model_slug!r}",
+        )
+    config = _load_openclaw_json()
+    agent = _find_agent(config, agent_id)
+    if not isinstance(agent.get("model"), dict):
+        agent["model"] = {}
+    agent["model"]["primary"] = model_slug
+    _save_openclaw_json_atomic(config)
+    reload_ok = _reload_gateway()
+    logger.info("agent.model.set %s → %s (reload=%s)", agent_id, model_slug, reload_ok)
+    return {
+        "agentId": agent_id,
+        "primary": model_slug,
+        "fallbacks": list(agent["model"].get("fallbacks") or []),
+        "gatewayReloaded": reload_ok,
+    }
+
+
+def _dispatch_agent(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    agent_id = str(params.get("agentId") or "main")
+    if method == "agent.model.get":
+        return _agent_model_get(agent_id)
+    if method == "agent.model.set":
+        return _agent_model_set(agent_id, str(params.get("model", "")))
+    raise AgentError("unknown-method", f"unknown method {method!r}")
+
+
 class ClientSession:
     """A single downstream client (app WebSocket) paired with an upstream
     connection to the openclaw-gateway. Proxies frames transparently and
@@ -5082,10 +5197,11 @@ class ClientSession:
     async def _forward(self, src, dst, direction: str) -> None:
         try:
             async for message in src:
-                if direction == "c→u" and await self._maybe_handle_mind_rpc(
-                    message
-                ):
-                    continue
+                if direction == "c→u":
+                    if await self._maybe_handle_mind_rpc(message):
+                        continue
+                    if await self._maybe_handle_agent_rpc(message):
+                        continue
                 await dst.send(message)
         except ConnectionClosed:
             pass
@@ -5127,6 +5243,57 @@ class ClientSession:
             }
         except Exception as e:  # noqa: BLE001
             logger.exception("mind rpc %s failed", method)
+            response = {
+                "type": "res",
+                "id": req_id,
+                "ok": False,
+                "error": {"code": "internal", "message": str(e)},
+            }
+        try:
+            await self.send_downstream(
+                json.dumps(response, separators=(",", ":"))
+            )
+        except ConnectionClosed:
+            pass
+        return True
+
+    async def _maybe_handle_agent_rpc(self, message: Any) -> bool:
+        """If `message` is an `agent.*` RPC, answer it locally and return
+        True so the caller skips the upstream forward. Otherwise False
+        and the message is proxied as before."""
+        if not isinstance(message, str):
+            return False
+        try:
+            frame = json.loads(message)
+        except (ValueError, TypeError):
+            return False
+        if not isinstance(frame, dict):
+            return False
+        if frame.get("type") != "req":
+            return False
+        method = frame.get("method")
+        if not isinstance(method, str) or not method.startswith("agent."):
+            return False
+        req_id = frame.get("id", "")
+        raw_params = frame.get("params") or {}
+        params = raw_params if isinstance(raw_params, dict) else {}
+        try:
+            payload = _dispatch_agent(method, params)
+            response = {
+                "type": "res",
+                "id": req_id,
+                "ok": True,
+                "payload": payload,
+            }
+        except AgentError as e:
+            response = {
+                "type": "res",
+                "id": req_id,
+                "ok": False,
+                "error": {"code": e.code, "message": e.message},
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.exception("agent rpc %s failed", method)
             response = {
                 "type": "res",
                 "id": req_id,
