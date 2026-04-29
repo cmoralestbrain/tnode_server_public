@@ -5058,14 +5058,30 @@ def _save_openclaw_json_atomic(config: Dict[str, Any]) -> None:
         raise AgentError("openclaw-json-write", str(e))
 
 
-def _find_agent(config: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
-    lst = config.get("agents", {}).get("list", [])
+def _find_agent(config: Dict[str, Any], agent_id: str) -> Optional[Dict[str, Any]]:
+    """Returns the explicit `agents.list[]` entry for `agent_id`, or None if
+    the agent isn't listed (the gateway then falls back to `defaults.models`).
+    Distinguished from `agent-list-malformed`, which is a real config error."""
+    lst = (config.get("agents") or {}).get("list")
+    if lst is None:
+        return None
     if not isinstance(lst, list):
         raise AgentError("agent-list-malformed", "agents.list is not an array")
     for a in lst:
         if isinstance(a, dict) and a.get("id") == agent_id:
             return a
-    raise AgentError("agent-not-found", f"agent {agent_id!r} not in config")
+    return None
+
+
+def _default_model_from_config(config: Dict[str, Any]) -> Optional[str]:
+    """First key of `agents.defaults.models` (dict form) or first item if
+    list-of-strings. Returns None if the node doesn't define defaults."""
+    dm = ((config.get("agents") or {}).get("defaults") or {}).get("models")
+    if isinstance(dm, dict) and dm:
+        return next(iter(dm.keys()))
+    if isinstance(dm, list) and dm and isinstance(dm[0], str):
+        return dm[0]
+    return None
 
 
 def _reload_gateway() -> bool:
@@ -5094,34 +5110,76 @@ def _reload_gateway() -> bool:
 
 
 def _agent_model_get(agent_id: str) -> Dict[str, Any]:
+    """Returns the effective model the gateway uses for `agent_id`. The
+    `effective` field is what the UI should show as "active" — it falls
+    back to `agents.defaults.models` when the agent has no explicit
+    `model.primary`. `primary` is the explicit override (None if absent).
+    `explicit` indicates whether the agent has its own list entry at all."""
     config = _load_openclaw_json()
     agent = _find_agent(config, agent_id)
-    model = agent.get("model") or {}
+    primary: Optional[str] = None
+    fallbacks: List[str] = []
+    explicit = False
+    if agent is not None:
+        explicit = True
+        model = agent.get("model") or {}
+        primary = model.get("primary") if isinstance(model.get("primary"), str) else None
+        fb = model.get("fallbacks")
+        if isinstance(fb, list):
+            fallbacks = [s for s in fb if isinstance(s, str)]
+    effective = primary or _default_model_from_config(config)
     return {
         "agentId": agent_id,
-        "primary": model.get("primary"),
-        "fallbacks": list(model.get("fallbacks") or []),
+        "primary": primary,
+        "effective": effective,
+        "fallbacks": fallbacks,
+        "explicit": explicit,
     }
 
 
 def _agent_model_set(agent_id: str, model_slug: str) -> Dict[str, Any]:
+    """Sets the per-agent primary model. If the node has no `agents.list[]`
+    entry for `agent_id`, one is created (`{id, default, model: {primary}}`),
+    so this works on freshly-provisioned nodes that only have
+    `defaults.models`. Atomic file write + best-effort gateway reload."""
     if not isinstance(model_slug, str) or "/" not in model_slug:
         raise AgentError(
             "invalid-model-slug",
             f"model must be 'provider/model', got {model_slug!r}",
         )
     config = _load_openclaw_json()
-    agent = _find_agent(config, agent_id)
+    agents = config.setdefault("agents", {})
+    if not isinstance(agents, dict):
+        raise AgentError("agents-malformed", "agents is not an object")
+    lst = agents.setdefault("list", [])
+    if not isinstance(lst, list):
+        raise AgentError("agent-list-malformed", "agents.list is not an array")
+    agent: Optional[Dict[str, Any]] = None
+    for a in lst:
+        if isinstance(a, dict) and a.get("id") == agent_id:
+            agent = a
+            break
+    created = False
+    if agent is None:
+        agent = {"id": agent_id, "default": agent_id == "main"}
+        lst.append(agent)
+        created = True
     if not isinstance(agent.get("model"), dict):
         agent["model"] = {}
     agent["model"]["primary"] = model_slug
     _save_openclaw_json_atomic(config)
     reload_ok = _reload_gateway()
-    logger.info("agent.model.set %s → %s (reload=%s)", agent_id, model_slug, reload_ok)
+    logger.info(
+        "agent.model.set %s → %s (created=%s reload=%s)",
+        agent_id, model_slug, created, reload_ok,
+    )
     return {
         "agentId": agent_id,
         "primary": model_slug,
+        "effective": model_slug,
         "fallbacks": list(agent["model"].get("fallbacks") or []),
+        "explicit": True,
+        "created": created,
         "gatewayReloaded": reload_ok,
     }
 
