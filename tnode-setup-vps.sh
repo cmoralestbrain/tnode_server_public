@@ -4458,7 +4458,7 @@ USAGE_STREAM = "usage"
 USAGE_VERSION = 1
 
 HEALTH_STREAM = "health"
-HEALTH_VERSION = 2
+HEALTH_VERSION = 3
 HEALTH_TICK_SEC = float(os.environ.get("TNODE_TELEMETRY_HEALTH_TICK_SEC", "15"))
 
 # TODO Channels v1 → CHANNELS_PROTOCOL_v1.md §2
@@ -4481,7 +4481,8 @@ def _collect_health() -> Optional[Dict[str, Any]]:
         cpu = psutil.cpu_percent(interval=None) / 100.0
         vm = psutil.virtual_memory()
         ram = vm.percent / 100.0
-        disk = psutil.disk_usage("/").percent / 100.0
+        du = psutil.disk_usage("/")
+        disk = du.percent / 100.0
         load_avg = list(os.getloadavg()) if hasattr(os, "getloadavg") else None
         uptime = int(time.time() - psutil.boot_time())
         return {
@@ -4490,6 +4491,9 @@ def _collect_health() -> Optional[Dict[str, Any]]:
             "disk": round(disk, 4),
             "ramUsedMb": int(vm.used / (1024 * 1024)),
             "ramTotalMb": int(vm.total / (1024 * 1024)),
+            "diskUsedGb": round(du.used / (1024 ** 3), 1),
+            "diskTotalGb": round(du.total / (1024 ** 3), 1),
+            "cpuCores": psutil.cpu_count(logical=True),
             "uptimeSec": uptime,
             "loadAvg1m": round(load_avg[0], 2) if load_avg else None,
         }
