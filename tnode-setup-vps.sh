@@ -3879,9 +3879,34 @@ def main() -> int:
     pending: dict[str, dict] = {}
     PENDING_TIMEOUT_S = 15.0
 
+    # Dedup window for stale flushes (turns without a runId). The agent can
+    # emit the same auto-greeting on every WS reconnect; without this guard
+    # each reconnect writes a new doc with a different content-hash id and
+    # the user sees the message duplicated. Real turns (with runId) bypass.
+    STALE_DEDUP_WINDOW_S = 600.0
+    stale_recent: list[tuple[str, float]] = []
+
+    def _is_recent_stale_dup(content: str, role: str, now: float) -> bool:
+        # Drop entries older than the window (small list, linear is fine).
+        nonlocal stale_recent
+        stale_recent = [(h, ts) for (h, ts) in stale_recent if ts >= now - STALE_DEDUP_WINDOW_S]
+        h = hashlib.sha256(f"{role}|{content}".encode("utf-8")).hexdigest()
+        if any(rh == h for rh, _ in stale_recent):
+            return True
+        stale_recent.append((h, now))
+        return False
+
     def flush_turn(t: dict):
         if token is None:
             return
+        if not t.get("turnId"):
+            if _is_recent_stale_dup(
+                t.get("content", "") or "",
+                t.get("role", "") or "",
+                time.time(),
+            ):
+                _log("skip duplicate stale turn (content matches recent within window)")
+                return
         mid = message_id_for(t)
         body = {
             "id": mid, "role": t["role"], "content": t["content"],
