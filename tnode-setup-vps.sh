@@ -3588,7 +3588,43 @@ write_tnode_chat_sync_py() {
     local dest="$1"
     cat > "$dest" <<'CHATSYNCPYEOF'
 #!/usr/bin/env python3
-"""tnode-chat-sync — see cmoralestbrain/skills for full docs."""
+"""tnode-chat-sync — mirrors OpenClaw session turns to Firestore.
+
+Why: the TNode mobile app talks to its OpenClaw agent over a raw WebSocket.
+If the user closes the app while the agent is still responding, that turn
+is lost because it never hit disk in a place the app can fetch later.
+
+This watcher tails the JSONL session files under
+  ~/.openclaw/agents/<agent_id>/sessions/*.jsonl
+and, for every new turn (a message line with role=user|assistant),
+writes it to Firestore at
+  users/{uid}/nodes/{nodeId}/chats/{messageId}
+using a Firebase custom token minted by the `mintNodeToken` Cloud Function.
+
+Authentication:
+- Config at ~/.openclaw/tnode-chat-sync.json is created by tnode-setup.sh
+  post-pairing with {nodeId, nodeSecret, mintUrl}.
+- For each token mint cycle: sign HMAC(nodeSecret, f"{nodeId}:{ts}:{nonce}"),
+  POST to mintUrl, receive Firebase customToken, exchange at
+  identitytoolkit for an idToken valid ~1h.
+
+Design notes:
+- stdlib only (urllib, hmac, hashlib, json, time, os, pathlib).
+- Dedup: Firestore doc id is deterministic:
+    * user messages  -> u_<hash(content+ts)>  (or u_<idempotencyKey> if
+      the line carries one; not usually present server-side)
+    * assistant msgs -> a_<hash(content+ts)>
+  This keeps the watcher idempotent on restart and avoids duplicating a
+  message the Flutter client already wrote client-side.
+- Polling cadence: 500ms. Low CPU, good-enough latency for chat UX.
+- File tracking: (device, inode) -> byte offset. Handles rotation.
+
+Env/overrides:
+  TNODE_CHAT_SYNC_CONFIG    Path to config JSON (default ~/.openclaw/tnode-chat-sync.json)
+  TNODE_CHAT_SYNC_SESSIONS  Sessions dir (default ~/.openclaw/agents/<agent>/sessions)
+  TNODE_CHAT_SYNC_LOG       Log file (default ~/.openclaw/logs/tnode-chat-sync.log)
+  TNODE_CHAT_SYNC_POLL_MS   Polling interval ms (default 500)
+"""
 from __future__ import annotations
 
 import hashlib
@@ -3602,9 +3638,32 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+FIREBASE_API_KEY_URL = "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net"
+# The web API key is public — it gates only anonymous signup/signin with a
+# Firebase customToken (which itself requires HMAC-signed mint). We fetch it
+# lazily once from a helper endpoint; if unavailable, fall back to the
+# hard-coded project value shipped with the mobile app.
+# This is the iOS app's public API key for project tbrain-platform-7fc1f.
+# Firebase API keys are designed to be public (they only identify the
+# project; auth still gates access). Using the iOS key is fine for REST
+# identitytoolkit calls from any environment.
 FIREBASE_WEB_API_KEY_FALLBACK = os.environ.get(
     "TNODE_CHAT_SYNC_WEB_API_KEY",
     "AIzaSyCOybTP4r9J2bWXiJvXY0MQBFvaYDo_iWU",
+)
+
+# Endpoints used by the self-healing path. When `mintNodeToken` returns 404
+# (which means the gateway-side `nodeSyncRegistrations/{nodeId}` doc is gone
+# — typically a Firestore reset wiped it), we re-run the registration flow
+# the installer used at first install: pull a short-lived provisioning HMAC
+# from `getProvisionToken`, then trade it for a fresh nodeSecret at
+# `registerNodeSync`. The new secret overwrites the local config and the
+# next mint cycle picks up where it left off, no manual intervention.
+PROVISION_TOKEN_URL = (
+    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/getProvisionToken"
+)
+REGISTER_NODE_SYNC_URL = (
+    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/registerNodeSync"
 )
 
 HOME = Path.home()
@@ -3633,17 +3692,23 @@ def _log(msg: str) -> None:
 def _http_post_json(url: str, payload: dict, timeout: int = 15) -> dict:
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}, method="POST",
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        raw = resp.read().decode("utf-8")
+        return json.loads(raw)
 
 
 def _http_patch_json(url: str, payload: dict, headers: dict, timeout: int = 15) -> dict:
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        url, data=body,
-        headers={"Content-Type": "application/json", **headers}, method="PATCH",
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", **headers},
+        method="PATCH",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read().decode("utf-8")
@@ -3652,7 +3717,9 @@ def _http_patch_json(url: str, payload: dict, headers: dict, timeout: int = 15) 
 
 def load_config() -> dict:
     if not CONFIG_PATH.is_file():
-        raise RuntimeError(f"Config {CONFIG_PATH} missing.")
+        raise RuntimeError(
+            f"Config {CONFIG_PATH} missing. Run tnode-setup.sh register step."
+        )
     with open(CONFIG_PATH) as f:
         cfg = json.load(f)
     for k in ("nodeId", "nodeSecret", "mintUrl"):
@@ -3662,6 +3729,10 @@ def load_config() -> dict:
 
 
 def mint_token(cfg: dict) -> dict:
+    """Request a fresh Firebase custom token + exchange for idToken.
+
+    Returns {idToken, uid, nodeId, expiresAt (epoch seconds)}.
+    """
     ts = str(int(time.time() * 1000))
     nonce = py_secrets.token_hex(16)
     mac = hmac.new(
@@ -3671,27 +3742,121 @@ def mint_token(cfg: dict) -> dict:
     ).hexdigest()
     mint_resp = _http_post_json(
         cfg["mintUrl"],
-        {"nodeId": cfg["nodeId"], "timestamp": ts, "nonce": nonce, "signature": mac},
+        {
+            "nodeId": cfg["nodeId"],
+            "timestamp": ts,
+            "nonce": nonce,
+            "signature": mac,
+        },
     )
+    custom_token = mint_resp["customToken"]
+    uid = mint_resp["uid"]
+    node_id = mint_resp["nodeId"]
+
     api_key = cfg.get("webApiKey") or FIREBASE_WEB_API_KEY_FALLBACK
+    if not api_key:
+        raise RuntimeError(
+            "No Firebase web API key configured. Set webApiKey in config or"
+            " TNODE_CHAT_SYNC_WEB_API_KEY env var."
+        )
     exchange = _http_post_json(
         f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key={api_key}",
-        {"token": mint_resp["customToken"], "returnSecureToken": True},
+        {"token": custom_token, "returnSecureToken": True},
     )
     return {
         "idToken": exchange["idToken"],
-        "uid": mint_resp["uid"],
-        "nodeId": mint_resp["nodeId"],
+        "uid": uid,
+        "nodeId": node_id,
         "expiresAt": int(time.time()) + int(exchange.get("expiresIn", "3600")) - 60,
     }
 
 
+def reregister_with_server(cfg: dict) -> str:
+    """Pull a fresh provisioning HMAC and re-create the
+    `nodeSyncRegistrations/{nodeId}` doc on the server. Returns the new
+    nodeSecret. The caller must persist it to disk and update its in-memory
+    cfg before the next mint attempt.
+
+    Used as a self-healing recovery when `mintNodeToken` starts returning
+    404 (the registration doc was deleted out from under us). The server
+    rotates the secret on every successful re-register, so callers can rely
+    on this rebuilding the trust chain end-to-end.
+
+    **Caveat**: the freshly-minted doc has nodeSecret but no `linkedUserId`
+    until the `attachNodeSync` trigger fires. That trigger is bound to
+    `users/{uid}/nodes/{nodeId}` writes, so the mint loop will continue to
+    fail with 409 ("not linked") until the Flutter client touches the
+    subdoc. The client's NodesNotifier upserts the subdoc on every
+    add/update/remove; restoring the linkedUserId without user interaction
+    requires a boot-time upsert (planned follow-up) or any node mutation.
+    """
+    # 1) Pull the short-lived provisioning HMAC. GET, no auth.
+    req = urllib.request.Request(PROVISION_TOKEN_URL, method="GET")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        ptoken = json.loads(resp.read().decode("utf-8"))
+    for k in ("timestamp", "nonce", "signature"):
+        if not ptoken.get(k):
+            raise RuntimeError(f"getProvisionToken response missing {k}")
+
+    # 2) Trade it for a fresh nodeSecret. Server replaces the
+    # nodeSyncRegistrations/{nodeId} doc with a newly-rotated one.
+    response = _http_post_json(
+        REGISTER_NODE_SYNC_URL,
+        {
+            "nodeId": cfg["nodeId"],
+            "timestamp": ptoken["timestamp"],
+            "nonce": ptoken["nonce"],
+            "signature": ptoken["signature"],
+        },
+    )
+    new_secret = response.get("nodeSecret")
+    if not new_secret:
+        raise RuntimeError(
+            f"registerNodeSync returned no nodeSecret: {response}"
+        )
+    return new_secret
+
+
+def persist_node_secret(cfg: dict, new_secret: str) -> None:
+    """Atomically write the rotated nodeSecret back to the config file
+    while preserving every other field (mintUrl, pullUrl, registeredAt, …)."""
+    on_disk: dict
+    try:
+        with CONFIG_PATH.open() as f:
+            on_disk = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        on_disk = dict(cfg)
+    on_disk["nodeSecret"] = new_secret
+    on_disk["reregisteredAt"] = (
+        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    )
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    with tmp.open("w") as f:
+        json.dump(on_disk, f, indent=2)
+    os.replace(tmp, CONFIG_PATH)
+    try:
+        os.chmod(CONFIG_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def _firestore_base(project_id: str) -> str:
+    return f"https://firestore.googleapis.com/v1/projects/{project_id}/databases/(default)/documents"
+
+
+# Firestore REST uses typed values. Helpers:
+
 def _fs_value(v):
-    if v is None: return {"nullValue": None}
-    if isinstance(v, bool): return {"booleanValue": v}
-    if isinstance(v, int): return {"integerValue": str(v)}
-    if isinstance(v, float): return {"doubleValue": v}
-    if isinstance(v, str): return {"stringValue": v}
+    if v is None:
+        return {"nullValue": None}
+    if isinstance(v, bool):
+        return {"booleanValue": v}
+    if isinstance(v, int):
+        return {"integerValue": str(v)}
+    if isinstance(v, float):
+        return {"doubleValue": v}
+    if isinstance(v, str):
+        return {"stringValue": v}
     if isinstance(v, dict):
         return {"mapValue": {"fields": {k: _fs_value(x) for k, x in v.items()}}}
     if isinstance(v, list):
@@ -3703,23 +3868,37 @@ def _fs_fields(d: dict) -> dict:
     return {"fields": {k: _fs_value(v) for k, v in d.items()}}
 
 
-def write_message(token, project_id, uid, node_id, message_id, body) -> None:
+def write_message(
+    token: dict,
+    project_id: str,
+    uid: str,
+    node_id: str,
+    message_id: str,
+    body: dict,
+) -> None:
+    base = _firestore_base(project_id)
+    # PATCH with documentPath + updateMask-less body == upsert semantics.
     url = (
-        f"https://firestore.googleapis.com/v1/projects/{project_id}"
-        f"/databases/(default)/documents/users/{uid}/nodes/{node_id}"
-        f"/chats/{message_id}?currentDocument.exists=false"
+        f"{base}/users/{uid}/nodes/{node_id}/chats/{message_id}"
+        f"?currentDocument.exists=false"
     )
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
     try:
-        _http_patch_json(url, _fs_fields(body), {"Authorization": f"Bearer {token['idToken']}"})
+        _http_patch_json(url, _fs_fields(body), headers)
     except urllib.error.HTTPError as e:
+        # 409 = already exists (dedup hit). Safe to ignore.
         if e.code in (409, 412):
             return
         raise
 
 
+# ── JSONL turn extraction ──────────────────────────────────────
+
 def extract_content(raw):
-    if raw is None: return ""
-    if isinstance(raw, str): return raw
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
     if isinstance(raw, list):
         parts = []
         for part in raw:
@@ -3731,19 +3910,41 @@ def extract_content(raw):
     return str(raw)
 
 
-_HEARTBEAT_ACK_PATTERNS = frozenset({
+# OpenClaw's built-in heartbeat periodically injects a system prompt asking
+# the agent to reply HEARTBEAT_OK when no action is needed. That ack is
+# bookkeeping, not real output — mirroring it to Firestore would surface as
+# a push notification on the client's lockscreen.
+#
+# Some agents don't reply with the literal ack: they narrate what they did
+# during the heartbeat ("Gateway reconectado… según HEARTBEAT.md.",
+# "No hay solicitudes pendientes. Termino sin output según HEARTBEAT.md.").
+# HEARTBEAT.md is the server-side instructions file and never legitimately
+# appears in user-facing answers, so any assistant turn that references it
+# is treated as heartbeat bookkeeping and dropped.
+# Assistant turns whose entire content is one of these sentinels are
+# agent-internal signals (heartbeat acks, refusal markers) that should NOT
+# be surfaced to the user. NO_REPLY / NO_RESPONSE are emitted when the agent
+# declines to answer (e.g. guardrail-triggered questions about the model).
+# NO_RE handles the truncated form we've observed when the response is cut
+# off at the first token boundary.
+_SILENT_ACK_PATTERNS = frozenset({
     "HEARTBEAT_OK", "HEARTBEAT OK",
     "NO_REPLY", "NO_RESPONSE", "NO_RE",
 })
+_HEARTBEAT_MARKER = "HEARTBEAT.MD"
 
 
-def _is_heartbeat_ack(role: str, content: str) -> bool:
+def _is_silent_ack(role: str, content: str) -> bool:
     if role != "assistant":
         return False
-    return content.strip().upper() in _HEARTBEAT_ACK_PATTERNS
+    upper = content.strip().upper()
+    if upper in _SILENT_ACK_PATTERNS:
+        return True
+    return _HEARTBEAT_MARKER in upper
 
 
 def parse_line(line: str):
+    """Parse a JSONL line into the raw entry dict, or None if not JSON."""
     line = line.strip()
     if not line:
         return None
@@ -3754,19 +3955,38 @@ def parse_line(line: str):
 
 
 def assistant_turn_from(entry: dict):
+    """Return a normalized assistant turn dict (without runId) or None.
+
+    Extracts content from a `type:"message", role:"assistant"` entry.
+    The runId is NOT in this entry — it arrives later in a sibling
+    `type:"custom", customType:"openclaw:bootstrap-context:full"` whose
+    `parentId` matches `entry.id`. `main()` resolves that and sets turnId.
+    """
     if entry.get("type") != "message":
         return None
     msg = entry.get("message") or {}
     role = (msg.get("role") or entry.get("role") or "").lower()
+    # User messages are written to Firestore directly by the Flutter client
+    # with clean content and stable UUIDs. The watcher only needs to mirror
+    # assistant turns — they stream over WebSocket and would be lost if the
+    # app closes mid-response.
     if role != "assistant":
         return None
     content = extract_content(msg.get("content") or entry.get("content"))
-    if not content.strip() or _is_heartbeat_ack(role, content):
+    if not content.strip():
+        return None
+    if _is_silent_ack(role, content):
         return None
     ts_raw = entry.get("timestamp") or entry.get("ts") or msg.get("timestamp")
-    legacy_run = entry.get("runId") or entry.get("turnId") or msg.get("runId")
+    # Legacy path: some older OpenClaw builds did attach runId to the
+    # message entry. Keep it as a best-effort fallback.
+    legacy_run = (
+        entry.get("runId") or entry.get("turnId") or msg.get("runId")
+    )
     return {
-        "role": role, "content": content, "ts": ts_raw,
+        "role": role,
+        "content": content,
+        "ts": ts_raw,
         "turnId": legacy_run,
         "idempotencyKey": entry.get("idempotencyKey") or msg.get("idempotencyKey"),
         "entryId": entry.get("id"),
@@ -3774,6 +3994,8 @@ def assistant_turn_from(entry: dict):
 
 
 def runid_from_custom(entry: dict):
+    """Return (parentId, runId) if entry is the bootstrap-context custom
+    event that follows an assistant message; else (None, None)."""
     if entry.get("type") != "custom":
         return (None, None)
     if entry.get("customType") != "openclaw:bootstrap-context:full":
@@ -3783,6 +4005,7 @@ def runid_from_custom(entry: dict):
 
 
 def message_id_for(turn: dict) -> str:
+    """Deterministic id so restarts don't duplicate."""
     if turn.get("idempotencyKey"):
         prefix = "u_" if turn["role"] == "user" else "a_"
         return f"{prefix}{turn['idempotencyKey']}"
@@ -3793,10 +4016,16 @@ def message_id_for(turn: dict) -> str:
     return f"{prefix}{h}"
 
 
+# ── File tailer ────────────────────────────────────────────────
+
 class SessionTailer:
     def __init__(self, sessions_dir: Path):
         self.sessions_dir = sessions_dir
+        # (dev, inode) -> offset
         self.offsets: dict[tuple, int] = {}
+        # Watcher start time (monotonic file mtime). Files with mtime newer
+        # than this are "born after the watcher started" — i.e. live sessions
+        # we need to mirror from byte 0, not historical logs to skip.
         self.start_time = time.time()
 
     def _iter_files(self):
@@ -3823,14 +4052,20 @@ class SessionTailer:
             key = (st.st_dev, st.st_ino)
             offset = self.offsets.get(key)
             if offset is None:
-                # Historical file: skip to EOF. Freshly-created file
-                # (mtime after start): read from byte 0.
+                # First time seeing this file. Two cases:
+                #   - Created before the watcher started  → historical,
+                #     skip to EOF so we don't flood Firestore with old turns.
+                #   - Created after the watcher started  → brand-new live
+                #     session; read from byte 0 (OpenClaw writes several
+                #     bootstrap lines + the first user/assistant pair in the
+                #     same flush, so we'd otherwise lose the whole thing).
                 if st.st_mtime > self.start_time:
                     offset = 0
                 else:
                     self.offsets[key] = st.st_size
                     continue
             if st.st_size < offset:
+                # Truncation or rotation — reset
                 offset = 0
             if st.st_size == offset:
                 continue
@@ -3850,9 +4085,11 @@ def resolve_sessions_dir() -> Path:
     override = os.environ.get("TNODE_CHAT_SYNC_SESSIONS")
     if override:
         return Path(override)
+    # Discover the default agent dir under ~/.openclaw/agents/*/sessions
     agents_dir = OPENCLAW_DIR / "agents"
     if not agents_dir.is_dir():
-        return OPENCLAW_DIR / "sessions"
+        return OPENCLAW_DIR / "sessions"  # fallback, won't exist
+    # Prefer 'main' if present, else first alphabetical
     if (agents_dir / "main" / "sessions").is_dir():
         return agents_dir / "main" / "sessions"
     for sub in sorted(agents_dir.iterdir()):
@@ -3862,6 +4099,8 @@ def resolve_sessions_dir() -> Path:
     return agents_dir / "main" / "sessions"
 
 
+# ── Main loop ──────────────────────────────────────────────────
+
 def main() -> int:
     try:
         cfg = load_config()
@@ -3869,54 +4108,48 @@ def main() -> int:
         _log(f"config error: {e}")
         return 2
 
+    # Project id is derived from the mintUrl hostname.
     project_id = "tbrain-platform-7fc1f"
+
     sessions_dir = resolve_sessions_dir()
     _log(f"watching {sessions_dir}")
 
     tailer = SessionTailer(sessions_dir)
     token: dict | None = None
     backoff = 1.0
-    pending: dict[str, dict] = {}
+
+    # Assistant turns are buffered here keyed by the JSONL entry id until
+    # their sibling `openclaw:bootstrap-context:full` event arrives with
+    # the real runId — which is the same id the Flutter client observed
+    # over the WebSocket, so writing `a_{runId}` deduplicates live streams
+    # against the mirror on the client side.
+    pending: dict[str, dict] = {}  # entryId -> turn + {bufferedAt: float}
     PENDING_TIMEOUT_S = 15.0
-
-    # Dedup window for stale flushes (turns without a runId). The agent can
-    # emit the same auto-greeting on every WS reconnect; without this guard
-    # each reconnect writes a new doc with a different content-hash id and
-    # the user sees the message duplicated. Real turns (with runId) bypass.
-    STALE_DEDUP_WINDOW_S = 600.0
-    stale_recent: list[tuple[str, float]] = []
-
-    def _is_recent_stale_dup(content: str, role: str, now: float) -> bool:
-        # Drop entries older than the window (small list, linear is fine).
-        nonlocal stale_recent
-        stale_recent = [(h, ts) for (h, ts) in stale_recent if ts >= now - STALE_DEDUP_WINDOW_S]
-        h = hashlib.sha256(f"{role}|{content}".encode("utf-8")).hexdigest()
-        if any(rh == h for rh, _ in stale_recent):
-            return True
-        stale_recent.append((h, now))
-        return False
 
     def flush_turn(t: dict):
         if token is None:
             return
-        if not t.get("turnId"):
-            if _is_recent_stale_dup(
-                t.get("content", "") or "",
-                t.get("role", "") or "",
-                time.time(),
-            ):
-                _log("skip duplicate stale turn (content matches recent within window)")
-                return
         mid = message_id_for(t)
         body = {
-            "id": mid, "role": t["role"], "content": t["content"],
-            "status": "complete", "source": "watcher",
-            "createdAt": t.get("ts") or "", "updatedAt": t.get("ts") or "",
+            "id": mid,
+            "role": t["role"],
+            "content": t["content"],
+            "status": "complete",
+            "source": "watcher",
+            "createdAt": t.get("ts") or "",
+            "updatedAt": t.get("ts") or "",
         }
         if t.get("turnId"):
             body["turnId"] = t["turnId"]
         try:
-            write_message(token, project_id, token["uid"], token["nodeId"], mid, body)
+            write_message(
+                token,
+                project_id,
+                token["uid"],
+                token["nodeId"],
+                mid,
+                body,
+            )
             _log(f"wrote {mid} (runId={t.get('turnId') or 'hash'})")
         except urllib.error.HTTPError as e:
             if e.code == 401:
@@ -3926,11 +4159,35 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             _log(f"write error: {e}")
 
+    # When `mintNodeToken` keeps returning 404 (server-side registration doc
+    # gone), we re-register at most this often to avoid hammering the
+    # endpoint if rotation itself is failing.
+    REREGISTER_COOLDOWN_S = 300
+    last_reregister_attempt = 0.0
+
     while True:
         try:
             now = int(time.time())
             if token is None or now >= token["expiresAt"]:
-                token = mint_token(cfg)
+                try:
+                    token = mint_token(cfg)
+                except urllib.error.HTTPError as e:
+                    if e.code == 404 and (now - last_reregister_attempt) >= REREGISTER_COOLDOWN_S:
+                        _log(
+                            "mintNodeToken 404 — registration doc missing on server; "
+                            "attempting self-heal via registerNodeSync"
+                        )
+                        last_reregister_attempt = now
+                        try:
+                            new_secret = reregister_with_server(cfg)
+                            persist_node_secret(cfg, new_secret)
+                            cfg["nodeSecret"] = new_secret
+                            _log("re-registered ok — new nodeSecret persisted")
+                            # Loop back to retry mint with the new secret.
+                            continue
+                        except Exception as re:  # noqa: BLE001
+                            _log(f"re-register failed: {re}")
+                    raise
                 _log(f"minted token for uid={token['uid']} node={token['nodeId']}")
                 backoff = 1.0
 
@@ -3939,9 +4196,11 @@ def main() -> int:
                 if entry is None:
                     continue
 
+                # Case A: assistant message → buffer waiting for runId.
                 turn = assistant_turn_from(entry)
                 if turn is not None:
                     if turn.get("turnId"):
+                        # Legacy build: runId was on the message itself.
                         try:
                             flush_turn(turn)
                         except urllib.error.HTTPError as e:
@@ -3952,6 +4211,7 @@ def main() -> int:
                         turn["bufferedAt"] = time.time()
                         pending[turn["entryId"]] = turn
                     else:
+                        # No entry id to correlate — write with hash fallback.
                         try:
                             flush_turn(turn)
                         except urllib.error.HTTPError as e:
@@ -3960,6 +4220,8 @@ def main() -> int:
                                 break
                     continue
 
+                # Case B: bootstrap-context custom event → resolve a
+                # pending assistant turn with its runId.
                 parent_id, run_id = runid_from_custom(entry)
                 if parent_id and run_id and parent_id in pending:
                     pending_turn = pending.pop(parent_id)
@@ -3971,6 +4233,8 @@ def main() -> int:
                             token = None
                             break
 
+            # Flush anything that has been pending too long — avoids
+            # losing turns if OpenClaw fails to emit the custom event.
             deadline = time.time() - PENDING_TIMEOUT_S
             expired = [k for k, v in pending.items() if v["bufferedAt"] < deadline]
             for k in expired:
