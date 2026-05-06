@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.9.2"
+TNODE_SETUP_VERSION="1.9.3"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -205,6 +205,35 @@ phase() {
 # Utility functions
 # ─────────────────────────────────────────────
 command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+# In --update-only mode, the systemd unit was provisioned during a prior
+# full install and should NOT be regenerated — writing to /etc/systemd/system
+# requires root, which fails on the Pi (tbrainadmin) and on VPSs when the
+# operator runs `update.tbrain.app/update.sh | bash` as a non-root user.
+# Each install_<comp>_systemd calls this at the top; if it returns 0, the
+# rest of the function (the unit-file write + daemon-reload + enable) is
+# skipped. Picks user vs system path automatically.
+_systemd_update_only_handled() {
+    [[ "${UPDATE_ONLY:-0}" != "1" ]] && return 1
+    local unit="$1"
+    local user_path="${HOME}/.config/systemd/user/${unit}.service"
+    local sys_path="/etc/systemd/system/${unit}.service"
+    if [[ -f "$user_path" ]]; then
+        XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user daemon-reload 2>/dev/null || true
+        XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user restart "$unit" 2>/dev/null || true
+        success "systemd --user ${unit} reloaded+restarted (update-only)"
+        return 0
+    fi
+    if [[ -f "$sys_path" ]]; then
+        if sudo -n systemctl daemon-reload 2>/dev/null && sudo -n systemctl restart "$unit" 2>/dev/null; then
+            success "systemd ${unit} restarted via sudo (update-only)"
+        else
+            warn "systemd ${unit}: could not restart without sudo; run 'sudo systemctl restart ${unit}' manually"
+        fi
+        return 0
+    fi
+    return 1
+}
 
 # Run a command as the tnode user (no-op if already tnode or on macOS)
 run_as_tnode() {
@@ -2254,6 +2283,7 @@ install_pair_watch_systemd() {
         warn "systemctl no disponible — saltando systemd setup"
         return 0
     fi
+    _systemd_update_only_handled "pair-watch" && return 0
 
     # Always install as system-level units that run as tnode user
     local systemd_dir="/etc/systemd/system"
@@ -3676,6 +3706,7 @@ install_config_sync_systemd() {
         warn "systemctl no disponible — saltando systemd setup del config-sync"
         return 0
     fi
+    _systemd_update_only_handled "tnode-config-sync" && return 0
 
     local systemd_dir="/etc/systemd/system"
 
@@ -3711,6 +3742,7 @@ install_config_sync_systemd_watcher() {
     if ! command_exists systemctl; then
         return 0
     fi
+    _systemd_update_only_handled "tnode-config-sync-watch" && return 0
 
     local systemd_dir="/etc/systemd/system"
 
@@ -4495,6 +4527,7 @@ install_chat_sync_systemd() {
         warn "systemctl no disponible — saltando systemd setup del chat-sync"
         return 0
     fi
+    _systemd_update_only_handled "tnode-chat-sync" && return 0
 
     local systemd_dir="/etc/systemd/system"
 
@@ -4551,6 +4584,7 @@ install_telemetry_systemd() {
         warn "systemctl no disponible — saltando systemd setup del telemetry"
         return 0
     fi
+    _systemd_update_only_handled "tnode-telemetry" && return 0
 
     local systemd_dir="/etc/systemd/system"
 
