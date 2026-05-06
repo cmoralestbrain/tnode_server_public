@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.7.0"
+TNODE_SETUP_VERSION="1.9.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -139,6 +139,20 @@ API_KEY=""        # API key for external provider
 TUNNEL_TOKEN=""       # --tunnel-token: pre-provisioned Cloudflare tunnel token
 TUNNEL_DOMAIN=""      # set by phase_tunnel
 VERBOSE=0
+UPDATE_ONLY=0         # --update-only: refresh scripts/binaries, never rotate secrets
+COMPONENT=""          # --component <name>: only run install_<name> + verify, implies --update-only
+NO_SMOKE_TEST=0       # --no-smoke-test: skip post-update verify_<X>.py (escape hatch)
+
+# Components supported by --component=<name> dispatcher. Mirrored in
+# install.tbrain.app/verify/verify_<id>.py. Keep in sync with both.
+SUPPORTED_COMPONENTS=(
+    "openclaw-gateway"
+    "tnode-chat-sync"
+    "tnode-config-sync"
+    "tnode-telemetry"
+    "pair-watch"
+    "cloudflared"
+)
 
 # Tunnel provisioning API
 TUNNEL_API_URL="https://api.tbrain.app/v1/tunnel/provision"
@@ -593,12 +607,35 @@ parse_args() {
                 fi
                 ;;
             --verbose)       VERBOSE=1 ;;
+            --update-only)   UPDATE_ONLY=1 ;;
+            --component)
+                COMPONENT="${2:?--component requires a value (e.g. tnode-chat-sync)}"
+                UPDATE_ONLY=1
+                shift
+                ;;
+            --no-smoke-test) NO_SMOKE_TEST=1 ;;
             --version)       echo "tnode-setup v${TNODE_SETUP_VERSION}"; exit 0 ;;
             -h|--help)       print_usage; exit 0 ;;
             *)               warn "Unknown flag: $1" ;;
         esac
         shift
     done
+
+    # Validate --component against the supported list
+    if [[ -n "$COMPONENT" ]]; then
+        local found=0
+        local c
+        for c in "${SUPPORTED_COMPONENTS[@]}"; do
+            if [[ "$c" == "$COMPONENT" ]]; then
+                found=1
+                break
+            fi
+        done
+        if [[ "$found" == "0" ]]; then
+            local list="${SUPPORTED_COMPONENTS[*]}"
+            die "Unknown --component '$COMPONENT'. Supported: ${list// /, }"
+        fi
+    fi
 }
 
 print_usage() {
@@ -619,6 +656,14 @@ Options:
   --cloud             Use cloud model (${CLOUD_MODEL})
   --api [key]         Use cloud API (OpenRouter). Key opcional, incluida por defecto.
   --verbose           Enable debug output
+  --update-only       Refresh scripts/binaries without rotating secrets.
+                      Aborts if required state (tunnel.json, gateway token)
+                      is missing instead of regenerating it.
+  --component <name>  Only install/refresh the named component (implies
+                      --update-only). Supported: openclaw-gateway,
+                      tnode-chat-sync, tnode-config-sync, tnode-telemetry,
+                      pair-watch, cloudflared.
+  --no-smoke-test     Skip post-update verify_<X>.py smoke test.
   --version           Print version and exit
   -h, --help          Show this help
 
@@ -647,6 +692,12 @@ Examples:
 
   # Raspberry Pi — solo gateway, LLM en otro nodo:
   bash tnode-setup.sh --no-ollama --yes
+
+  # Refrescar scripts/binarios sin rotar secretos:
+  curl -fsSL https://install.tbrain.app | bash -s -- --update-only --yes
+
+  # Actualizar solo un daemon (incluye verify smoke-test):
+  curl -fsSL https://install.tbrain.app | bash -s -- --component tnode-chat-sync --yes
 EOF
 }
 
@@ -965,10 +1016,15 @@ configure_gateway_bind() {
     fi
 
     if command_exists python3; then
-        python3 - "$oc_config" "$use_tunnel" <<'PYEOF'
+        # In --update-only mode, refuse to mint a new token if one is missing
+        # — that would silently break every paired client. Fail loudly so
+        # the operator can run a full install instead.
+        local update_only="${UPDATE_ONLY:-0}"
+        python3 - "$oc_config" "$use_tunnel" "$update_only" <<'PYEOF'
 import json, sys
 config_path = sys.argv[1]
 use_tunnel = sys.argv[2] == "1"
+update_only = sys.argv[3] == "1"
 try:
     with open(config_path) as f:
         c = json.load(f)
@@ -986,18 +1042,31 @@ try:
     # "Gateway auth is set to token, but no token is configured", which
     # blocks `tnode-qr` and any pairing flow. Generate a fresh 48-hex-char
     # token (24 bytes) when missing — same shape used by older installs.
-    import secrets
     auth = gw.setdefault("auth", {})
     auth.setdefault("mode", "token")
     if auth.get("mode") == "token" and not auth.get("token"):
+        if update_only:
+            print(
+                "ERROR: --update-only refusing to mint gateway.auth.token "
+                "(missing or empty). Re-run a full install to recover.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        import secrets
         auth["token"] = secrets.token_hex(24)
     with open(config_path, "w") as f:
         json.dump(c, f, indent=2)
     bind_mode = "loopback (tunnel)" if use_tunnel else "lan"
     print(f"bind={bind_mode}, mode=local")
+except SystemExit:
+    raise
 except Exception as e:
     print(f"error: {e}", file=sys.stderr)
 PYEOF
+        local rc=$?
+        if [[ "$rc" != "0" ]] && [[ "$update_only" == "1" ]]; then
+            die "configure_gateway_bind: refused to mint missing gateway.auth.token under --update-only"
+        fi
     fi
 }
 
@@ -1348,6 +1417,13 @@ phase_tunnel() {
             configure_gateway_bind "1" >/dev/null 2>&1
             return 0
         fi
+    fi
+
+    # Past this point we'd call the provisioning API and rotate nodeId +
+    # nodeSecret. Refuse in --update-only mode — the operator should run
+    # a full install if they really want a fresh tunnel.
+    if [[ "$UPDATE_ONLY" == "1" ]]; then
+        die "phase_tunnel: --update-only requires existing $tunnel_json with a 'domain' field. Run a full install to provision."
     fi
 
     if [[ -n "$TUNNEL_TOKEN" ]]; then
@@ -2541,6 +2617,7 @@ Env/overrides:
                            (used by the file-watcher trigger).
 """
 from __future__ import annotations
+__VERSION__ = "1.1.0"
 
 import hashlib
 import hmac
@@ -2549,6 +2626,7 @@ import os
 import re
 import secrets as py_secrets
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -2645,11 +2723,27 @@ def load_config() -> dict:
     return cfg
 
 
+def _read_current_secret() -> str | None:
+    """Re-read tnode-chat-sync.json from disk to pick up self-heal rotations
+    by chat-sync (v1.8.15+ regenerates nodeSecret when mintNodeToken returns
+    404). Without this, config-sync keeps the boot-time secret in RAM and
+    loops 409 not_paired forever. Returns None on missing/invalid file."""
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f).get("nodeSecret")
+    except Exception:
+        return None
+
+
 def mint_token(cfg: dict) -> dict:
     """Mint a Firebase ID token with scope=sync_admin.
 
     Returns {idToken, uid, nodeId, expiresAt (epoch seconds)}.
     """
+    fresh_secret = _read_current_secret()
+    if fresh_secret and fresh_secret != cfg.get("nodeSecret"):
+        _log("nodeSecret rotated on disk (chat-sync self-heal); reloading")
+        cfg["nodeSecret"] = fresh_secret  # mutate caller's cfg in-place
     ts = str(int(time.time() * 1000))
     nonce = py_secrets.token_hex(16)
     signing = f'{cfg["nodeId"]}:{ts}:{nonce}:{SCOPE}'
@@ -2997,6 +3091,79 @@ def _spawn_openclaw_gateway(bin_path: str) -> dict:
         return {"ok": False, "error": f"spawn_failed: {e}"}
 
 
+def _gateway_main_pid() -> int | None:
+    """Return the gateway process PID, or None if not running.
+
+    Linux: systemctl --user show openclaw-gateway --property=MainPID --value.
+    Mac: pgrep -f openclaw-gateway (no systemd, launchd doesn't expose PID
+    portably from a non-root context).
+    """
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(
+                ["pgrep", "-f", "openclaw-gateway"], text=True, timeout=5,
+            ).strip()
+            return int(out.splitlines()[0]) if out else None
+        except (subprocess.CalledProcessError, ValueError, subprocess.TimeoutExpired):
+            return None
+    # Linux user service
+    env = os.environ.copy()
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    try:
+        out = subprocess.check_output(
+            ["systemctl", "--user", "show", "openclaw-gateway",
+             "--property=MainPID", "--value"],
+            text=True, timeout=5, env=env,
+        ).strip()
+        return int(out) if out and out != "0" else None
+    except (subprocess.CalledProcessError, ValueError, subprocess.TimeoutExpired,
+            FileNotFoundError):
+        return None
+
+
+def _restart_openclaw_with_verify(timeout: int = 60) -> dict:
+    """Restart openclaw and verify the MainPID actually rotated.
+
+    Some hosts return ok=True from `openclaw daemon restart` while the
+    gateway process keeps running with the old PID — openclaw.json on disk
+    is fresh but the in-memory config stays stale, so the user keeps seeing
+    "No API key found for provider X". When that happens, force-kill the old
+    PID; systemd Restart=always (Linux) or launchd KeepAlive (Mac) respawns
+    it within ~3s.
+    """
+    old_pid = _gateway_main_pid()
+    result = _run_openclaw("daemon", "restart", timeout=timeout)
+    result["oldPid"] = old_pid
+    if not result.get("ok"):
+        result["pidVerified"] = "skipped_restart_failed"
+        return result
+    time.sleep(3)
+    new_pid = _gateway_main_pid()
+    result["newPid"] = new_pid
+    if old_pid is None:
+        result["pidVerified"] = "old_pid_unknown"
+        return result
+    if new_pid is not None and new_pid != old_pid:
+        result["pidVerified"] = "ok"
+        return result
+    _log(
+        f"openclaw restart didn't rotate PID (old={old_pid} new={new_pid}); "
+        f"sending SIGTERM to old PID and trusting Restart=always to respawn"
+    )
+    try:
+        os.kill(old_pid, signal.SIGTERM)
+    except ProcessLookupError:
+        result["pidVerified"] = "old_pid_already_gone"
+        return result
+    except OSError as e:
+        result["pidVerified"] = f"sigterm_failed: {e}"
+        return result
+    time.sleep(3)
+    result["newPid"] = _gateway_main_pid()
+    result["pidVerified"] = "forced"
+    return result
+
+
 # ── openclaw.json writer ───────────────────────────────────────
 
 _CTX_DEFAULTS = {
@@ -3084,7 +3251,7 @@ def handle_update_llm_provider(token: dict, params: dict) -> dict:
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "result": {"error": f"write_failed: {e}"}}
 
-    restart = _run_openclaw("daemon", "restart")
+    restart = _restart_openclaw_with_verify()
     # Push the new state up immediately so the client sees it.
     try:
         new_state = push_openclaw_config(token)
@@ -3103,7 +3270,7 @@ def handle_update_llm_provider(token: dict, params: dict) -> dict:
 
 
 def handle_restart_openclaw(token: dict, params: dict) -> dict:
-    result = _run_openclaw("daemon", "restart")
+    result = _restart_openclaw_with_verify()
     return {
         "status": "done" if result.get("ok") else "error",
         "result": result,
@@ -3189,7 +3356,7 @@ def handle_apply_openrouter_key(token: dict, params: dict) -> dict:
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "result": {"error": f"write_failed: {e}"}}
 
-    restart = _run_openclaw("daemon", "restart")
+    restart = _restart_openclaw_with_verify()
     try:
         new_state = push_openclaw_config(token)
     except Exception as e:  # noqa: BLE001
@@ -3348,8 +3515,15 @@ def main() -> int:
             return 0
         except urllib.error.HTTPError as e:
             if e.code == 401:
-                _log("idToken rejected — refreshing")
+                # Persistent 401 (e.g. clock skew, revoked node, stale
+                # nodeSecret) used to spam ~10 lines/sec. Reuse the existing
+                # `backoff` variable (reset to 1.0 on a successful mint at
+                # the top of the loop) so we slow down without blocking
+                # legitimate single-shot refreshes.
+                _log(f"idToken rejected — refreshing; backoff={backoff:.1f}s")
                 token = None
+                time.sleep(backoff)
+                backoff = min(60.0, backoff * 2)
                 continue
             body = getattr(e, "server_body", "")
             _log(
@@ -3562,6 +3736,7 @@ write_tnode_chat_sync_py() {
     cat > "$dest" <<'CHATSYNCPYEOF'
 #!/usr/bin/env python3
 """tnode-chat-sync — see cmoralestbrain/skills for full docs."""
+__VERSION__ = "1.8.15"
 from __future__ import annotations
 
 import hashlib
@@ -4185,6 +4360,7 @@ Iteration 1: one stream → `usage`.
 
 Runs as its own systemd unit (tnode-telemetry.service).
 """
+__VERSION__ = "1.8.13"
 from __future__ import annotations
 
 import argparse
@@ -5609,6 +5785,7 @@ Modes:
 
 Stdlib only (Python 3.9+).
 """
+__VERSION__ = "1.0.0"
 
 import fcntl
 import ipaddress
@@ -6055,6 +6232,335 @@ PAIR_WATCH_CLI_EOF
 }
 
 # ═════════════════════════════════════════════
+# Fase 2 (components-manifest) — verify scripts + manifest writer
+# ═════════════════════════════════════════════
+# Default canónico: `install.tbrain.app/verify/*` (CF Page Rule preservando
+# path → raw GitHub). Default goes straight to raw GitHub because the
+# install.tbrain.app/* path on the Free CF plan is served by a Bulk Redirect
+# that does NOT preserve $1 (Page Rule budget consumed by update/health/
+# updates.tbrain.app). Override with VERIFY_BASE_URL=... if a path-preserving
+# CDN is set up later (Pro plan + Page Rule for install.tbrain.app/verify/*).
+VERIFY_BASE_URL="${VERIFY_BASE_URL:-https://raw.githubusercontent.com/cmoralestbrain/tnode_server_public/main/verify}"
+
+install_verify_scripts() {
+    info "Instalando verify scripts a \$OPENCLAW_HOME/verify/..."
+    local verify_dir="$OPENCLAW_HOME/verify"
+    run_as_tnode mkdir -p "$verify_dir"
+    local files=(
+        verify_common.py
+        verify_tnode-chat-sync.py
+        verify_tnode-config-sync.py
+        verify_tnode-telemetry.py
+        verify_pair-watch.py
+        verify_openclaw-gateway.py
+        verify_cloudflared.py
+        verify_plugin-npm.py
+        verify_plugin-skill.py
+        verify_tnode-llm-config-watcher.py
+    )
+    local ok=0 fail=0
+    for f in "${files[@]}"; do
+        local url="${VERIFY_BASE_URL}/$f"
+        local dest="$verify_dir/$f"
+        local tmp; tmp="$(mktemp)"
+        if curl -fsSL --max-time 10 "$url" -o "$tmp" 2>/dev/null; then
+            mv "$tmp" "$dest"
+            chmod +x "$dest"
+            chown "$TNODE_USER":"$TNODE_USER" "$dest" 2>/dev/null || true
+            ok=$((ok+1))
+        else
+            rm -f "$tmp"
+            fail=$((fail+1))
+        fi
+    done
+    if [[ $fail -eq 0 ]]; then
+        success "verify scripts ($ok/${#files[@]}) instalados en $verify_dir"
+    else
+        warn "verify scripts: $ok/${#files[@]} instalados; $fail fallaron (verifica $VERIFY_BASE_URL/*)"
+    fi
+}
+
+write_components_manifest() {
+    info "Generando components-manifest.json (auto-discovery + extracted versions)..."
+    local manifest="$OPENCLAW_HOME/components-manifest.json"
+    run_as_tnode python3 - "$manifest" "$OPENCLAW_HOME" <<'COMPMANIFEST_PYEOF'
+import json, sys, subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+openclaw_home = Path(sys.argv[2])
+scripts_dir = openclaw_home / "scripts"
+
+def extract_ver(p):
+    if not p.exists(): return None
+    try:
+        for line in p.read_text().splitlines()[:60]:
+            if line.startswith('__VERSION__ = "'):
+                return line.split('"')[1]
+    except Exception:
+        pass
+    return None
+
+def npm_ver(pkg):
+    try:
+        out = subprocess.check_output(["npm", "ls", "-g", "--json", "--depth=0", pkg],
+                                      timeout=15, stderr=subprocess.DEVNULL).decode()
+        return json.loads(out).get("dependencies", {}).get(pkg, {}).get("version")
+    except Exception:
+        return None
+
+components = []
+
+for comp_id, fname in [
+    ("tnode-chat-sync",   "tnode_chat_sync.py"),
+    ("tnode-config-sync", "tnode_config_sync.py"),
+    ("tnode-telemetry",   "tnode_telemetry.py"),
+    ("pair-watch",        "pair_watch.py"),
+]:
+    components.append({
+        "id": comp_id, "kind": "daemon-embedded",
+        "version": extract_ver(scripts_dir / fname) or "unknown",
+        "source": f"scripts/{fname}",
+    })
+
+for comp_id, npm_name in [
+    ("openclaw-gateway", "@openclaw/gateway"),
+    ("openclaw-cli",     "@openclaw/cli"),
+]:
+    components.append({
+        "id": comp_id, "kind": "binary-npm",
+        "version": npm_ver(npm_name) or "unknown",
+        "source": npm_name,
+    })
+
+for comp_id in ["cloudflared", "qrencode"]:
+    components.append({
+        "id": comp_id, "kind": "binary-os",
+        "version": "system", "source": "system-package",
+        "driftAllowed": True,
+    })
+
+skills_dir = openclaw_home / "skills"
+if skills_dir.is_dir():
+    for d in sorted(skills_dir.iterdir()):
+        mf = d / "manifest.json"
+        if not mf.is_file(): continue
+        try:
+            m = json.loads(mf.read_text())
+            components.append({
+                "id": m.get("name", d.name),
+                "kind": "plugin-skill",
+                "version": m.get("version", "unknown"),
+                "source": f"skills/{d.name}/",
+                "entrypoint": m.get("entrypoint"),
+            })
+        except Exception as e:
+            print(f"WARN: skipping {mf}: {e}", file=sys.stderr)
+
+ext_dir = openclaw_home / "extensions"
+if ext_dir.is_dir():
+    for d in sorted(ext_dir.iterdir()):
+        pkg = d / "package.json"
+        if not pkg.is_file(): continue
+        try:
+            m = json.loads(pkg.read_text())
+            components.append({
+                "id": m.get("name", d.name),
+                "kind": "plugin-extension",
+                "version": m.get("version", "unknown"),
+                "source": f"extensions/{d.name}/",
+            })
+        except Exception as e:
+            print(f"WARN: skipping {pkg}: {e}", file=sys.stderr)
+
+manifest_path.write_text(json.dumps({
+    "schemaVersion": 1,
+    "generatedAt":   datetime.now(timezone.utc).isoformat(),
+    "components":    components,
+}, indent=2) + "\n")
+print(f"OK: wrote {len(components)} components → {manifest_path}")
+COMPMANIFEST_PYEOF
+    chown "$TNODE_USER":"$TNODE_USER" "$OPENCLAW_HOME/components-manifest.json" 2>/dev/null || true
+    success "components-manifest.json generado"
+}
+
+phase_components_manifest() {
+    info "═══ Fase 2: Components manifest ═══"
+    install_verify_scripts
+    write_components_manifest
+}
+
+# ═════════════════════════════════════════════
+# Single-component update path (--component=<X>)
+# ═════════════════════════════════════════════
+
+# Refresh the openclaw npm package + restart the user-level gateway service
+# without touching tunnel.json or openclaw.json (auth token + provider config
+# are preserved). Idempotent.
+update_openclaw_gateway_only() {
+    if ! command_exists npm; then
+        die "openclaw-gateway: npm requerido"
+    fi
+    local npm_target="openclaw"
+    [[ -n "$OPENCLAW_PIN_VERSION" ]] && npm_target="openclaw@$OPENCLAW_PIN_VERSION"
+    run_with_progress "Actualizando openclaw kernel ($npm_target)" --estimate 30 npm install -g "$npm_target"
+
+    local tnode_uid
+    tnode_uid="$(id -u "$TNODE_USER" 2>/dev/null || echo "")"
+    case "$OS" in
+        Darwin)
+            # launchd: kickstart by killing the gateway; launchctl restarts it
+            pkill -f "openclaw-gatewa" 2>/dev/null || true
+            sleep 1
+            ;;
+        Linux)
+            if [[ "$(id -u)" == "0" ]] && [[ -n "$tnode_uid" ]]; then
+                su - "$TNODE_USER" -c "export XDG_RUNTIME_DIR=/run/user/$tnode_uid; systemctl --user restart openclaw-gateway" 2>/dev/null || true
+            else
+                systemctl --user restart openclaw-gateway 2>/dev/null || true
+            fi
+            ;;
+    esac
+    success "openclaw-gateway refreshed"
+}
+
+# Refresh cloudflared binary via OS package manager + restart its service.
+# Tunnel credentials/config are untouched.
+update_cloudflared_only() {
+    case "$OS" in
+        Darwin)
+            ensure_brew_on_path
+            if command_exists brew; then
+                run_with_progress "brew upgrade cloudflared" --estimate 25 \
+                    brew upgrade cloudflare/cloudflare/cloudflared 2>/dev/null || true
+            else
+                warn "brew no disponible — skip cloudflared upgrade"
+            fi
+            launchctl kickstart -k system/com.cloudflare.cloudflared 2>/dev/null || true
+            ;;
+        Linux)
+            local arch cfd_arch="amd64"
+            arch="$(uname -m)"
+            case "$arch" in
+                aarch64|arm64) cfd_arch="arm64" ;;
+                armv7*|armhf)  cfd_arch="arm" ;;
+            esac
+            local cfd_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cfd_arch}"
+            run_with_progress "Descargando cloudflared latest" --estimate 15 \
+                bash -c "curl -fsSL '$cfd_url' -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"
+            systemctl restart cloudflared 2>/dev/null || true
+            ;;
+    esac
+    success "cloudflared refreshed"
+}
+
+# Map component id → absolute path of its verify script (verify_<id>.py)
+verify_script_for() {
+    local comp="$1"
+    local p="$OPENCLAW_HOME/verify/verify_${comp}.py"
+    [[ -f "$p" ]] && echo "$p" || echo ""
+}
+
+# Run verify_<comp>.py and translate exit codes into installer-level outcomes.
+# abort_on_fail=1 (default): die on exit≥2; abort_on_fail=0: warn + return rc
+# (used by run_smoke_test_all to collect aggregate results).
+run_smoke_test_one() {
+    local comp="$1"
+    local abort_on_fail="${2:-1}"
+    local script
+    script="$(verify_script_for "$comp")"
+    if [[ -z "$script" ]]; then
+        warn "smoke test $comp: verify_${comp}.py no encontrado, skip"
+        return 0
+    fi
+    if ! command_exists python3; then
+        warn "smoke test $comp: python3 no disponible, skip"
+        return 0
+    fi
+    info "Smoke test: $comp"
+    local out rc=0
+    out="$(run_as_tnode python3 "$script" 2>&1)" || rc=$?
+    case "$rc" in
+        0) success "smoke $comp: OK"; return 0 ;;
+        1) warn    "smoke $comp: warn — $(echo "$out" | tail -1)"; return 0 ;;
+        *)
+            if [[ "$abort_on_fail" == "1" ]]; then
+                echo "$out" >&2
+                die "smoke $comp: FAIL (exit $rc). Re-run con --no-smoke-test para forzar."
+            fi
+            warn "smoke $comp: FAIL (exit $rc) — $(echo "$out" | tail -1)"
+            return "$rc"
+            ;;
+    esac
+}
+
+# Iterate the components manifest and verify every daemon/binary-os entry.
+# Aggregates failures and dies once at the end so the operator sees the full
+# picture (rather than aborting on the first failure).
+run_smoke_test_all() {
+    info "═══ Smoke tests ═══"
+    local manifest="$OPENCLAW_HOME/components-manifest.json"
+    if [[ ! -f "$manifest" ]]; then
+        warn "components-manifest.json no encontrado, skip smoke tests"
+        return 0
+    fi
+    local comps
+    comps="$(python3 -c "
+import json
+m = json.load(open('$manifest'))
+for c in m.get('components', []):
+    if c.get('kind', '') in ('daemon', 'daemon-embedded', 'binary-os', 'binary-npm', 'kernel'):
+        print(c.get('id', ''))
+" 2>/dev/null || echo "")"
+    if [[ -z "$comps" ]]; then
+        warn "manifest sin daemon/binary-os/binary-npm/kernel — skip smoke tests"
+        return 0
+    fi
+    local failed=0 c
+    while IFS= read -r c; do
+        [[ -z "$c" ]] && continue
+        run_smoke_test_one "$c" "0" || failed=$((failed + 1))
+    done <<<"$comps"
+
+    # Always run the deprecation gate even if the component isn't in the local
+    # manifest — a zombie llm-config-watcher install on a previously-paired
+    # node will not appear in components-manifest.json (the new installer
+    # doesn't write it), so we'd miss it without this explicit pass.
+    run_smoke_test_one "tnode-llm-config-watcher" "0" || failed=$((failed + 1))
+
+    if [[ "$failed" -gt 0 ]]; then
+        die "smoke tests: $failed componente(s) fallaron"
+    fi
+    success "smoke tests: todos OK"
+}
+
+# Dispatch a single-component refresh: install/update the named component,
+# regenerate the manifest so its version is current, then smoke-test it.
+cmd_component() {
+    local comp="$COMPONENT"
+    # Single-component path bypasses phase_validate, so seed OS/ARCH and
+    # OPENCLAW_HOME / TNODE_USER / TNODE_HOME the same way the full flow would.
+    detect_os
+    setup_tnode_user
+    info "═══ Componente único: $comp ═══"
+    case "$comp" in
+        openclaw-gateway)   update_openclaw_gateway_only ;;
+        tnode-chat-sync)    install_tnode_chat_sync ;;
+        tnode-config-sync)  install_tnode_config_sync ;;
+        tnode-telemetry)    install_tnode_telemetry ;;
+        pair-watch)         install_pair_watch ;;
+        cloudflared)        update_cloudflared_only ;;
+        *) die "cmd_component: $comp no soportado (debería haber sido validado en parse_args)" ;;
+    esac
+    install_verify_scripts
+    write_components_manifest
+    if [[ "$NO_SMOKE_TEST" == "0" ]]; then
+        run_smoke_test_one "$comp" "1"
+    fi
+}
+
+# ═════════════════════════════════════════════
 # MAIN
 # ═════════════════════════════════════════════
 main() {
@@ -6071,12 +6577,41 @@ main() {
     fi
 
     print_banner
+
+    # --component=<X>: skip the multi-phase flow and only refresh that one.
+    if [[ -n "$COMPONENT" ]]; then
+        cmd_component
+        exit 0
+    fi
+
     phase_validate
-    phase_ollama
-    phase_openclaw
-    phase_tunnel
-    phase_tailscale
+    if [[ "$UPDATE_ONLY" == "0" ]]; then
+        # Full install path
+        phase_ollama
+        phase_openclaw
+        phase_tunnel
+        phase_tailscale
+    else
+        # Update-only path: skip ollama / openclaw kernel reinstall / tunnel
+        # provisioning / tailscale. Kernel + cloudflared refresh is delegated
+        # to `--component=<id>` so operators choose explicitly when to bump.
+        info "modo --update-only: skip ollama / openclaw / tunnel / tailscale"
+    fi
     phase_helpers
+    # In update-only mode, phase_helpers refreshes pair-watch + tnode-config-sync
+    # but not tnode-chat-sync / tnode-telemetry (those normally install only
+    # after a fresh tunnel provisioning). Refresh them too if their scripts
+    # already exist on disk (i.e. node was previously paired).
+    if [[ "$UPDATE_ONLY" == "1" ]]; then
+        if [[ -f "$OPENCLAW_HOME/scripts/tnode_chat_sync.py" ]]; then
+            install_tnode_chat_sync
+        fi
+        if [[ -f "$OPENCLAW_HOME/scripts/tnode_telemetry.py" ]]; then
+            install_tnode_telemetry
+        fi
+    fi
+    phase_components_manifest
+    [[ "$NO_SMOKE_TEST" == "0" && "$UPDATE_ONLY" == "1" ]] && run_smoke_test_all
     phase_summary
 }
 
