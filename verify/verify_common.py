@@ -78,15 +78,30 @@ def find_self(component_id: str, manifest_path: Optional[Path] = None) -> Option
     return None
 
 
-def check_service_active(service_name: str) -> CheckResult:
-    """Linux: systemctl is-active. macOS: launchctl print system."""
+def check_service_active(service_name: str,
+                         darwin_label: Optional[str] = None) -> CheckResult:
+    """Linux: `systemctl --user is-active <service_name>`.
+    macOS: `launchctl print gui/<uid>/<darwin_label>` (LaunchAgents live in
+    the user-level domain, not system/). If darwin_label is None, default
+    to `com.tbrain.<service_name>` — the convention for TBrain daemons.
+    Pass an explicit label for non-TBrain services like cloudflared
+    (`com.cloudflare.cloudflared`) or openclaw-gateway (`ai.openclaw.gateway`).
+    """
     if sys.platform == "darwin":
-        rc, out, _ = _run(["launchctl", "print", f"system/{service_name}"])
+        import os
+        label = darwin_label or f"com.tbrain.{service_name}"
+        rc, out, _ = _run(["launchctl", "print", f"gui/{os.getuid()}/{label}"])
         if rc == 0 and "state = running" in out:
             return {"name": "service-active", "status": "ok",
-                    "details": f"launchd: {service_name} running"}
+                    "details": f"launchd: {label} running"}
         return {"name": "service-active", "status": "fail",
-                "details": f"launchd: {service_name} not running (rc={rc})"}
+                "details": f"launchd: {label} not running (rc={rc})"}
+    # Linux: try user service first (matches install_*_systemd in installer),
+    # fall back to system service for legacy installs.
+    rc, out, _ = _run(["systemctl", "--user", "is-active", service_name])
+    if rc == 0 and out == "active":
+        return {"name": "service-active", "status": "ok",
+                "details": f"systemd --user: {service_name} active"}
     rc, out, _ = _run(["systemctl", "is-active", service_name])
     if rc == 0 and out == "active":
         return {"name": "service-active", "status": "ok",

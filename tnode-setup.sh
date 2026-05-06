@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.9.1"
+TNODE_SETUP_VERSION="1.9.2"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -3736,8 +3736,8 @@ write_tnode_chat_sync_py() {
     cat > "$dest" <<'CHATSYNCPYEOF'
 #!/usr/bin/env python3
 """tnode-chat-sync — see cmoralestbrain/skills for full docs."""
-__VERSION__ = "1.8.15"
 from __future__ import annotations
+__VERSION__ = "1.8.15"
 
 import hashlib
 import hmac
@@ -4360,8 +4360,8 @@ Iteration 1: one stream → `usage`.
 
 Runs as its own systemd unit (tnode-telemetry.service).
 """
-__VERSION__ = "1.8.13"
 from __future__ import annotations
+__VERSION__ = "1.8.13"
 
 import argparse
 import asyncio

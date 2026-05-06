@@ -15,7 +15,8 @@ from verify_common import (  # noqa: E402
 )
 
 COMPONENT_ID = "cloudflared"
-SERVICE_NAME = "cloudflared"
+SERVICE_NAME = "cloudflared"          # systemd unit name on Linux
+DARWIN_LABEL = "com.cloudflare.cloudflared"  # launchd label on macOS
 PACKAGE_NAME = "cloudflared"
 
 
@@ -24,7 +25,7 @@ def main() -> int:
     expected = entry.get("version") if entry else "system"
 
     checks = [
-        check_service_active(SERVICE_NAME),
+        check_service_active(SERVICE_NAME, darwin_label=DARWIN_LABEL),
         check_apt_version(PACKAGE_NAME),
     ]
     actual = next((c["details"].split("=")[-1] if "=" in c["details"] else c["details"]

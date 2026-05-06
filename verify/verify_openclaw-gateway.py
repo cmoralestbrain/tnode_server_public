@@ -17,7 +17,8 @@ from verify_common import (  # noqa: E402
 )
 
 COMPONENT_ID = "openclaw-gateway"
-SERVICE_NAME = "openclaw-gateway"
+SERVICE_NAME = "openclaw-gateway"           # systemd --user unit on Linux
+DARWIN_LABEL = "ai.openclaw.gateway"        # launchd label on macOS
 NPM_PACKAGE = "@openclaw/gateway"
 OPENCLAW_JSON = Path.home() / ".openclaw" / "openclaw.json"
 GATEWAY_WS_URL = "ws://127.0.0.1:18789"
@@ -28,7 +29,7 @@ def main() -> int:
     expected = entry.get("version") if entry else "unknown"
 
     checks = [
-        check_service_active(SERVICE_NAME),
+        check_service_active(SERVICE_NAME, darwin_label=DARWIN_LABEL),
         check_npm_version(NPM_PACKAGE),
         check_http_probe(GATEWAY_WS_URL, timeout=3),
         check_json_valid(OPENCLAW_JSON),
