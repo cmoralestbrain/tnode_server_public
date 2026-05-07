@@ -24,7 +24,7 @@ Exit codes:
 Stdlib only (Python 3.9+). Diseñado para correr en Mac/Linux sin deps externas.
 """
 from __future__ import annotations
-__VERSION__ = "1.0.0"
+__VERSION__ = "1.0.1"
 
 import hashlib
 import json
@@ -247,6 +247,28 @@ def check_apt_version(package_name: str) -> CheckResult:
                 "details": f"apt: {package_name}={out}"}
     return {"name": "apt-version", "status": "warn",
             "details": f"apt: {package_name} not installed (rc={rc})"}
+
+
+def check_python_module(module_name: str, *, required: bool = True) -> CheckResult:
+    """Imports `module_name` via the same `python3` the daemons use and reports
+    its `__version__` if available. `required=False` downgrades a missing
+    module to `warn` (e.g. optional features). The shorthand details
+    `<module>=<version>` lets manifests/installers grep the version field
+    without parsing JSON twice."""
+    rc, out, err = _run(
+        ["python3", "-c",
+         f"import {module_name} as m; "
+         f"print(getattr(m, '__version__', 'unknown'))"],
+        timeout=5,
+    )
+    if rc == 0 and out:
+        version = out.strip()
+        return {"name": f"python-{module_name}", "status": "ok",
+                "details": f"{module_name}={version}"}
+    status = "fail" if required else "warn"
+    msg = err.strip() or f"rc={rc}"
+    return {"name": f"python-{module_name}", "status": status,
+            "details": f"import {module_name} failed: {msg}"}
 
 
 def report(component: str, version_expected: str, version_actual: Optional[str],

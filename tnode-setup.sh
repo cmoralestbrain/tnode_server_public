@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.9.3"
+TNODE_SETUP_VERSION="1.9.4"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -493,6 +493,54 @@ ensure_websockets_modern() {
         die "Tras pip install, websockets sigue en ${final_version}. Probablemente apt's python3-websockets está shadowing el pip install — desinstala con: apt remove -y python3-websockets"
     fi
     success "websockets actualizado a ${final_version}"
+}
+
+# Ensures Python `psutil` is importable. The telemetry sidecar uses psutil
+# to collect CPU/RAM/disk metrics for the `health` stream — without it,
+# the sidecar logs a warning and silently disables the stream, so the
+# mobile dashboard's Salud widget shows no data (Mini incident 2026-05-07).
+# Linux: apt/dnf/yum already install python3-psutil during phase_helpers,
+# so this is mostly a safety net. macOS: Apple's Python ships without it,
+# pip-install with PEP 668 fallback (matches ensure_websockets_modern).
+ensure_psutil_installed() {
+    if /usr/bin/env python3 -c 'import psutil' >/dev/null 2>&1; then
+        local v
+        v="$(/usr/bin/env python3 -c 'import psutil; print(psutil.__version__)' 2>/dev/null || echo 'unknown')"
+        success "psutil ${v} OK"
+        return 0
+    fi
+    info "psutil no está instalado — el stream health del sidecar lo necesita"
+
+    if ! /usr/bin/env python3 -m pip --version >/dev/null 2>&1; then
+        warn "python3-pip no disponible — saltando install de psutil (health stream quedará deshabilitado)"
+        return 1
+    fi
+
+    local install_log
+    install_log="$(mktemp)"
+    local rc=0
+    /usr/bin/env python3 -m pip install psutil >"$install_log" 2>&1 || rc=$?
+    if [[ "$rc" -ne 0 ]] && grep -q "externally-managed-environment" "$install_log"; then
+        info "Reintentando con --break-system-packages (PEP 668)"
+        rc=0
+        /usr/bin/env python3 -m pip install --break-system-packages psutil >"$install_log" 2>&1 || rc=$?
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        warn "pip install psutil falló (exit ${rc}). Últimas líneas:"
+        tail -10 "$install_log" >&2 || true
+        rm -f "$install_log"
+        warn "Health stream del sidecar quedará deshabilitado en este nodo"
+        return 1
+    fi
+    rm -f "$install_log"
+
+    local final_version
+    final_version="$(/usr/bin/env python3 -c 'import psutil; print(psutil.__version__)' 2>/dev/null || echo 'none')"
+    if [[ "$final_version" == "none" ]]; then
+        warn "Tras pip install, 'import psutil' falla. Health stream deshabilitado"
+        return 1
+    fi
+    success "psutil instalado (${final_version})"
 }
 
 # Resolve Homebrew binary
@@ -980,6 +1028,9 @@ ensure_nodejs() {
             # Distro `python3-websockets` packages are often stuck on 9.x —
             # force-upgrade so the telemetry sidecar can accept WS clients.
             ensure_websockets_modern
+            # Validate psutil landed (apt above already pulled python3-psutil);
+            # falls through to pip-install if the distro lacks the apt pkg.
+            ensure_psutil_installed || true
             ;;
     esac
 
@@ -4293,6 +4344,10 @@ install_telemetry_launchd() {
     # Apple's Python — ensure_websockets_modern handles install + version
     # validation (>=13 required, see comment on the function).
     ensure_websockets_modern
+    # psutil powers the `health` stream (CPU/RAM/disk). Apple's Python
+    # ships without it; install via pip. Soft-fail: sidecar still works
+    # for `usage` stream even if psutil is unavailable.
+    ensure_psutil_installed || true
 
     local plist_label="com.tbrain.tnode-telemetry"
     local plist_dest="$HOME/Library/LaunchAgents/${plist_label}.plist"
