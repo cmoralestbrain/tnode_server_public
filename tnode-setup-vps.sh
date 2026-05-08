@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.9.4"
+TNODE_SETUP_VERSION="1.9.5"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -4691,7 +4691,7 @@ Iteration 1: one stream → `usage`.
 Runs as its own systemd unit (tnode-telemetry.service).
 """
 from __future__ import annotations
-__VERSION__ = "1.8.13"
+__VERSION__ = "1.8.14"
 
 import argparse
 import asyncio
@@ -5701,7 +5701,13 @@ def _agent_model_set(agent_id: str, model_slug: str) -> Dict[str, Any]:
     """Sets the per-agent primary model. If the node has no `agents.list[]`
     entry for `agent_id`, one is created (`{id, default, model: {primary}}`),
     so this works on freshly-provisioned nodes that only have
-    `defaults.models`. Atomic file write + best-effort gateway reload."""
+    `defaults.models`. Atomic file write + best-effort gateway reload.
+
+    Critically also adds `model_slug` to `agents.defaults.models` (the plural
+    dict). OpenClaw v2026.4.x builds the agent's allowlist from that key —
+    if the slug isn't there, the resolver silently falls back to the
+    pre-existing default and the user's selection is ignored at runtime.
+    Merges (doesn't replace) so multiple agents can keep distinct models."""
     if not isinstance(model_slug, str) or "/" not in model_slug:
         raise AgentError(
             "invalid-model-slug",
@@ -5727,6 +5733,17 @@ def _agent_model_set(agent_id: str, model_slug: str) -> Dict[str, Any]:
     if not isinstance(agent.get("model"), dict):
         agent["model"] = {}
     agent["model"]["primary"] = model_slug
+    defaults = agents.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        raise AgentError("defaults-malformed", "agents.defaults is not an object")
+    defaults_models = defaults.setdefault("models", {})
+    if not isinstance(defaults_models, dict):
+        raise AgentError(
+            "defaults-models-malformed",
+            "agents.defaults.models is not an object",
+        )
+    if model_slug not in defaults_models:
+        defaults_models[model_slug] = {}
     _save_openclaw_json_atomic(config)
     reload_ok = _reload_gateway()
     logger.info(
