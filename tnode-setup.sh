@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.9.5"
+TNODE_SETUP_VERSION="1.9.6"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -3820,7 +3820,7 @@ write_tnode_chat_sync_py() {
 #!/usr/bin/env python3
 """tnode-chat-sync — see cmoralestbrain/skills for full docs."""
 from __future__ import annotations
-__VERSION__ = "1.8.15"
+__VERSION__ = "1.8.16"
 
 import hashlib
 import hmac
