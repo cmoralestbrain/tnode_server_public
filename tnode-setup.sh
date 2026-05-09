@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.9.6"
+TNODE_SETUP_VERSION="1.9.7"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -3820,7 +3820,7 @@ write_tnode_chat_sync_py() {
 #!/usr/bin/env python3
 """tnode-chat-sync — see cmoralestbrain/skills for full docs."""
 from __future__ import annotations
-__VERSION__ = "1.8.16"
+__VERSION__ = "1.8.17"
 
 import hashlib
 import hmac
@@ -4013,6 +4013,34 @@ def runid_from_custom(entry: dict):
     return (entry.get("parentId"), data.get("runId"))
 
 
+def assistant_turn_from_trajectory(entry: dict):
+    """Return a normalized assistant turn from an OpenClaw v2026.5.x
+    `type:"model.completed"` trajectory event, or None if `entry` is not
+    that shape. The trajectory event already carries the runId, so the
+    resulting turn can be flushed immediately — no buffering wait."""
+    if entry.get("type") != "model.completed":
+        return None
+    data = entry.get("data") or {}
+    texts = data.get("assistantTexts") or []
+    if not isinstance(texts, list):
+        return None
+    content = "\n".join(t for t in texts if isinstance(t, str)).strip()
+    if not content:
+        return None
+    if _is_silent_ack("assistant", content):
+        return None
+    run_id = entry.get("runId") or data.get("runId")
+    ts_raw = entry.get("ts") or entry.get("timestamp") or data.get("ts")
+    return {
+        "role": "assistant",
+        "content": content,
+        "ts": ts_raw,
+        "turnId": run_id,
+        "idempotencyKey": None,
+        "entryId": None,
+    }
+
+
 def message_id_for(turn: dict) -> str:
     if turn.get("idempotencyKey"):
         prefix = "u_" if turn["role"] == "user" else "a_"
@@ -4043,7 +4071,25 @@ class SessionTailer:
                 self.sessions_dir = new_dir
             else:
                 return []
-        return sorted(self.sessions_dir.glob("*.jsonl"))
+        # OpenClaw v2026.5.x writes a sibling `<sessionId>.trajectory.jsonl`
+        # next to each `<sessionId>.jsonl`. Tail trajectory exclusively when
+        # present — see comment in skills/tnode-chat-sync for full rationale.
+        all_files = sorted(self.sessions_dir.glob("*.jsonl"))
+        traj_sessions = {
+            p.name[: -len(".trajectory.jsonl")]
+            for p in all_files
+            if p.name.endswith(".trajectory.jsonl")
+        }
+        out: list[Path] = []
+        for p in all_files:
+            if p.name.endswith(".trajectory.jsonl"):
+                out.append(p)
+                continue
+            session_id = p.stem
+            if session_id in traj_sessions:
+                continue
+            out.append(p)
+        return out
 
     def read_new_lines(self):
         for path in self._iter_files():
@@ -4168,6 +4214,18 @@ def main() -> int:
             for line in tailer.read_new_lines():
                 entry = parse_line(line)
                 if entry is None:
+                    continue
+
+                # Preferred path (OpenClaw v2026.5.x): trajectory event
+                # carries runId + final assistantTexts → flush directly.
+                turn = assistant_turn_from_trajectory(entry)
+                if turn is not None:
+                    try:
+                        flush_turn(turn)
+                    except urllib.error.HTTPError as e:
+                        if e.code == 401:
+                            token = None
+                            break
                     continue
 
                 turn = assistant_turn_from(entry)

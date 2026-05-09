@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.9.6"
+TNODE_SETUP_VERSION="1.9.7"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -3883,7 +3883,7 @@ Env/overrides:
   TNODE_CHAT_SYNC_POLL_MS   Polling interval ms (default 500)
 """
 from __future__ import annotations
-__VERSION__ = "1.8.16"
+__VERSION__ = "1.8.17"
 
 import hashlib
 import hmac
@@ -4253,13 +4253,52 @@ def assistant_turn_from(entry: dict):
 
 def runid_from_custom(entry: dict):
     """Return (parentId, runId) if entry is the bootstrap-context custom
-    event that follows an assistant message; else (None, None)."""
+    event that follows an assistant message; else (None, None).
+
+    Used only on legacy OpenClaw (v2026.4.x) sessions that don't ship a
+    sibling `*.trajectory.jsonl`. Newer builds (v2026.5.x) deprecated this
+    custom event and put runId directly on `type:"model.completed"` in
+    the trajectory file — see `assistant_turn_from_trajectory` below.
+    """
     if entry.get("type") != "custom":
         return (None, None)
     if entry.get("customType") != "openclaw:bootstrap-context:full":
         return (None, None)
     data = entry.get("data") or {}
     return (entry.get("parentId"), data.get("runId"))
+
+
+def assistant_turn_from_trajectory(entry: dict):
+    """Return a normalized assistant turn from an OpenClaw v2026.5.x
+    `type:"model.completed"` trajectory event, or None if `entry` is not
+    that shape.
+
+    The trajectory event already carries the runId, so the resulting turn
+    can be flushed immediately — no buffering / bootstrap-context wait,
+    and the Firestore doc id will be `a_{runId}` (matching what the
+    Flutter client uses for live-stream dedup).
+    """
+    if entry.get("type") != "model.completed":
+        return None
+    data = entry.get("data") or {}
+    texts = data.get("assistantTexts") or []
+    if not isinstance(texts, list):
+        return None
+    content = "\n".join(t for t in texts if isinstance(t, str)).strip()
+    if not content:
+        return None
+    if _is_silent_ack("assistant", content):
+        return None
+    run_id = entry.get("runId") or data.get("runId")
+    ts_raw = entry.get("ts") or entry.get("timestamp") or data.get("ts")
+    return {
+        "role": "assistant",
+        "content": content,
+        "ts": ts_raw,
+        "turnId": run_id,
+        "idempotencyKey": None,
+        "entryId": None,  # no buffering needed — runId is already populated
+    }
 
 
 def message_id_for(turn: dict) -> str:
@@ -4299,7 +4338,31 @@ class SessionTailer:
                 self.sessions_dir = new_dir
             else:
                 return []
-        return sorted(self.sessions_dir.glob("*.jsonl"))
+        # OpenClaw v2026.5.x writes a sibling `<sessionId>.trajectory.jsonl`
+        # next to each `<sessionId>.jsonl`. The trajectory file is canonical
+        # and includes `type:"model.completed"` events with the runId we
+        # need for client-side dedup. When present we tail ONLY the
+        # trajectory file for that session and ignore the legacy main jsonl
+        # (which still has `type:"message"` entries but no longer ships the
+        # `bootstrap-context:full` correlation event the watcher used to
+        # rely on, so it would always time out and write hash-based ids
+        # — duplicating against the live-WS message in the client).
+        all_files = sorted(self.sessions_dir.glob("*.jsonl"))
+        traj_sessions = {
+            p.name[: -len(".trajectory.jsonl")]
+            for p in all_files
+            if p.name.endswith(".trajectory.jsonl")
+        }
+        out: list[Path] = []
+        for p in all_files:
+            if p.name.endswith(".trajectory.jsonl"):
+                out.append(p)
+                continue
+            session_id = p.stem
+            if session_id in traj_sessions:
+                continue
+            out.append(p)
+        return out
 
     def read_new_lines(self):
         for path in self._iter_files():
@@ -4476,6 +4539,22 @@ def main() -> int:
             for line in tailer.read_new_lines():
                 entry = parse_line(line)
                 if entry is None:
+                    continue
+
+                # Case 0 (preferred — OpenClaw v2026.5.x trajectory event):
+                # `model.completed` carries the runId and the final
+                # assistant text in one shot. Flush directly so the doc
+                # lands as `a_{runId}` and matches the live-stream
+                # message the Flutter client already wrote with the same
+                # turnId. No buffering / timeout wait.
+                turn = assistant_turn_from_trajectory(entry)
+                if turn is not None:
+                    try:
+                        flush_turn(turn)
+                    except urllib.error.HTTPError as e:
+                        if e.code == 401:
+                            token = None
+                            break
                     continue
 
                 # Case A: assistant message → buffer waiting for runId.
