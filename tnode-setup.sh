@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.9.7"
+TNODE_SETUP_VERSION="1.9.8"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -142,6 +142,8 @@ VERBOSE=0
 UPDATE_ONLY=0         # --update-only: refresh scripts/binaries, never rotate secrets
 COMPONENT=""          # --component <name>: only run install_<name> + verify, implies --update-only
 NO_SMOKE_TEST=0       # --no-smoke-test: skip post-update verify_<X>.py (escape hatch)
+UNINSTALL=0           # --uninstall: stop+remove local services and ~/.openclaw, NO server-side cleanup
+PURGE_BINARIES=0      # --purge-binaries: also delete /usr/local/bin/cloudflared and /usr/bin/openclaw
 
 # Components supported by --component=<name> dispatcher. Mirrored in
 # install.tbrain.app/verify/verify_<id>.py. Keep in sync with both.
@@ -691,6 +693,8 @@ parse_args() {
                 shift
                 ;;
             --no-smoke-test) NO_SMOKE_TEST=1 ;;
+            --uninstall)     UNINSTALL=1 ;;
+            --purge-binaries) PURGE_BINARIES=1 ;;
             --version)       echo "tnode-setup v${TNODE_SETUP_VERSION}"; exit 0 ;;
             -h|--help)       print_usage; exit 0 ;;
             *)               warn "Unknown flag: $1" ;;
@@ -741,6 +745,14 @@ Options:
                       tnode-chat-sync, tnode-config-sync, tnode-telemetry,
                       pair-watch, cloudflared.
   --no-smoke-test     Skip post-update verify_<X>.py smoke test.
+  --uninstall         Local cleanup only: stop+disable systemd/launchd units,
+                      remove unit files, delete ~/.openclaw. Does NOT touch
+                      server-side state (Firestore, Cloudflare tunnel) — for
+                      that, delete the node from the TNode mobile app first
+                      (which invokes the deleteAgent Cloud Function).
+  --purge-binaries    With --uninstall, also delete /usr/local/bin/cloudflared
+                      and /usr/bin/openclaw. Off by default (other apps may
+                      use them).
   --version           Print version and exit
   -h, --help          Show this help
 
@@ -6699,6 +6711,315 @@ for c in m.get('components', []):
     success "smoke tests: todos OK"
 }
 
+# ═════════════════════════════════════════════
+# UNINSTALL — local cleanup only
+# ═════════════════════════════════════════════
+# Stops + removes the systemd / launchd units this installer creates and
+# deletes ~/.openclaw. Does NOT touch server-side state: the Cloudflare
+# tunnel + DNS + Firestore docs are owned by the `deleteAgent` callable
+# in tnode_client/functions/src/provisioning/delete.ts, triggered from
+# the mobile app's "Eliminar nodo" UI. Run that BEFORE this script for a
+# clean teardown; otherwise tunnel + Firestore residue persists until
+# `cleanupOrphanedTunnels` (admin-only) prunes it.
+
+# Systemd .service units this installer creates (system + user scope).
+# pair-watch and tnode-config-sync-watch each install as BOTH a .service
+# (the action) and a .path (the file watcher that triggers it), so they
+# appear in both lists. cloudflared-update.{service,timer} are NOT here —
+# they're auto-created by `cloudflared service install` and removed by
+# `cloudflared service uninstall` (do_uninstall calls that explicitly).
+UNINSTALL_SYSTEMD_SERVICES=(
+    cloudflared
+    tnode-chat-sync
+    tnode-config-sync
+    tnode-config-sync-watch
+    tnode-telemetry
+    tnode-llm-config-watcher
+    pair-watch
+)
+# Systemd .path units (file watchers).
+UNINSTALL_SYSTEMD_PATHS=(
+    pair-watch
+    tnode-config-sync-watch
+)
+# Launchd plist labels (macOS).
+UNINSTALL_LAUNCHD_LABELS=(
+    com.tbrain.pair-watch
+    com.tbrain.llm-config-watcher
+    com.tbrain.tnode-config-sync
+    com.tbrain.tnode-config-sync-watch
+    com.tbrain.tnode-chat-sync
+    com.tbrain.tnode-telemetry
+)
+
+# Run a privileged command directly if root, via `sudo -n` otherwise.
+# Non-interactive on purpose — uninstall is meant to work under
+# `curl ... | bash --yes` where there's no TTY for a sudo password.
+_uninstall_sudo() {
+    if [[ "$(id -u)" == "0" ]]; then
+        "$@"
+    else
+        sudo -n "$@" 2>/dev/null
+    fi
+}
+
+# Stop+disable+remove a single systemd unit at both user and system scope.
+# `type` is "service" or "path". Missing units are silently skipped, so
+# this is safe to call against a partial install.
+_uninstall_systemd_unit() {
+    local name="$1" type="${2:-service}"
+    local unit="${name}.${type}"
+    local user_path="$HOME/.config/systemd/user/${unit}"
+    local sys_path="/etc/systemd/system/${unit}"
+
+    if [[ -f "$user_path" ]]; then
+        local rt="/run/user/$(id -u)"
+        XDG_RUNTIME_DIR="$rt" systemctl --user stop "$unit" 2>/dev/null || true
+        XDG_RUNTIME_DIR="$rt" systemctl --user disable "$unit" 2>/dev/null || true
+        rm -f "$user_path"
+        info "removido (user): $unit"
+    fi
+    if [[ -f "$sys_path" ]]; then
+        _uninstall_sudo systemctl stop "$unit" 2>/dev/null || true
+        _uninstall_sudo systemctl disable "$unit" 2>/dev/null || true
+        if _uninstall_sudo rm -f "$sys_path"; then
+            info "removido (system): $unit"
+        else
+            warn "no pude remover $sys_path (sin sudo)"
+        fi
+    fi
+}
+
+# Unload + remove a launchd plist by label (macOS).
+_uninstall_launchd_label() {
+    local label="$1"
+    local plist="$HOME/Library/LaunchAgents/${label}.plist"
+    if [[ -f "$plist" ]]; then
+        launchctl unload "$plist" 2>/dev/null || true
+        rm -f "$plist"
+        info "removido (launchd): $label"
+    fi
+}
+
+do_uninstall() {
+    detect_os
+
+    # ── 0. Pre-flight: sudo check ──────────────────────────────
+    # On Linux, almost every cleanup step needs root: deleting unit files
+    # under /etc/systemd/system/, killing the dedicated `tnode` user with
+    # systemd --user under linger, and `userdel -r tnode`. If we aren't
+    # root and can't get sudo non-interactively (curl|bash has no TTY for
+    # a sudo password prompt), abort early with a clear instruction
+    # instead of failing silently halfway through.
+    if [[ "$OS" != "Darwin" ]] && [[ "$(id -u)" != "0" ]]; then
+        if ! sudo -n true 2>/dev/null; then
+            warn "Necesitas root para limpiar /etc/systemd/system y el user dedicado 'tnode'."
+            warn "Re-corre así (cualquiera de las dos):"
+            warn "  sudo -v && curl -fsSL https://install.tbrain.app | bash -s -- --uninstall --yes"
+            warn "  curl -fsSL https://install.tbrain.app -o /tmp/uninstall.sh && sudo bash /tmp/uninstall.sh --uninstall --yes"
+            die "abortando — sin sudo no-interactivo no puedo terminar"
+        fi
+    fi
+
+    # ── 1. Locate every ~/.openclaw on this host ───────────────
+    # The installer writes ~/.openclaw under different users depending on
+    # how it was invoked: as root → /home/tnode/.openclaw (creates a
+    # dedicated `tnode` user); as a regular user → $HOME/.openclaw. A
+    # node may end up with both if the operator switched modes between
+    # runs. Find every candidate so we don't miss state.
+    local candidates=()
+    [[ -d "$HOME/.openclaw" ]] && candidates+=("$HOME/.openclaw")
+    if [[ "$OS" != "Darwin" ]]; then
+        local h
+        for h in /home/*/.openclaw; do
+            [[ -d "$h" ]] || continue
+            # Skip if it's already in the list (e.g. when $HOME == /home/<user>).
+            local already=0
+            local existing
+            for existing in "${candidates[@]}"; do
+                [[ "$existing" == "$h" ]] && already=1 && break
+            done
+            [[ "$already" == "0" ]] && candidates+=("$h")
+        done
+    fi
+
+    phase "1/5" "Uninstall — limpieza local"
+
+    # Best-effort identity readout from any candidate (warning context only).
+    local nodeId="" tunnelDomain="" cand
+    for cand in "${candidates[@]}"; do
+        if [[ -r "$cand/tnode-chat-sync.json" ]] && command_exists python3; then
+            nodeId=$(python3 -c "import json; print(json.load(open('$cand/tnode-chat-sync.json')).get('nodeId',''))" 2>/dev/null || echo "")
+        fi
+        if [[ -r "$cand/tunnel.json" ]] && command_exists python3; then
+            tunnelDomain=$(python3 -c "import json; print(json.load(open('$cand/tunnel.json')).get('domain',''))" 2>/dev/null || echo "")
+        fi
+        [[ -n "$nodeId" ]] && break
+    done
+
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+        info "No hay ningún ~/.openclaw en este host."
+    else
+        info "Estado detectado:"
+        [[ -n "$nodeId" ]]       && info "  nodeId:        $nodeId"
+        [[ -n "$tunnelDomain" ]] && info "  tunnelDomain:  $tunnelDomain"
+        info "  Candidatos a borrar:"
+        for cand in "${candidates[@]}"; do
+            info "    $cand"
+        done
+    fi
+
+    warn "Esto borra SOLO el estado local en este nodo."
+    warn "El estado server-side (Firestore + tunnel CF) NO se limpia automáticamente."
+    warn "Para limpiarlo, borra el nodo desde la app móvil ANTES de continuar"
+    warn "(eso dispara la Cloud Function deleteAgent que hace el teardown completo)."
+
+    if [[ "$YES" == "0" ]]; then
+        echo
+        printf "    ¿Continuar con uninstall local? [y/N] "
+        local ans
+        read -r ans
+        case "${ans:-n}" in
+            [yY]|[yY][eE][sS]) ;;
+            *) info "Cancelado por el usuario."; exit 0 ;;
+        esac
+    fi
+
+    # ── 2. cloudflared service uninstall ───────────────────────
+    # `cloudflared service install` creates THREE units atomically:
+    # cloudflared.service AND cloudflared-update.{service,timer}. Its
+    # own `service uninstall` knows about all three; running it first
+    # avoids leaving the auto-update timer behind after we delete
+    # cloudflared.service manually below.
+    phase "2/5" "cloudflared service uninstall"
+    if command_exists cloudflared; then
+        # Suppress output: cloudflared logs ERR + a long systemctl line
+        # whenever its service unit doesn't exist (the common idempotent
+        # case where it was already removed). Real failures get caught
+        # by the manual unit-file removal in step 3.
+        if [[ "$OS" == "Darwin" ]]; then
+            cloudflared service uninstall >/dev/null 2>&1 || true
+        else
+            _uninstall_sudo cloudflared service uninstall >/dev/null 2>&1 || true
+        fi
+        info "cloudflared service uninstall ejecutado"
+    else
+        info "cloudflared no instalado — saltando"
+    fi
+
+    # ── 3. Dismantle dedicated tnode user + system units ───────
+    phase "3/5" "Detener servicios y remover unit files"
+    if [[ "$OS" == "Darwin" ]]; then
+        for label in "${UNINSTALL_LAUNCHD_LABELS[@]}"; do
+            _uninstall_launchd_label "$label"
+        done
+    else
+        # Disable linger on the dedicated `tnode` user (if it exists);
+        # otherwise its `systemd --user` instance keeps respawning
+        # openclaw-gateway and friends even after we delete unit files.
+        # Stop the user manager service explicitly so the kill takes
+        # effect now, not on next boot.
+        if id tnode >/dev/null 2>&1; then
+            _uninstall_sudo loginctl disable-linger tnode 2>/dev/null || true
+            local tnode_uid
+            tnode_uid=$(id -u tnode 2>/dev/null || echo "")
+            if [[ -n "$tnode_uid" ]]; then
+                _uninstall_sudo systemctl stop "user@${tnode_uid}.service" 2>/dev/null || true
+            fi
+            info "linger desactivado y user@${tnode_uid:-?}.service detenido"
+        fi
+        # Remove every system-scope unit file we might have created.
+        for svc in "${UNINSTALL_SYSTEMD_SERVICES[@]}"; do
+            _uninstall_systemd_unit "$svc" "service"
+        done
+        for pth in "${UNINSTALL_SYSTEMD_PATHS[@]}"; do
+            _uninstall_systemd_unit "$pth" "path"
+        done
+        _uninstall_sudo systemctl daemon-reload 2>/dev/null || true
+        # reset-failed clears systemd's cached "loaded: not-found" state
+        # for units we just removed, so `systemctl status` returns clean.
+        _uninstall_sudo systemctl reset-failed 2>/dev/null || true
+    fi
+    success "servicios detenidos y unit files removidos"
+
+    # ── 4. Kill leftover processes + remove every ~/.openclaw ──
+    phase "4/5" "Kill procesos sobrevivientes + borrar estado local"
+    if [[ "$OS" != "Darwin" ]]; then
+        # Some embedded daemons (openclaw-gateway, tnode_*.py) may still
+        # be running outside any unit (e.g. orphaned by user@.service
+        # teardown above, or started via SSH for debugging). Nuke them
+        # by pattern so the rm -rf below doesn't race against active
+        # writers re-creating files in ~/.openclaw.
+        _uninstall_sudo pkill -9 -f openclaw-gateway 2>/dev/null || true
+        _uninstall_sudo pkill -9 -f tnode_chat_sync 2>/dev/null || true
+        _uninstall_sudo pkill -9 -f tnode_config_sync 2>/dev/null || true
+        _uninstall_sudo pkill -9 -f tnode_telemetry 2>/dev/null || true
+        _uninstall_sudo pkill -9 -f tnode_llm_config_watcher 2>/dev/null || true
+        _uninstall_sudo pkill -9 -f "cloudflared --no-autoupdate tunnel run" 2>/dev/null || true
+        sleep 1
+    fi
+
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+        info "no hay ~/.openclaw — nada que borrar"
+    else
+        for cand in "${candidates[@]}"; do
+            if rm -rf "$cand" 2>/dev/null; then
+                success "borrado: $cand"
+            elif _uninstall_sudo rm -rf "$cand"; then
+                success "borrado (via sudo): $cand"
+            else
+                warn "no pude borrar $cand"
+            fi
+        done
+    fi
+
+    # Optionally remove the dedicated `tnode` user. Done last so that
+    # `userdel -r` can clear /home/tnode entirely (~/.config/systemd/user
+    # unit files, ~/.cache, ~/.local, etc. — not just ~/.openclaw which
+    # we already nuked above).
+    if [[ "$OS" != "Darwin" ]] && id tnode >/dev/null 2>&1; then
+        if _uninstall_sudo userdel -r tnode 2>/dev/null; then
+            success "user dedicado 'tnode' eliminado (incluyendo /home/tnode)"
+        else
+            # userdel -r prints "directory not empty" when something is
+            # still holding a file open. Force-kill once more and retry.
+            _uninstall_sudo pkill -9 -u tnode 2>/dev/null || true
+            sleep 1
+            if _uninstall_sudo userdel -r tnode 2>/dev/null; then
+                success "user dedicado 'tnode' eliminado tras retry"
+            else
+                warn "no pude userdel -r tnode — re-corre el uninstall"
+            fi
+        fi
+    fi
+
+    # ── 5. Optional: purge installer-managed binaries ──────────
+    if [[ "$PURGE_BINARIES" == "1" ]]; then
+        phase "5/5" "Borrar binarios (--purge-binaries)"
+        local bin
+        for bin in /usr/local/bin/cloudflared /usr/bin/openclaw; do
+            if [[ -e "$bin" ]]; then
+                if _uninstall_sudo rm -f "$bin"; then
+                    success "borrado: $bin"
+                else
+                    warn "no pude borrar $bin"
+                fi
+            fi
+        done
+    else
+        phase "5/5" "Binarios preservados"
+        info "/usr/local/bin/cloudflared y /usr/bin/openclaw NO se tocan."
+        info "Pasa --purge-binaries si los quieres borrar también."
+    fi
+
+    echo
+    success "Uninstall local completo."
+    echo
+    info "Próximos pasos:"
+    info "  • Server-side (si no lo hiciste): borra el nodo desde la app móvil"
+    info "  • Reinstalar:  curl -fsSL https://install.tbrain.app | bash"
+}
+
 # Dispatch a single-component refresh: install/update the named component,
 # regenerate the manifest so its version is current, then smoke-test it.
 cmd_component() {
@@ -6741,6 +7062,15 @@ main() {
     fi
 
     print_banner
+
+    # --uninstall: stop+remove local services and ~/.openclaw, then exit.
+    # Server-side cleanup (Firestore + CF tunnel) is owned by the
+    # `deleteAgent` callable triggered from the mobile app — see
+    # do_uninstall() and tnode_client/functions/src/provisioning/delete.ts.
+    if [[ "$UNINSTALL" == "1" ]]; then
+        do_uninstall
+        exit 0
+    fi
 
     # --component=<X>: skip the multi-phase flow and only refresh that one.
     if [[ -n "$COMPONENT" ]]; then
