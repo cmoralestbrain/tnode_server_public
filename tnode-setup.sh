@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.9.8"
+TNODE_SETUP_VERSION="1.9.9"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -1113,7 +1113,7 @@ configure_gateway_bind() {
         # the operator can run a full install instead.
         local update_only="${UPDATE_ONLY:-0}"
         python3 - "$oc_config" "$use_tunnel" "$update_only" <<'PYEOF'
-import json, sys
+import json, os, sys
 config_path = sys.argv[1]
 use_tunnel = sys.argv[2] == "1"
 update_only = sys.argv[3] == "1"
@@ -1124,6 +1124,27 @@ try:
     if use_tunnel:
         # Cloudflare Tunnel: only listen on localhost, cloudflared handles external
         gw["bind"] = "loopback"
+        # bind=loopback alone makes `openclaw qr` refuse to render with
+        # "Gateway is only bound to loopback. Set gateway.bind=lan, enable
+        # tailscale serve, or configure plugins.entries.device-pair.config.publicUrl."
+        # The tunnel IS the public URL — write it into device-pair so the
+        # QR carries the tunnel hostname instead of refusing. Auto-pair
+        # mode used to set this elsewhere; BYO-tunnel installs (curl pipe
+        # without TNODE_AUTO_PAIR) hit the bug because nothing else wrote
+        # publicUrl. Pulling the domain from tunnel.json — written by
+        # phase_tunnel BEFORE this function is called — keeps the value
+        # consistent with whatever the provisioning Worker handed us.
+        tunnel_json = os.path.join(os.path.dirname(config_path), "tunnel.json")
+        try:
+            with open(tunnel_json) as tj:
+                domain = (json.load(tj) or {}).get("domain", "")
+        except FileNotFoundError:
+            domain = ""
+        if domain:
+            entries = c.setdefault("plugins", {}).setdefault("entries", {})
+            dp = entries.setdefault("device-pair", {})
+            dp["enabled"] = True
+            dp.setdefault("config", {})["publicUrl"] = f"wss://{domain}"
     else:
         # No tunnel: listen on all interfaces (for Tailscale/LAN access)
         gw["bind"] = "lan"
