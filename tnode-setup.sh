@@ -1853,8 +1853,10 @@ phase_helpers() {
     # ── 5d: tnode-config-sync (event-driven command executor + state
     # mirror; replaces llm-config-watcher). Runs on every node regardless
     # of provider so the Flutter app can query state/current and dispatch
-    # commands. The legacy install_llm_config_watcher function above is
-    # kept for rollback but no longer wired into phase_helpers. ──
+    # commands. Sub-agents (install/uninstall/restart_for_subagents) are
+    # also handled here — the Firestore-driven `agentsCatalog/` →
+    # `agents/<id>/agent/` materialization happens on demand from
+    # individual user toggles, not via a polling daemon. ──
     install_tnode_config_sync
 }
 
@@ -2731,7 +2733,11 @@ Env/overrides:
                            (used by the file-watcher trigger).
 """
 from __future__ import annotations
-__VERSION__ = "1.1.0"
+# 1.2.0 — sub-agents: install_subagent / uninstall_subagent /
+#         restart_gateway_for_subagents handlers (Firestore-driven
+#         per-node materialization replacing the agency-agents/ dir
+#         + symlink hack).
+__VERSION__ = "1.2.0"
 
 import hashlib
 import hmac
@@ -3312,10 +3318,12 @@ def _apply_provider_to_openclaw(
 ) -> dict:
     """Merge/update a provider block inside openclaw.json. Returns updated cfg.
 
-    Note: we intentionally do NOT set `agents.defaults.model.primary`. OpenClaw
-    auto-selects the first provider with a valid apiKey, which is what VPS 1
-    runs with and works. Setting primary explicitly causes `Unknown model`
-    because OpenClaw expects an internal registry id.
+    Also activates the model via `agents.defaults.models = {model: {}}` (plural
+    dict). OpenClaw v2026.4.24+ no longer auto-selects: without this dict the
+    gateway falls back to the hardcoded `openai/gpt-5.5` and fails with
+    `No API key found for provider "openai"`. Must be the plural form — the
+    singular `agents.defaults.model.primary` triggers `Unknown model` for any
+    id outside OpenClaw's internal registry (e.g. `qwen/qwen3.6-plus`).
     """
     cfg = read_openclaw_json() or {}
     cfg.setdefault("models", {}).setdefault("providers", {})
@@ -3331,6 +3339,9 @@ def _apply_provider_to_openclaw(
             }
         ],
     }
+    agents_defaults = cfg.setdefault("agents", {}).setdefault("defaults", {})
+    agents_defaults["models"] = {model: {}}
+    agents_defaults.pop("model", None)  # drop legacy singular key
     _write_openclaw_json(cfg)
     return cfg
 
@@ -3488,6 +3499,331 @@ def handle_apply_openrouter_key(token: dict, params: dict) -> dict:
     }
 
 
+# ── Sub-agents handlers ────────────────────────────────────────
+# install/uninstall/restart_for_subagents commands let the user toggle
+# individual sub-agents from the app on a per-node basis. Each install
+# fetches the curated agent files (SOUL.md / AGENTS.md / IDENTITY.md)
+# from `agentsCatalog/{agentId}` in Firestore, materializes them into
+# `~/.openclaw/agents/<id>/agent/`, and updates `agents.list[]` plus
+# `main.subagents.allowAgents`. Uninstall removes the curated files
+# (preserving runtime state in `.openclaw/`) and revokes the entry.
+#
+# Replaces the former `tnode-agents-sync` polling daemon — sub-agents
+# are now user-driven, not pre-installed wholesale.
+
+_AGENTS_DIR = OPENCLAW_DIR / "agents"
+_SUBAGENT_FILES = ("SOUL.md", "AGENTS.md", "IDENTITY.md")
+_SUBAGENT_DEFAULT_MODEL = "openrouter/qwen/qwen3.6-plus"
+
+
+def _firestore_get_agent_doc(token: dict, agent_id: str) -> dict | None:
+    """Read agentsCatalog/{agent_id} via Firestore REST."""
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{PROJECT_ID}"
+        f"/databases/(default)/documents/agentsCatalog/{agent_id}"
+    )
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f'Bearer {token["idToken"]}'},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+
+
+def _fs_unwrap(value: dict):
+    """Convert a Firestore REST typed value into a native Python object."""
+    if "stringValue" in value:
+        return value["stringValue"]
+    if "integerValue" in value:
+        return int(value["integerValue"])
+    if "doubleValue" in value:
+        return float(value["doubleValue"])
+    if "booleanValue" in value:
+        return value["booleanValue"]
+    if "nullValue" in value:
+        return None
+    if "timestampValue" in value:
+        return value["timestampValue"]
+    if "mapValue" in value:
+        return {
+            k: _fs_unwrap(v)
+            for k, v in value["mapValue"].get("fields", {}).items()
+        }
+    if "arrayValue" in value:
+        return [_fs_unwrap(v) for v in value["arrayValue"].get("values", [])]
+    return None
+
+
+def _firestore_upsert_installed_subagent(
+    token: dict, agent_id: str, payload: dict
+) -> None:
+    """Write `users/{uid}/nodes/{nodeId}/installedSubagents/{agent_id}`.
+    Uses PATCH with documentMask to be idempotent."""
+    cfg = load_config()
+    uid = token["uid"]
+    node_id = cfg["nodeId"]
+    fields = {}
+    for k, v in payload.items():
+        if isinstance(v, str):
+            fields[k] = {"stringValue": v}
+        elif isinstance(v, bool):
+            fields[k] = {"booleanValue": v}
+        elif isinstance(v, int):
+            fields[k] = {"integerValue": str(v)}
+        elif v is None:
+            fields[k] = {"nullValue": None}
+    mask = "&".join(f"updateMask.fieldPaths={k}" for k in payload.keys())
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{PROJECT_ID}"
+        f"/databases/(default)/documents/users/{uid}/nodes/{node_id}"
+        f"/installedSubagents/{agent_id}?{mask}"
+    )
+    body = json.dumps({"fields": fields}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f'Bearer {token["idToken"]}',
+            "Content-Type": "application/json",
+        },
+        method="PATCH",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
+
+
+def _firestore_delete_installed_subagent(token: dict, agent_id: str) -> None:
+    cfg = load_config()
+    uid = token["uid"]
+    node_id = cfg["nodeId"]
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{PROJECT_ID}"
+        f"/databases/(default)/documents/users/{uid}/nodes/{node_id}"
+        f"/installedSubagents/{agent_id}"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f'Bearer {token["idToken"]}'},
+        method="DELETE",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+
+
+def _materialize_subagent_files(agent_id: str, files: dict, files_sha: str) -> None:
+    """Write SOUL/AGENTS/IDENTITY + .source.json. Preserves any pre-existing
+    runtime files under .openclaw/ (the gateway owns those)."""
+    target_dir = _AGENTS_DIR / agent_id / "agent"
+    parent = _AGENTS_DIR / agent_id
+
+    # Wipe legacy symlink (from earlier hack-era) before writing real files.
+    if target_dir.is_symlink():
+        target_dir.unlink()
+
+    parent.mkdir(parents=True, exist_ok=True)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    for name in _SUBAGENT_FILES:
+        if name in files:
+            (target_dir / name).write_text(files[name], encoding="utf-8")
+    (target_dir / ".source.json").write_text(
+        json.dumps(
+            {
+                "filesSha": files_sha,
+                "materializedAt": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                ),
+                "source": "config_sync_command",
+            },
+            indent=2,
+        )
+    )
+
+
+def _remove_subagent_files(agent_id: str) -> None:
+    """Remove curated SOUL/AGENTS/IDENTITY/.source.json. Preserves
+    `.openclaw/` (sessions, history) so re-installing keeps context."""
+    target_dir = _AGENTS_DIR / agent_id / "agent"
+    if not target_dir.exists():
+        return
+    for name in (*_SUBAGENT_FILES, ".source.json"):
+        f = target_dir / name
+        if f.is_file():
+            f.unlink()
+
+
+def _update_openclaw_config_for_subagent(
+    agent_id: str, action: str, recommended_model: str | None = None
+) -> bool:
+    """Add/remove an entry in agents.list[] and update main.subagents
+    .allowAgents accordingly. Returns True if the file changed."""
+    if not OPENCLAW_JSON_PATH.exists():
+        return False
+    cfg = json.loads(OPENCLAW_JSON_PATH.read_text())
+    main_idx = next(
+        (i for i, a in enumerate(cfg["agents"]["list"]) if a.get("id") == "main"),
+        None,
+    )
+    if main_idx is None:
+        _log("openclaw.json: 'main' agent not found; cannot update sub-agents")
+        return False
+
+    agent_dir = str(_AGENTS_DIR / agent_id / "agent")
+    existing_idx = next(
+        (
+            i
+            for i, a in enumerate(cfg["agents"]["list"])
+            if a.get("id") == agent_id
+        ),
+        None,
+    )
+
+    if action == "install":
+        entry = (
+            dict(cfg["agents"]["list"][existing_idx])
+            if existing_idx is not None
+            else {}
+        )
+        entry["id"] = agent_id
+        entry.setdefault("name", agent_id)
+        entry["workspace"] = agent_dir
+        entry["agentDir"] = agent_dir
+        if recommended_model:
+            entry.setdefault("model", {})["primary"] = recommended_model
+        elif not entry.get("model", {}).get("primary"):
+            entry.setdefault("model", {})["primary"] = _SUBAGENT_DEFAULT_MODEL
+        if existing_idx is None:
+            cfg["agents"]["list"].append(entry)
+        else:
+            cfg["agents"]["list"][existing_idx] = entry
+    elif action == "uninstall":
+        if existing_idx is None:
+            return False
+        cfg["agents"]["list"].pop(existing_idx)
+    else:
+        return False
+
+    # Rebuild main.subagents.allowAgents from the resulting list.
+    main_entry = cfg["agents"]["list"][
+        next(
+            i for i, a in enumerate(cfg["agents"]["list"]) if a.get("id") == "main"
+        )
+    ]
+    main_entry.setdefault("subagents", {})["allowAgents"] = sorted(
+        a["id"] for a in cfg["agents"]["list"] if a.get("id") != "main"
+    )
+
+    serialized = json.dumps(cfg, indent=2) + "\n"
+    if OPENCLAW_JSON_PATH.read_text() == serialized:
+        return False
+    OPENCLAW_JSON_PATH.write_text(serialized)
+    return True
+
+
+def handle_install_subagent(token: dict, params: dict) -> dict:
+    agent_id = (params.get("agentId") or "").strip()
+    if not agent_id:
+        return {"status": "error", "result": {"error": "missing_agentId"}}
+
+    doc = _firestore_get_agent_doc(token, agent_id)
+    if doc is None:
+        return {
+            "status": "error",
+            "result": {"error": f"agent_not_found: {agent_id}"},
+        }
+    fields = {k: _fs_unwrap(v) for k, v in doc.get("fields", {}).items()}
+    files = fields.get("files") or {}
+    files_sha = fields.get("filesSha") or ""
+    recommended_model = fields.get("recommendedModel")
+
+    if not all(k in files for k in _SUBAGENT_FILES) or not files_sha:
+        return {
+            "status": "error",
+            "result": {"error": f"agent_doc_incomplete: {agent_id}"},
+        }
+
+    try:
+        _materialize_subagent_files(agent_id, files, files_sha)
+        config_changed = _update_openclaw_config_for_subagent(
+            agent_id, "install", recommended_model
+        )
+        _firestore_upsert_installed_subagent(
+            token,
+            agent_id,
+            {
+                "agentId": agent_id,
+                "status": "installed",
+                "filesSha": files_sha,
+            },
+        )
+    except Exception as e:  # noqa: BLE001
+        _log(f"install_subagent {agent_id} failed: {e}")
+        return {"status": "error", "result": {"error": str(e)[:500]}}
+
+    return {
+        "status": "done",
+        "result": {
+            "agentId": agent_id,
+            "filesSha": files_sha,
+            "configChanged": config_changed,
+            "recommendedModel": recommended_model,
+        },
+    }
+
+
+def handle_uninstall_subagent(token: dict, params: dict) -> dict:
+    agent_id = (params.get("agentId") or "").strip()
+    if not agent_id:
+        return {"status": "error", "result": {"error": "missing_agentId"}}
+
+    try:
+        _remove_subagent_files(agent_id)
+        config_changed = _update_openclaw_config_for_subagent(
+            agent_id, "uninstall"
+        )
+        _firestore_delete_installed_subagent(token, agent_id)
+    except Exception as e:  # noqa: BLE001
+        _log(f"uninstall_subagent {agent_id} failed: {e}")
+        return {"status": "error", "result": {"error": str(e)[:500]}}
+
+    return {
+        "status": "done",
+        "result": {"agentId": agent_id, "configChanged": config_changed},
+    }
+
+
+def handle_restart_gateway_for_subagents(token: dict, params: dict) -> dict:
+    """Sends SIGTERM to openclaw-gateway. systemd Restart=always respawns
+    with the new agents.list[]. Coalesce: client should send this once
+    after a batch of install/uninstall commands."""
+    pids: list[int] = []
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-f", "openclaw-gatewa"], text=True
+        )
+        pids = [int(p) for p in out.split() if p.strip()]
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    if not pids:
+        return {"status": "done", "result": {"pids": [], "note": "no_running"}}
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    return {"status": "done", "result": {"pids": pids}}
+
+
 # ── Dispatcher ─────────────────────────────────────────────────
 
 _HANDLERS = {
@@ -3499,6 +3835,9 @@ _HANDLERS = {
     "restart_openclaw": handle_restart_openclaw,
     "detect_local_models": handle_detect_local_models,
     "apply_openrouter_key": handle_apply_openrouter_key,
+    "install_subagent": handle_install_subagent,
+    "uninstall_subagent": handle_uninstall_subagent,
+    "restart_gateway_for_subagents": handle_restart_gateway_for_subagents,
 }
 
 
