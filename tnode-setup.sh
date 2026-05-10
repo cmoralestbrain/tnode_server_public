@@ -2733,6 +2733,19 @@ Env/overrides:
                            (used by the file-watcher trigger).
 """
 from __future__ import annotations
+# 1.4.0 — AGENTS_INDEX.md auto-generation. install_subagent and
+#         uninstall_subagent now regenerate
+#         ~/.openclaw/agency-agents/AGENTS_INDEX.md (Markdown table of
+#         installed sub-agents with id | tagline | role, derived from
+#         each agent's IDENTITY.md + SOUL.md), and idempotently append
+#         "Sub-agentes" sections to workspace/SOUL.md (operative: when
+#         to read the INDEX) and workspace/IDENTITY.md (identitarian:
+#         "you are a coordinator, delegate") so the main agent picks
+#         up the roster on next bootstrap. Daemon startup also runs
+#         the regen + section-ensure as self-heal against workspace
+#         drift. Without this, qwen-3.6-plus had no in-context cue to
+#         delegate and answered every prompt as the main itself even
+#         when sub-agents were materialized.
 # 1.3.1 — _update_openclaw_config_for_subagent tolerates missing
 #         agents.list[]. OpenClaw 2026.4.x infers `main` implicitly
 #         when openclaw.json only carries agents.defaults.models (no
@@ -2754,7 +2767,7 @@ from __future__ import annotations
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.3.1"
+__VERSION__ = "1.4.0"
 
 import hashlib
 import hmac
@@ -3610,6 +3623,7 @@ def handle_apply_openrouter_key(token: dict, params: dict) -> dict:
 _AGENTS_DIR = OPENCLAW_DIR / "agents"
 _SUBAGENT_FILES = ("SOUL.md", "AGENTS.md", "IDENTITY.md")
 _SUBAGENT_DEFAULT_MODEL = "openrouter/qwen/qwen3.6-plus"
+_AGENTS_INDEX_PATH = OPENCLAW_DIR / "agency-agents" / "AGENTS_INDEX.md"
 
 
 def _firestore_get_agent_doc(token: dict, agent_id: str) -> dict | None:
@@ -3852,6 +3866,131 @@ def _update_openclaw_config_for_subagent(
     return True
 
 
+def _extract_tagline(p: Path) -> str:
+    """First non-blank, non-heading line of an IDENTITY.md (the tagline
+    OpenClaw's `convert.sh` puts right under the H1)."""
+    if not p.is_file():
+        return ""
+    try:
+        for line in p.read_text(encoding="utf-8").splitlines()[1:]:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                return line
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _extract_role(p: Path) -> str:
+    """Match `**Role**: ...` from a SOUL.md (the canonical "when to use"
+    sentence). Returns empty string when the agent's SOUL.md doesn't
+    define a Role line — a few do (cms-developer, customer-service,
+    healthcare-customer-service, hospitality-guest-services)."""
+    if not p.is_file():
+        return ""
+    try:
+        m = re.search(
+            r"\*\*Role\*\*\s*:\s*(.+?)(?:\n|$)",
+            p.read_text(encoding="utf-8"),
+        )
+        if m:
+            return m.group(1).strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _shorten(s: str, n: int = 140) -> str:
+    """Single-line, escape `|` for Markdown tables, truncate at `n`."""
+    s = (s or "").replace("|", "\\|").replace("\n", " ").strip()
+    return (s[:n].rsplit(" ", 1)[0] + "…") if len(s) > n else s
+
+
+def _regenerate_agents_index() -> None:
+    """Rebuild ~/.openclaw/agency-agents/AGENTS_INDEX.md from sub-agents
+    materialized under agents/<id>/agent/. Idempotent — safe to call
+    after every install/uninstall and on daemon startup. The path
+    `agency-agents/` is a holdover from the pre-v3 layout where the
+    whole catalog lived there; today only the index file does, kept at
+    the same path so the workspace SOUL.md/IDENTITY.md references stay
+    stable across versions."""
+    if not _AGENTS_DIR.is_dir():
+        return
+    rows: list[tuple[str, str, str]] = []
+    for d in sorted(_AGENTS_DIR.iterdir()):
+        if not d.is_dir() or d.name == "main":
+            continue
+        agent_dir = d / "agent"
+        if not (agent_dir / "SOUL.md").is_file():
+            continue
+        rows.append((
+            d.name,
+            _extract_tagline(agent_dir / "IDENTITY.md"),
+            _extract_role(agent_dir / "SOUL.md"),
+        ))
+
+    lines = [
+        "# Sub-agents Index",
+        "",
+        'Roster of sub-agents available via `sessions_spawn(runtime="subagent", agentId=<id>, task="...")`.',
+        "Generated automatically from each agent's `IDENTITY.md` (especialidad) and `SOUL.md` (Role/cuándo usarlo).",
+        "",
+        "| id | especialidad | cuándo usarlo (Role) |",
+        "|---|---|---|",
+    ]
+    for slug, tag, role in rows:
+        lines.append(f"| `{slug}` | {_shorten(tag)} | {_shorten(role)} |")
+    lines.append("")
+    lines.append(f"_{len(rows)} sub-agents indexed._")
+
+    try:
+        _AGENTS_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _AGENTS_INDEX_PATH.write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
+    except Exception as e:  # noqa: BLE001
+        _log(f"_regenerate_agents_index: write failed: {e}")
+
+
+_SUBAGENTS_SECTION_SOUL = """
+## Sub-agentes disponibles
+
+Lee `~/.openclaw/agency-agents/AGENTS_INDEX.md` al iniciar tu sesión para conocer el roster completo y sus especialidades. Úsalo para decidir cuándo invocar `sessions_spawn(runtime="subagent", agentId=<id>, task=...)`.
+"""
+
+_SUBAGENTS_SECTION_IDENTITY = """
+## Sub-agentes a tu disposición
+
+Eres el coordinador principal. Cuando una tarea encaja con la especialidad de un sub-agente del roster (ver `~/.openclaw/agency-agents/AGENTS_INDEX.md`), delégala con `sessions_spawn(runtime="subagent", agentId=<id>, task=...)` en lugar de hacerla tú mismo.
+"""
+
+
+def _ensure_subagents_sections() -> None:
+    """Idempotently append the 'Sub-agentes' section to workspace/SOUL.md
+    (operative: when to read the INDEX) and workspace/IDENTITY.md
+    (identitarian: you are a coordinator, delegate). No-op on each file
+    that already carries its section header. Safe to call repeatedly —
+    each install/uninstall_subagent cycle re-runs it as a guard against
+    workspace drift."""
+    workspace = OPENCLAW_DIR / "workspace"
+    targets = (
+        ("SOUL.md", "## Sub-agentes disponibles", _SUBAGENTS_SECTION_SOUL),
+        ("IDENTITY.md", "## Sub-agentes a tu disposición",
+         _SUBAGENTS_SECTION_IDENTITY),
+    )
+    for fname, marker, section in targets:
+        p = workspace / fname
+        if not p.is_file():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+            if marker in text:
+                continue
+            p.write_text(text.rstrip() + "\n" + section, encoding="utf-8")
+        except Exception as e:  # noqa: BLE001
+            _log(f"_ensure_subagents_sections: skipping {fname}: {e}")
+
+
 def handle_install_subagent(token: dict, params: dict) -> dict:
     agent_id = (params.get("agentId") or "").strip()
     if not agent_id:
@@ -3888,6 +4027,8 @@ def handle_install_subagent(token: dict, params: dict) -> dict:
                 "filesSha": files_sha,
             },
         )
+        _regenerate_agents_index()
+        _ensure_subagents_sections()
     except Exception as e:  # noqa: BLE001
         _log(f"install_subagent {agent_id} failed: {e}")
         return {"status": "error", "result": {"error": str(e)[:500]}}
@@ -3914,6 +4055,7 @@ def handle_uninstall_subagent(token: dict, params: dict) -> dict:
             agent_id, "uninstall"
         )
         _firestore_delete_installed_subagent(token, agent_id)
+        _regenerate_agents_index()
     except Exception as e:  # noqa: BLE001
         _log(f"uninstall_subagent {agent_id} failed: {e}")
         return {"status": "error", "result": {"error": str(e)[:500]}}
@@ -4006,6 +4148,15 @@ def main() -> int:
         return 2
 
     _log(f"starting tnode-config-sync for nodeId={cfg['nodeId']}")
+    # Self-heal: regenerate AGENTS_INDEX.md and ensure the workspace
+    # references survive workspace drift (e.g. user wiped SOUL.md
+    # manually, or the node was provisioned before v1.4.0). Best-effort
+    # — failures here are logged but don't prevent the daemon loop.
+    try:
+        _regenerate_agents_index()
+        _ensure_subagents_sections()
+    except Exception as e:  # noqa: BLE001
+        _log(f"startup self-heal failed: {e}")
     token: dict | None = None
     backoff = 1.0
     empty_polls = 0
