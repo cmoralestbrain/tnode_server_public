@@ -2733,6 +2733,14 @@ Env/overrides:
                            (used by the file-watcher trigger).
 """
 from __future__ import annotations
+# 1.3.1 — _update_openclaw_config_for_subagent tolerates missing
+#         agents.list[]. OpenClaw 2026.4.x infers `main` implicitly
+#         when openclaw.json only carries agents.defaults.models (no
+#         agents.list); the previous implementation tried to iterate
+#         cfg["agents"]["list"] directly and tripped on KeyError on the
+#         first sub-agent install. Now setdefault-s the list and
+#         materializes a `main` entry with the canonical workspace +
+#         agents/main/agent paths if missing.
 # 1.3.0 — merge semantics for the model catalog. _apply_provider_to_openclaw
 #         now upserts providers[p].models[] (by id) and merges the slug
 #         into agents.defaults.models instead of replacing both wholesale —
@@ -2746,7 +2754,7 @@ from __future__ import annotations
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.3.0"
+__VERSION__ = "1.3.1"
 
 import hashlib
 import hmac
@@ -3754,31 +3762,48 @@ def _update_openclaw_config_for_subagent(
     agent_id: str, action: str, recommended_model: str | None = None
 ) -> bool:
     """Add/remove an entry in agents.list[] and update main.subagents
-    .allowAgents accordingly. Returns True if the file changed."""
+    .allowAgents accordingly. Returns True if the file changed.
+
+    OpenClaw 2026.4.x infers `main` implicitly when agents.list[] is
+    absent — a freshly-paired node only carries `agents.defaults.models`
+    in openclaw.json. We materialize the main entry explicitly on first
+    sub-agent install so we have something to append alongside (and so
+    callers that DO read agents.list[] see a consistent shape)."""
     if not OPENCLAW_JSON_PATH.exists():
         return False
     cfg = json.loads(OPENCLAW_JSON_PATH.read_text())
+    agents_section = cfg.setdefault("agents", {})
+    if not isinstance(agents_section, dict):
+        _log("openclaw.json: agents is not an object; cannot update sub-agents")
+        return False
+    agents_list = agents_section.setdefault("list", [])
+    if not isinstance(agents_list, list):
+        _log("openclaw.json: agents.list is not an array; cannot update sub-agents")
+        return False
     main_idx = next(
-        (i for i, a in enumerate(cfg["agents"]["list"]) if a.get("id") == "main"),
+        (i for i, a in enumerate(agents_list)
+         if isinstance(a, dict) and a.get("id") == "main"),
         None,
     )
     if main_idx is None:
-        _log("openclaw.json: 'main' agent not found; cannot update sub-agents")
-        return False
+        agents_list.insert(0, {
+            "id": "main",
+            "default": True,
+            "workspace": str(OPENCLAW_DIR / "workspace"),
+            "agentDir": str(OPENCLAW_DIR / "agents" / "main" / "agent"),
+        })
+        main_idx = 0
 
     agent_dir = str(_AGENTS_DIR / agent_id / "agent")
     existing_idx = next(
-        (
-            i
-            for i, a in enumerate(cfg["agents"]["list"])
-            if a.get("id") == agent_id
-        ),
+        (i for i, a in enumerate(agents_list)
+         if isinstance(a, dict) and a.get("id") == agent_id),
         None,
     )
 
     if action == "install":
         entry = (
-            dict(cfg["agents"]["list"][existing_idx])
+            dict(agents_list[existing_idx])
             if existing_idx is not None
             else {}
         )
@@ -3791,9 +3816,9 @@ def _update_openclaw_config_for_subagent(
         elif not entry.get("model", {}).get("primary"):
             entry.setdefault("model", {})["primary"] = _SUBAGENT_DEFAULT_MODEL
         if existing_idx is None:
-            cfg["agents"]["list"].append(entry)
+            agents_list.append(entry)
         else:
-            cfg["agents"]["list"][existing_idx] = entry
+            agents_list[existing_idx] = entry
         # Propagate the sub-agent's primary model to the runtime catalog
         # AND the gateway allowlist. Without this, install_subagent puts a
         # slug in agents.list[i].model.primary that the gateway accepts on
@@ -3804,18 +3829,20 @@ def _update_openclaw_config_for_subagent(
     elif action == "uninstall":
         if existing_idx is None:
             return False
-        cfg["agents"]["list"].pop(existing_idx)
+        agents_list.pop(existing_idx)
     else:
         return False
 
     # Rebuild main.subagents.allowAgents from the resulting list.
-    main_entry = cfg["agents"]["list"][
+    main_entry = agents_list[
         next(
-            i for i, a in enumerate(cfg["agents"]["list"]) if a.get("id") == "main"
+            i for i, a in enumerate(agents_list)
+            if isinstance(a, dict) and a.get("id") == "main"
         )
     ]
     main_entry.setdefault("subagents", {})["allowAgents"] = sorted(
-        a["id"] for a in cfg["agents"]["list"] if a.get("id") != "main"
+        a["id"] for a in agents_list
+        if isinstance(a, dict) and a.get("id") and a.get("id") != "main"
     )
 
     serialized = json.dumps(cfg, indent=2) + "\n"
