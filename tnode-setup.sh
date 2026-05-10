@@ -2733,11 +2733,20 @@ Env/overrides:
                            (used by the file-watcher trigger).
 """
 from __future__ import annotations
+# 1.3.0 — merge semantics for the model catalog. _apply_provider_to_openclaw
+#         now upserts providers[p].models[] (by id) and merges the slug
+#         into agents.defaults.models instead of replacing both wholesale —
+#         re-applying an OpenRouter key no longer clobbers the expanded
+#         catalog (Cerebro's per-agent picks, sub-agent recommended models).
+#         install_subagent now propagates the sub-agent's primary model to
+#         the runtime catalog and allowlist via the new helper
+#         _ensure_model_registered, fixing the "model not allowed" failure
+#         on delegate after a fresh sub-agent install.
 # 1.2.0 — sub-agents: install_subagent / uninstall_subagent /
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.2.0"
+__VERSION__ = "1.3.0"
 
 import hashlib
 import hmac
@@ -3299,6 +3308,61 @@ def _default_context_for(provider: str) -> int:
     return _CTX_DEFAULTS.get(provider, 8192)
 
 
+_KNOWN_PROVIDER_PREFIXES = frozenset(_CTX_DEFAULTS.keys())
+
+
+def _split_provider_slug(slug: str) -> tuple[str, str]:
+    """`'openrouter/qwen/qwen3.6-plus'` → `('openrouter', 'qwen/qwen3.6-plus')`.
+    Returns `('', slug)` if the slug doesn't start with a known provider
+    prefix — keeps interop between the prefixed `agent.model.primary` form
+    and the unprefixed `providers[p].models[].id` form."""
+    if not isinstance(slug, str) or "/" not in slug:
+        return "", slug if isinstance(slug, str) else ""
+    head, rest = slug.split("/", 1)
+    if head in _KNOWN_PROVIDER_PREFIXES:
+        return head, rest
+    return "", slug
+
+
+def _ensure_model_registered(cfg: dict, model_slug: str) -> bool:
+    """Idempotently make `model_slug` reachable from a freshly-loaded gateway:
+    upsert under `models.providers[p].models[]` (catalog id without the
+    provider prefix) and add the same id to `agents.defaults.models`.
+    Skips the catalog write if the inferred provider isn't yet configured
+    (e.g. a sub-agent install on a node before `apply_openrouter_key`).
+    Returns `True` if cfg was modified."""
+    provider, catalog_id = _split_provider_slug(model_slug)
+    if not provider:
+        return False
+
+    changed = False
+    providers = (cfg.setdefault("models", {}).setdefault("providers", {}))
+    p = providers.get(provider)
+    if isinstance(p, dict):
+        models_list = p.setdefault("models", [])
+        if isinstance(models_list, list) and not any(
+            isinstance(m, dict) and m.get("id") == catalog_id for m in models_list
+        ):
+            models_list.append({
+                "id": catalog_id,
+                "name": catalog_id,
+                "contextWindow": _default_context_for(provider),
+                "maxTokens": 4096,
+            })
+            changed = True
+
+    defaults_models = (
+        cfg.setdefault("agents", {})
+        .setdefault("defaults", {})
+        .setdefault("models", {})
+    )
+    if isinstance(defaults_models, dict) and catalog_id not in defaults_models:
+        defaults_models[catalog_id] = {}
+        changed = True
+
+    return changed
+
+
 def _write_openclaw_json(cfg: dict) -> None:
     """Atomically write openclaw.json with the given config dict."""
     tmp = OPENCLAW_JSON_PATH.with_suffix(".json.tmp")
@@ -3316,32 +3380,56 @@ def _apply_provider_to_openclaw(
     ctx: int | None = None,
     max_tokens: int = 4096,
 ) -> dict:
-    """Merge/update a provider block inside openclaw.json. Returns updated cfg.
+    """Upsert a provider block inside openclaw.json. Returns updated cfg.
 
-    Also activates the model via `agents.defaults.models = {model: {}}` (plural
-    dict). OpenClaw v2026.4.24+ no longer auto-selects: without this dict the
-    gateway falls back to the hardcoded `openai/gpt-5.5` and fails with
-    `No API key found for provider "openai"`. Must be the plural form — the
-    singular `agents.defaults.model.primary` triggers `Unknown model` for any
-    id outside OpenClaw's internal registry (e.g. `qwen/qwen3.6-plus`).
+    Merge semantics (v1.3.0+): `providers[p].models[]` and
+    `agents.defaults.models` are extended in-place rather than replaced.
+    Earlier versions clobbered the expanded model catalog (e.g. Cerebro's
+    14-model list and any sub-agent's recommended model) every time the
+    user re-applied an OpenRouter key, leaving the gateway with a single
+    allowed model and breaking sub-agent delegation.
+
+    `agents.defaults.models` MUST stay as a dict keyed by id (without the
+    provider prefix). The legacy singular `agents.defaults.model.primary`
+    is dropped on touch — it still triggers `Unknown model` on OpenClaw
+    v2026.4.24+ for any id outside OpenClaw's internal registry.
     """
     cfg = read_openclaw_json() or {}
-    cfg.setdefault("models", {}).setdefault("providers", {})
-    cfg["models"]["providers"][provider] = {
+    providers = cfg.setdefault("models", {}).setdefault("providers", {})
+    p = providers.setdefault(provider, {
         "baseUrl": base_url,
         "apiKey": api_key or "",
-        "models": [
-            {
-                "id": model,
-                "name": model,
-                "contextWindow": ctx or _default_context_for(provider),
-                "maxTokens": max_tokens,
-            }
-        ],
-    }
+        "models": [],
+    })
+    p["baseUrl"] = base_url
+    if api_key:
+        p["apiKey"] = api_key
+
+    models_list = p.setdefault("models", [])
+    if not isinstance(models_list, list):
+        models_list = []
+        p["models"] = models_list
+    existing = next(
+        (m for m in models_list if isinstance(m, dict) and m.get("id") == model),
+        None,
+    )
+    if existing is None:
+        models_list.append({
+            "id": model,
+            "name": model,
+            "contextWindow": ctx or _default_context_for(provider),
+            "maxTokens": max_tokens,
+        })
+    else:
+        if ctx:
+            existing["contextWindow"] = ctx
+        if max_tokens:
+            existing["maxTokens"] = max_tokens
+
     agents_defaults = cfg.setdefault("agents", {}).setdefault("defaults", {})
-    agents_defaults["models"] = {model: {}}
+    agents_defaults.setdefault("models", {}).setdefault(model, {})
     agents_defaults.pop("model", None)  # drop legacy singular key
+
     _write_openclaw_json(cfg)
     return cfg
 
@@ -3706,6 +3794,13 @@ def _update_openclaw_config_for_subagent(
             cfg["agents"]["list"].append(entry)
         else:
             cfg["agents"]["list"][existing_idx] = entry
+        # Propagate the sub-agent's primary model to the runtime catalog
+        # AND the gateway allowlist. Without this, install_subagent puts a
+        # slug in agents.list[i].model.primary that the gateway accepts on
+        # spawn but rejects on delegate ("model not allowed") because it
+        # was never registered under providers[p].models[] /
+        # agents.defaults.models. Idempotent — safe to re-run.
+        _ensure_model_registered(cfg, entry["model"]["primary"])
     elif action == "uninstall":
         if existing_idx is None:
             return False
@@ -4880,7 +4975,16 @@ Iteration 1: one stream → `usage`.
 Runs as its own systemd unit (tnode-telemetry.service).
 """
 from __future__ import annotations
-__VERSION__ = "1.8.14"
+# 1.8.15 — _agent_model_set now upserts the slug under
+#          providers[p].models[] (in addition to the existing
+#          defaults.models merge from 1.8.14). Without the catalog
+#          insert, switching a per-agent model in Cerebro left the
+#          gateway's allowlist updated but the provider catalog stale,
+#          which the resolver fell back through silently to the
+#          previous default. Idempotent; no-op on un-prefixed slugs.
+# 1.8.14 — _agent_model_set merges into defaults.models instead of
+#          overwriting it (preserves multi-agent distinct picks).
+__VERSION__ = "1.8.15"
 
 import argparse
 import asyncio
@@ -5904,6 +6008,32 @@ def _agent_model_set(agent_id: str, model_slug: str) -> Dict[str, Any]:
         )
     if model_slug not in defaults_models:
         defaults_models[model_slug] = {}
+    # v1.8.15: also upsert the slug under providers[p].models[] so the
+    # gateway accepts delegate calls immediately. Earlier versions only
+    # touched defaults.models; the provider catalog stayed stale until
+    # the next apply_openrouter_key, which is the wrong primitive to
+    # rely on (and replaces the catalog wholesale pre-config-sync 1.3.0).
+    # Idempotent and skips silently when the inferred provider isn't
+    # configured yet (e.g. a freshly-paired node before key apply).
+    _provider_prefixes = ("openrouter", "groq", "ollama", "lmstudio", "llama-cpp")
+    parts = model_slug.split("/", 1)
+    if len(parts) == 2 and parts[0] in _provider_prefixes:
+        _provider, _catalog_id = parts
+        _p_block = (
+            (config.get("models") or {}).get("providers", {}).get(_provider)
+        )
+        if isinstance(_p_block, dict):
+            _models_list = _p_block.setdefault("models", [])
+            if isinstance(_models_list, list) and not any(
+                isinstance(m, dict) and m.get("id") == _catalog_id
+                for m in _models_list
+            ):
+                _models_list.append({
+                    "id": _catalog_id,
+                    "name": _catalog_id,
+                    "contextWindow": 200000 if _provider == "openrouter" else 32768,
+                    "maxTokens": 4096,
+                })
     _save_openclaw_json_atomic(config)
     reload_ok = _reload_gateway()
     logger.info(
