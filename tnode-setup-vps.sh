@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.9.9"
+TNODE_SETUP_VERSION="1.12.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -4521,7 +4521,7 @@ Env/overrides:
   TNODE_CHAT_SYNC_POLL_MS   Polling interval ms (default 500)
 """
 from __future__ import annotations
-__VERSION__ = "1.8.17"
+__VERSION__ = "1.9.0"
 
 import hashlib
 import hmac
@@ -4572,6 +4572,24 @@ LOG_PATH = Path(
 )
 POLL_MS = int(os.environ.get("TNODE_CHAT_SYNC_POLL_MS", "500"))
 
+# ── Chat attachments (v1.9.0+) ──────────────────────────────────
+# Files the mobile app uploads via the (+) menu land in Firestore at
+# `users/{uid}/nodes/{nodeId}/uploads/{attachmentId}` with status=pending.
+# We poll every UPLOAD_POLL_INTERVAL_S, download the public URL into the
+# agent's workspace, verify sha256, and flip status to downloaded so the
+# Flutter client can send the WS message with the workspace path.
+UPLOAD_DIR = Path(
+    os.environ.get("TNODE_CHAT_SYNC_UPLOAD_DIR",
+                   str(OPENCLAW_DIR / "workspace" / "upload"))
+)
+UPLOAD_POLL_INTERVAL_S = float(
+    os.environ.get("TNODE_CHAT_SYNC_UPLOAD_POLL_S", "2.0")
+)
+# Server-side cap is 50MB (`prepareChatAttachment`); we re-validate locally
+# so a manipulated signed URL can't drown the disk.
+UPLOAD_MAX_BYTES = 50 * 1024 * 1024
+UPLOAD_DOWNLOAD_CHUNK = 64 * 1024
+
 
 def _log(msg: str) -> None:
     ts = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -4605,6 +4623,22 @@ def _http_patch_json(url: str, payload: dict, headers: dict, timeout: int = 15) 
         data=body,
         headers={"Content-Type": "application/json", **headers},
         method="PATCH",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8")
+        return json.loads(raw) if raw else {}
+
+
+def _http_post_json_authed(
+    url: str, payload: dict, headers: dict, timeout: int = 30
+) -> dict:
+    """POST with auth headers — used for Firestore runQuery."""
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", **headers},
+        method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read().decode("utf-8")
@@ -4786,6 +4820,258 @@ def write_message(
         if e.code in (409, 412):
             return
         raise
+
+
+# ── Chat attachments (uploads/) ────────────────────────────────
+
+def _fs_field_to_python(v):
+    """Inverse of _fs_value — pull a Python value out of a Firestore
+    REST field map. Returns None when the field shape is unknown."""
+    if not isinstance(v, dict):
+        return None
+    if "stringValue" in v:
+        return v["stringValue"]
+    if "integerValue" in v:
+        try:
+            return int(v["integerValue"])
+        except (TypeError, ValueError):
+            return None
+    if "doubleValue" in v:
+        return v["doubleValue"]
+    if "booleanValue" in v:
+        return v["booleanValue"]
+    if "timestampValue" in v:
+        return v["timestampValue"]
+    return None
+
+
+def query_pending_uploads(token: dict, project_id: str, limit: int = 20) -> list:
+    """Run a structured query for uploads with status=pending under this
+    node. Returns a list of {id, fields} dicts (Firestore REST shape).
+
+    The query is scoped to the node — we don't sweep across users. The
+    daemon's custom token doesn't have permission to read other users
+    anyway; the query just makes that explicit and lets Firestore use
+    the (status, createdAt) composite index."""
+    parent = (
+        f"projects/{project_id}/databases/(default)/documents"
+        f"/users/{token['uid']}/nodes/{token['nodeId']}"
+    )
+    url = f"https://firestore.googleapis.com/v1/{parent}:runQuery"
+    body = {
+        "structuredQuery": {
+            "from": [{"collectionId": "uploads"}],
+            "where": {
+                "fieldFilter": {
+                    "field": {"fieldPath": "status"},
+                    "op": "EQUAL",
+                    "value": {"stringValue": "pending"},
+                }
+            },
+            "orderBy": [
+                {"field": {"fieldPath": "createdAt"}, "direction": "ASCENDING"},
+            ],
+            "limit": limit,
+        }
+    }
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    raw = _http_post_json_authed(url, body, headers, timeout=20)
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        doc = item.get("document") if isinstance(item, dict) else None
+        if not doc:
+            continue
+        name = doc.get("name", "")
+        doc_id = name.rsplit("/", 1)[-1] if name else ""
+        if not doc_id:
+            continue
+        out.append({"id": doc_id, "fields": doc.get("fields", {})})
+    return out
+
+
+def _sanitize_segment(s: str) -> str:
+    """Belt-and-suspenders: drop anything that's not alnum/dot/dash/underscore
+    so a malicious doc can't escape the upload dir."""
+    safe = []
+    for ch in s:
+        if ch.isalnum() or ch in (".", "-", "_"):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    out = "".join(safe).strip("._")
+    return out or "file"
+
+
+def download_public_url_to_file(url: str, dest: Path, max_bytes: int) -> tuple:
+    """Stream a public URL into `dest`, capping at max_bytes and computing
+    sha256 on the fly. Returns (hex_sha256, bytes_written). Raises on
+    HTTP error, oversize, or write failure (after cleaning up partial)."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    h = hashlib.sha256()
+    written = 0
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            with open(tmp, "wb") as f:
+                while True:
+                    chunk = resp.read(UPLOAD_DOWNLOAD_CHUNK)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > max_bytes:
+                        raise RuntimeError(
+                            f"file exceeds {max_bytes} bytes — aborting"
+                        )
+                    h.update(chunk)
+                    f.write(chunk)
+        os.replace(tmp, dest)
+    except Exception:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return h.hexdigest(), written
+
+
+def update_upload_doc(
+    token: dict,
+    project_id: str,
+    attachment_id: str,
+    fields: dict,
+    mask: list,
+) -> None:
+    """PATCH a single upload doc with an updateMask covering only the
+    fields we're writing. Without the mask, Firestore replaces the
+    entire doc (and would wipe the original fileName/sizeBytes/etc)."""
+    parent = (
+        f"users/{token['uid']}/nodes/{token['nodeId']}/uploads/{attachment_id}"
+    )
+    mask_q = "&".join(f"updateMask.fieldPaths={k}" for k in mask)
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{project_id}"
+        f"/databases/(default)/documents/{parent}?{mask_q}"
+    )
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    _http_patch_json(url, {"fields": fields}, headers)
+
+
+def mark_upload_failed(
+    token: dict, project_id: str, attachment_id: str, reason: str
+) -> None:
+    try:
+        update_upload_doc(
+            token,
+            project_id,
+            attachment_id,
+            fields={
+                "status": {"stringValue": "failed"},
+                "errorReason": {"stringValue": reason[:500]},
+            },
+            mask=["status", "errorReason"],
+        )
+    except Exception as e:  # noqa: BLE001
+        _log(f"upload {attachment_id}: mark failed errored: {e}")
+
+
+def process_uploads(token: dict, project_id: str) -> None:
+    """Poll pending uploads, download each into workspace/upload/,
+    verify sha256, and flip status. Best-effort — failures are logged +
+    written back to the doc so the user sees them in the chip.
+
+    Raises HTTPError(401) so the main loop refreshes the token. Other
+    errors are swallowed (logged) so one bad attachment doesn't stall
+    the daemon's chat-mirror loop."""
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        pending = query_pending_uploads(token, project_id)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise
+        _log(f"uploads query: HTTP {e.code} {e.reason}")
+        return
+    except Exception as e:  # noqa: BLE001
+        _log(f"uploads query error: {e}")
+        return
+
+    for doc in pending:
+        aid = doc["id"]
+        f = doc["fields"]
+        sanitized = _fs_field_to_python(f.get("sanitizedFileName", {})) or ""
+        public_url = _fs_field_to_python(f.get("publicUrl", {})) or ""
+        expected_sha = _fs_field_to_python(f.get("sha256", {})) or ""
+        size_bytes = _fs_field_to_python(f.get("sizeBytes", {})) or 0
+        if not sanitized or not public_url or not expected_sha:
+            _log(f"upload {aid}: missing required fields, marking failed")
+            mark_upload_failed(token, project_id, aid, "missing required fields")
+            continue
+        if isinstance(size_bytes, int) and size_bytes > UPLOAD_MAX_BYTES:
+            _log(f"upload {aid}: oversize {size_bytes}, marking failed")
+            mark_upload_failed(token, project_id, aid, "exceeds local size cap")
+            continue
+
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        sha8 = expected_sha[:8]
+        dest_name = _sanitize_segment(f"{ts}-{sha8}-{sanitized}")
+        dest_path = UPLOAD_DIR / dest_name
+        local_path = f"workspace/upload/{dest_name}"
+
+        try:
+            actual_sha, written = download_public_url_to_file(
+                public_url, dest_path, UPLOAD_MAX_BYTES
+            )
+        except urllib.error.HTTPError as e:
+            _log(f"upload {aid}: download HTTP {e.code} {e.reason}")
+            mark_upload_failed(token, project_id, aid, f"download http {e.code}")
+            continue
+        except Exception as e:  # noqa: BLE001
+            _log(f"upload {aid}: download error: {e}")
+            mark_upload_failed(token, project_id, aid, f"download: {e}"[:200])
+            continue
+
+        if actual_sha != expected_sha:
+            _log(
+                f"upload {aid}: sha mismatch expected={expected_sha[:16]}... "
+                f"actual={actual_sha[:16]}..."
+            )
+            try:
+                dest_path.unlink()
+            except FileNotFoundError:
+                pass
+            mark_upload_failed(token, project_id, aid, "sha256 mismatch")
+            continue
+
+        # Refresh ttlExpiresAt → downloadedAt + 24h so the cleanup CF
+        # keeps the doc around for a full day after the download.
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        ttl_iso = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(time.time() + 24 * 3600),
+        )
+        try:
+            update_upload_doc(
+                token,
+                project_id,
+                aid,
+                fields={
+                    "status": {"stringValue": "downloaded"},
+                    "localPath": {"stringValue": local_path},
+                    "downloadedAt": {"timestampValue": now_iso},
+                    "ttlExpiresAt": {"timestampValue": ttl_iso},
+                },
+                mask=["status", "localPath", "downloadedAt", "ttlExpiresAt"],
+            )
+            _log(
+                f"upload {aid}: downloaded {written}B -> {local_path}"
+            )
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                raise
+            _log(f"upload {aid}: status update HTTP {e.code} {e.reason}")
+        except Exception as e:  # noqa: BLE001
+            _log(f"upload {aid}: status update error: {e}")
 
 
 # ── JSONL turn extraction ──────────────────────────────────────
@@ -5148,6 +5434,12 @@ def main() -> int:
     REREGISTER_COOLDOWN_S = 300
     last_reregister_attempt = 0.0
 
+    # Cadence for chat-attachment polling. Runs alongside the JSONL tail
+    # loop but at a slower clock so we don't pound Firestore — 2s feels
+    # snappy in the UI (the user sees the chip flip from "procesando" to
+    # "listo" within ~3s of the PUT landing).
+    last_uploads_check = 0.0
+
     while True:
         try:
             now = int(time.time())
@@ -5245,6 +5537,20 @@ def main() -> int:
                     if e.code == 401:
                         token = None
                         break
+
+            # Chat-attachment poll — slower clock than the JSONL tail.
+            now_f = time.time()
+            if (
+                token is not None
+                and (now_f - last_uploads_check) >= UPLOAD_POLL_INTERVAL_S
+            ):
+                last_uploads_check = now_f
+                try:
+                    process_uploads(token, project_id)
+                except urllib.error.HTTPError as e:
+                    if e.code == 401:
+                        _log("uploads poll: idToken rejected — refreshing")
+                        token = None
 
             time.sleep(POLL_MS / 1000.0)
         except KeyboardInterrupt:

@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.9.9"
+TNODE_SETUP_VERSION="1.12.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -4465,7 +4465,7 @@ write_tnode_chat_sync_py() {
 #!/usr/bin/env python3
 """tnode-chat-sync — see cmoralestbrain/skills for full docs."""
 from __future__ import annotations
-__VERSION__ = "1.8.17"
+__VERSION__ = "1.9.0"
 
 import hashlib
 import hmac
@@ -4492,6 +4492,17 @@ LOG_PATH = Path(
     os.environ.get("TNODE_CHAT_SYNC_LOG", str(OPENCLAW_DIR / "logs" / "tnode-chat-sync.log"))
 )
 POLL_MS = int(os.environ.get("TNODE_CHAT_SYNC_POLL_MS", "500"))
+
+# ── Chat attachments (v1.9.0+) ──────────────────────────────────
+UPLOAD_DIR = Path(
+    os.environ.get("TNODE_CHAT_SYNC_UPLOAD_DIR",
+                   str(OPENCLAW_DIR / "workspace" / "upload"))
+)
+UPLOAD_POLL_INTERVAL_S = float(
+    os.environ.get("TNODE_CHAT_SYNC_UPLOAD_POLL_S", "2.0")
+)
+UPLOAD_MAX_BYTES = 50 * 1024 * 1024
+UPLOAD_DOWNLOAD_CHUNK = 64 * 1024
 
 
 def _log(msg: str) -> None:
@@ -4520,6 +4531,19 @@ def _http_patch_json(url: str, payload: dict, headers: dict, timeout: int = 15) 
     req = urllib.request.Request(
         url, data=body,
         headers={"Content-Type": "application/json", **headers}, method="PATCH",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8")
+        return json.loads(raw) if raw else {}
+
+
+def _http_post_json_authed(
+    url: str, payload: dict, headers: dict, timeout: int = 30
+) -> dict:
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": "application/json", **headers}, method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read().decode("utf-8")
@@ -4591,6 +4615,196 @@ def write_message(token, project_id, uid, node_id, message_id, body) -> None:
         if e.code in (409, 412):
             return
         raise
+
+
+# ── Chat attachments (uploads/) ────────────────────────────────
+
+def _fs_field_to_python(v):
+    if not isinstance(v, dict):
+        return None
+    if "stringValue" in v:
+        return v["stringValue"]
+    if "integerValue" in v:
+        try:
+            return int(v["integerValue"])
+        except (TypeError, ValueError):
+            return None
+    if "doubleValue" in v:
+        return v["doubleValue"]
+    if "booleanValue" in v:
+        return v["booleanValue"]
+    if "timestampValue" in v:
+        return v["timestampValue"]
+    return None
+
+
+def query_pending_uploads(token: dict, project_id: str, limit: int = 20) -> list:
+    parent = (
+        f"projects/{project_id}/databases/(default)/documents"
+        f"/users/{token['uid']}/nodes/{token['nodeId']}"
+    )
+    url = f"https://firestore.googleapis.com/v1/{parent}:runQuery"
+    body = {
+        "structuredQuery": {
+            "from": [{"collectionId": "uploads"}],
+            "where": {
+                "fieldFilter": {
+                    "field": {"fieldPath": "status"},
+                    "op": "EQUAL",
+                    "value": {"stringValue": "pending"},
+                }
+            },
+            "orderBy": [
+                {"field": {"fieldPath": "createdAt"}, "direction": "ASCENDING"},
+            ],
+            "limit": limit,
+        }
+    }
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    raw = _http_post_json_authed(url, body, headers, timeout=20)
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        doc = item.get("document") if isinstance(item, dict) else None
+        if not doc:
+            continue
+        name = doc.get("name", "")
+        doc_id = name.rsplit("/", 1)[-1] if name else ""
+        if not doc_id:
+            continue
+        out.append({"id": doc_id, "fields": doc.get("fields", {})})
+    return out
+
+
+def _sanitize_segment(s: str) -> str:
+    safe = []
+    for ch in s:
+        if ch.isalnum() or ch in (".", "-", "_"):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    out = "".join(safe).strip("._")
+    return out or "file"
+
+
+def download_public_url_to_file(url: str, dest: Path, max_bytes: int) -> tuple:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    h = hashlib.sha256()
+    written = 0
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            with open(tmp, "wb") as f:
+                while True:
+                    chunk = resp.read(UPLOAD_DOWNLOAD_CHUNK)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > max_bytes:
+                        raise RuntimeError(f"file exceeds {max_bytes} bytes")
+                    h.update(chunk)
+                    f.write(chunk)
+        os.replace(tmp, dest)
+    except Exception:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return h.hexdigest(), written
+
+
+def update_upload_doc(token, project_id, attachment_id, fields, mask):
+    parent = (
+        f"users/{token['uid']}/nodes/{token['nodeId']}/uploads/{attachment_id}"
+    )
+    mask_q = "&".join(f"updateMask.fieldPaths={k}" for k in mask)
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{project_id}"
+        f"/databases/(default)/documents/{parent}?{mask_q}"
+    )
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    _http_patch_json(url, {"fields": fields}, headers)
+
+
+def mark_upload_failed(token, project_id, attachment_id, reason):
+    try:
+        update_upload_doc(token, project_id, attachment_id, fields={
+            "status": {"stringValue": "failed"},
+            "errorReason": {"stringValue": reason[:500]},
+        }, mask=["status", "errorReason"])
+    except Exception as e:  # noqa: BLE001
+        _log(f"upload {attachment_id}: mark failed errored: {e}")
+
+
+def process_uploads(token, project_id):
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        pending = query_pending_uploads(token, project_id)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise
+        _log(f"uploads query: HTTP {e.code} {e.reason}")
+        return
+    except Exception as e:  # noqa: BLE001
+        _log(f"uploads query error: {e}")
+        return
+
+    for doc in pending:
+        aid = doc["id"]
+        f = doc["fields"]
+        sanitized = _fs_field_to_python(f.get("sanitizedFileName", {})) or ""
+        public_url = _fs_field_to_python(f.get("publicUrl", {})) or ""
+        expected_sha = _fs_field_to_python(f.get("sha256", {})) or ""
+        size_bytes = _fs_field_to_python(f.get("sizeBytes", {})) or 0
+        if not sanitized or not public_url or not expected_sha:
+            mark_upload_failed(token, project_id, aid, "missing required fields")
+            continue
+        if isinstance(size_bytes, int) and size_bytes > UPLOAD_MAX_BYTES:
+            mark_upload_failed(token, project_id, aid, "exceeds local size cap")
+            continue
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        sha8 = expected_sha[:8]
+        dest_name = _sanitize_segment(f"{ts}-{sha8}-{sanitized}")
+        dest_path = UPLOAD_DIR / dest_name
+        local_path = f"workspace/upload/{dest_name}"
+        try:
+            actual_sha, written = download_public_url_to_file(
+                public_url, dest_path, UPLOAD_MAX_BYTES
+            )
+        except urllib.error.HTTPError as e:
+            mark_upload_failed(token, project_id, aid, f"download http {e.code}")
+            continue
+        except Exception as e:  # noqa: BLE001
+            mark_upload_failed(token, project_id, aid, f"download: {e}"[:200])
+            continue
+        if actual_sha != expected_sha:
+            try:
+                dest_path.unlink()
+            except FileNotFoundError:
+                pass
+            mark_upload_failed(token, project_id, aid, "sha256 mismatch")
+            continue
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        ttl_iso = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(time.time() + 24 * 3600),
+        )
+        try:
+            update_upload_doc(token, project_id, aid, fields={
+                "status": {"stringValue": "downloaded"},
+                "localPath": {"stringValue": local_path},
+                "downloadedAt": {"timestampValue": now_iso},
+                "ttlExpiresAt": {"timestampValue": ttl_iso},
+            }, mask=["status", "localPath", "downloadedAt", "ttlExpiresAt"])
+            _log(f"upload {aid}: downloaded {written}B -> {local_path}")
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                raise
+            _log(f"upload {aid}: status update HTTP {e.code} {e.reason}")
+        except Exception as e:  # noqa: BLE001
+            _log(f"upload {aid}: status update error: {e}")
 
 
 def extract_content(raw):
@@ -4848,6 +5062,8 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             _log(f"write error: {e}")
 
+    last_uploads_check = 0.0
+
     while True:
         try:
             now = int(time.time())
@@ -4916,6 +5132,19 @@ def main() -> int:
                     if e.code == 401:
                         token = None
                         break
+
+            now_f = time.time()
+            if (
+                token is not None
+                and (now_f - last_uploads_check) >= UPLOAD_POLL_INTERVAL_S
+            ):
+                last_uploads_check = now_f
+                try:
+                    process_uploads(token, project_id)
+                except urllib.error.HTTPError as e:
+                    if e.code == 401:
+                        _log("uploads poll: idToken rejected — refreshing")
+                        token = None
 
             time.sleep(POLL_MS / 1000.0)
         except KeyboardInterrupt:
