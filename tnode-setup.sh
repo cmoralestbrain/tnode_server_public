@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.12.0"
+TNODE_SETUP_VERSION="1.12.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -4886,7 +4886,7 @@ def assistant_turn_from_trajectory(entry: dict):
     content = "\n".join(t for t in texts if isinstance(t, str)).strip()
     if not content:
         return None
-    if _is_silent_ack("assistant", content):
+    if _is_heartbeat_ack("assistant", content):
         return None
     run_id = entry.get("runId") or data.get("runId")
     ts_raw = entry.get("ts") or entry.get("timestamp") or data.get("ts")
