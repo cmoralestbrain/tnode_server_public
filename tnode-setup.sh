@@ -4465,7 +4465,7 @@ write_tnode_chat_sync_py() {
 #!/usr/bin/env python3
 """tnode-chat-sync — see cmoralestbrain/skills for full docs."""
 from __future__ import annotations
-__VERSION__ = "1.9.0"
+__VERSION__ = "1.9.1"
 
 import hashlib
 import hmac
@@ -4895,7 +4895,11 @@ def assistant_turn_from_trajectory(entry: dict):
         "content": content,
         "ts": ts_raw,
         "turnId": run_id,
-        "idempotencyKey": None,
+        # Use the runId as the idempotency key too — message_id_for() reads
+        # idempotencyKey to build the Firestore doc id. Without this the
+        # trajectory flow falls through to a content-hash id, breaking the
+        # promised `a_{runId}` shape and weakening the dedup guarantee.
+        "idempotencyKey": run_id,
         "entryId": None,
     }
 
@@ -5391,7 +5395,7 @@ from __future__ import annotations
 #          previous default. Idempotent; no-op on un-prefixed slugs.
 # 1.8.14 — _agent_model_set merges into defaults.models instead of
 #          overwriting it (preserves multi-agent distinct picks).
-__VERSION__ = "1.8.15"
+__VERSION__ = "1.9.0"
 
 import argparse
 import asyncio
@@ -5641,10 +5645,16 @@ class UsageAccumulator:
 
 # ── Auth + OpenRouter usage fetcher ──────────────────────────────────
 
-def _load_node_auth() -> Optional[Dict[str, str]]:
-    """Read nodeId/nodeSecret from the chat-sync config. Both daemons share
-    the same HMAC credential (set by the installer via registerNodeSync)."""
+def _load_node_auth() -> Optional[Dict[str, Any]]:
+    """Read nodeId/nodeSecret + mtime from the chat-sync config. Both daemons
+    share the same HMAC credential (set by the installer via registerNodeSync).
+
+    Returns the file's mtime alongside the parsed payload so callers can
+    cheaply detect rotation by comparing the cached mtime against the
+    current stat without re-parsing JSON on every poll.
+    """
     try:
+        st = CHAT_SYNC_CONFIG.stat()
         data = json.loads(CHAT_SYNC_CONFIG.read_text())
     except Exception as e:
         logger.warning("failed to read %s: %s", CHAT_SYNC_CONFIG, e)
@@ -5657,6 +5667,7 @@ def _load_node_auth() -> Optional[Dict[str, str]]:
         "nodeId": node_id,
         "nodeSecret": node_secret,
         "pullUsageUrl": data.get("pullLLMUsageUrl") or DEFAULT_PULL_LLM_USAGE_URL,
+        "_mtime": st.st_mtime,
     }
 
 
@@ -6025,9 +6036,41 @@ class TelemetryProxy:
         except Exception as e:  # noqa: BLE001
             logger.warning("delayed refresh failed: %s", e)
 
+    def _maybe_reload_auth(self) -> None:
+        """Re-read chat-sync.json if its mtime moved since we cached it.
+
+        Catches the case where `tnode-chat-sync` self-heals and rotates the
+        nodeSecret on disk while we keep using the in-RAM copy from startup.
+        Without this we'd 401-loop forever on pullLLMUsage until manual
+        `systemctl restart tnode-telemetry` — same class of bug as
+        `config_sync_stale_secret` (memoria) but on the telemetry daemon.
+        Re-load is a single stat()+json.loads, fine to call before every
+        OR refresh.
+        """
+        if not self._auth:
+            return
+        try:
+            st = CHAT_SYNC_CONFIG.stat()
+        except OSError:
+            return
+        cached_mtime = self._auth.get("_mtime", 0.0) or 0.0
+        if st.st_mtime <= cached_mtime:
+            return
+        fresh = _load_node_auth()
+        if not fresh:
+            return
+        if fresh["nodeSecret"] != self._auth["nodeSecret"]:
+            logger.info(
+                "chat-sync.json rotated (mtime moved %.0f → %.0f); "
+                "reloading nodeSecret",
+                cached_mtime, st.st_mtime,
+            )
+        self._auth = fresh
+
     async def _refresh_or_cache(self, announce: bool = False) -> None:
         if not self._auth:
             return
+        self._maybe_reload_auth()
         fresh = await fetch_or_usage(self._auth)
         if not fresh:
             return
