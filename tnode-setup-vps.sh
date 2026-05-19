@@ -4545,7 +4545,7 @@ Env/overrides:
   TNODE_CHAT_SYNC_POLL_MS   Polling interval ms (default 500)
 """
 from __future__ import annotations
-__VERSION__ = "1.10.0"
+__VERSION__ = "1.11.0"
 
 import hashlib
 import hmac
@@ -4554,6 +4554,7 @@ import mimetypes
 import os
 import re
 import secrets as py_secrets
+import subprocess
 import sys
 import time
 import urllib.error
@@ -4706,12 +4707,19 @@ def mint_token(cfg: dict) -> dict:
     """Request a fresh Firebase custom token + exchange for idToken.
 
     Returns {idToken, uid, nodeId, expiresAt (epoch seconds)}.
+
+    Scope `sync_admin` is requested explicitly (v1.11.0+) so the daemon
+    can update `commands/{cmdId}` docs from cron CRUD handlers. The
+    chat-write rule on chats/ is satisfied by uid==owner regardless of
+    scope, so this is backward-compatible with the existing chat write
+    path.
     """
     ts = str(int(time.time() * 1000))
     nonce = py_secrets.token_hex(16)
+    scope = "sync_admin"
     mac = hmac.new(
         cfg["nodeSecret"].encode("utf-8"),
-        f'{cfg["nodeId"]}:{ts}:{nonce}'.encode("utf-8"),
+        f'{cfg["nodeId"]}:{ts}:{nonce}:{scope}'.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
     mint_resp = _http_post_json(
@@ -4721,6 +4729,7 @@ def mint_token(cfg: dict) -> dict:
             "timestamp": ts,
             "nonce": nonce,
             "signature": mac,
+            "scope": scope,
         },
     )
     custom_token = mint_resp["customToken"]
@@ -4832,6 +4841,14 @@ def _fs_value(v):
     if isinstance(v, str):
         return {"stringValue": v}
     if isinstance(v, dict):
+        # Sentinel: client-supplied timestamp → emit as Firestore timestampValue
+        # (REST PATCH cannot use real server-side serverTimestamp transforms
+        # without commitWriteRequests; clock drift on the node is tolerable
+        # for `mirroredAt` style fields).
+        if v.get("__server_timestamp__") is True:
+            return {"timestampValue": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            )}
         return {"mapValue": {"fields": {k: _fs_value(x) for k, x in v.items()}}}
     if isinstance(v, list):
         return {"arrayValue": {"values": [_fs_value(x) for x in v]}}
@@ -5324,6 +5341,389 @@ def process_assistant_file_markers(cfg: dict, content: str) -> str:
     return ASSISTANT_FILE_MARKER_RE.sub(replace, content)
 
 
+# ── Crons mirror + CRUD via commands/ (v1.11.0+) ──────────────────
+#
+# `openclaw cron list --json` enumera los cron jobs configurados en la
+# gateway. Cada N segundos los reflejamos a Firestore
+# `users/{uid}/nodes/{nodeId}/crons/{cronId}` para que la app cliente los
+# muestre como cards en el widget "Recurrencias" sin necesidad de
+# conexión WS al gateway.
+#
+# Commands CRUD del cliente llegan via `users/{uid}/nodes/{nodeId}/commands/{id}`
+# con `type` en {`cron.add`, `cron.edit`, `cron.rm`, `cron.enable`,
+# `cron.disable`}. Ejecutamos el CLI correspondiente y marcamos status.
+
+CRON_MIRROR_INTERVAL_S = float(
+    os.environ.get("TNODE_CHAT_SYNC_CRON_MIRROR_S", "10.0")
+)
+CRON_COMMAND_POLL_INTERVAL_S = float(
+    os.environ.get("TNODE_CHAT_SYNC_CRON_CMD_S", "3.0")
+)
+
+
+def _run_openclaw_cron(*args: str) -> tuple[int, str, str]:
+    """Run `openclaw cron <args...>` and return (rc, stdout, stderr).
+    Uses the user's PATH — the installer adds openclaw via npm global
+    so the binary is typically `/home/tnode/.npm-global/bin/openclaw`.
+    Sudo wrapping is NOT used here: this daemon already runs as the
+    tnode user via systemd User=tnode (or launchd UserName)."""
+    try:
+        result = subprocess.run(
+            ["openclaw", "cron", *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.returncode, result.stdout, result.stderr
+    except FileNotFoundError:
+        # Probar npm-global path explícito si openclaw no está en PATH.
+        for candidate in (
+            Path.home() / ".npm-global/bin/openclaw",
+            Path("/usr/local/bin/openclaw"),
+            Path("/opt/homebrew/bin/openclaw"),
+        ):
+            if candidate.is_file():
+                try:
+                    result = subprocess.run(
+                        [str(candidate), "cron", *args],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    return result.returncode, result.stdout, result.stderr
+                except Exception:  # noqa: BLE001
+                    pass
+        return -1, "", "openclaw binary not found"
+    except subprocess.TimeoutExpired:
+        return -1, "", "timeout"
+    except Exception as e:  # noqa: BLE001
+        return -1, "", str(e)
+
+
+def _fetch_local_crons() -> list[dict] | None:
+    """Returns the list of cron jobs as reported by `openclaw cron list --json`,
+    or None on failure. Each job dict carries id, name, enabled, schedule,
+    payload, delivery, state, agentId, etc."""
+    rc, stdout, stderr = _run_openclaw_cron("list", "--json")
+    if rc != 0:
+        _log(f"cron list failed rc={rc}: {stderr[:200]}")
+        return None
+    try:
+        data = json.loads(stdout)
+        return list(data.get("jobs") or [])
+    except json.JSONDecodeError as e:
+        _log(f"cron list JSON decode error: {e}")
+        return None
+
+
+def _crons_collection_url(token: dict, project_id: str) -> str:
+    base = _firestore_base(project_id)
+    return f"{base}/users/{token['uid']}/nodes/{token['nodeId']}/crons"
+
+
+def _query_existing_cron_ids(token: dict, project_id: str) -> set[str] | None:
+    """List existing crons/{id} docs to compute which need delete on mirror."""
+    url = _crons_collection_url(token, project_id) + "?pageSize=300"
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        return {
+            doc["name"].rsplit("/", 1)[-1]
+            for doc in (data.get("documents") or [])
+        }
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return set()
+        _log(f"query crons failed: {e.code} {e.reason}")
+        return None
+    except Exception as e:  # noqa: BLE001
+        _log(f"query crons error: {e}")
+        return None
+
+
+def _write_cron_doc(token: dict, project_id: str, job: dict) -> None:
+    cron_id = job.get("id")
+    if not cron_id:
+        return
+    base = _firestore_base(project_id)
+    url = f"{base}/users/{token['uid']}/nodes/{token['nodeId']}/crons/{cron_id}"
+    body = {
+        "id": cron_id,
+        "name": job.get("name") or cron_id,
+        "enabled": bool(job.get("enabled", True)),
+        "agentId": job.get("agentId") or "",
+        "schedule": job.get("schedule") or {},
+        "payload": job.get("payload") or {},
+        "delivery": job.get("delivery") or {},
+        "sessionTarget": job.get("sessionTarget") or "",
+        "sessionKey": job.get("sessionKey") or "",
+        "createdAtMs": job.get("createdAtMs"),
+        "updatedAtMs": job.get("updatedAtMs"),
+        "nextRunAtMs": (job.get("state") or {}).get("nextRunAtMs"),
+        "mirroredAt": {"__server_timestamp__": True},
+    }
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    try:
+        _http_patch_json(url, _fs_fields(body), headers)
+    except urllib.error.HTTPError as e:
+        _log(f"cron write {cron_id}: {e.code} {e.reason}")
+
+
+def _delete_cron_doc(token: dict, project_id: str, cron_id: str) -> None:
+    base = _firestore_base(project_id)
+    url = f"{base}/users/{token['uid']}/nodes/{token['nodeId']}/crons/{cron_id}"
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    try:
+        req = urllib.request.Request(url, method="DELETE", headers=headers)
+        urllib.request.urlopen(req, timeout=15).close()
+    except Exception as e:  # noqa: BLE001
+        _log(f"cron delete {cron_id}: {e}")
+
+
+def process_crons_mirror(token: dict, project_id: str) -> None:
+    """Sync `openclaw cron list --json` → Firestore `crons/`.
+    Upserts each present job; deletes Firestore docs for jobs no longer
+    in the local list. Idempotent — safe to call frequently."""
+    jobs = _fetch_local_crons()
+    if jobs is None:
+        return
+    local_ids = {j.get("id") for j in jobs if j.get("id")}
+    remote_ids = _query_existing_cron_ids(token, project_id)
+    if remote_ids is None:
+        # Couldn't enumerate — only do upserts, skip deletes to avoid
+        # nuking docs by accident on a transient error.
+        for job in jobs:
+            _write_cron_doc(token, project_id, job)
+        return
+    for job in jobs:
+        _write_cron_doc(token, project_id, job)
+    for orphan in remote_ids - local_ids:
+        _delete_cron_doc(token, project_id, orphan)
+
+
+# ── Command handler ─────────────────────────────────────────────
+
+_CRON_COMMAND_TYPES = frozenset({
+    "cron.add", "cron.edit", "cron.rm",
+    "cron.enable", "cron.disable",
+})
+
+
+def _build_cron_add_args(params: dict) -> list[str]:
+    """Translate a `cron.add` command params dict into CLI flags.
+    Required: name, schedule (every|cron|at), message.
+    Optional: agent, sessionTarget, channel, announce, description."""
+    args: list[str] = []
+    name = (params.get("name") or "").strip()
+    if name:
+        args += ["--name", name]
+    message = params.get("message")
+    if isinstance(message, str) and message.strip():
+        args += ["--message", message]
+    every = params.get("every")
+    if isinstance(every, str) and every.strip():
+        args += ["--every", every]
+    cron_expr = params.get("cron")
+    if isinstance(cron_expr, str) and cron_expr.strip():
+        args += ["--cron", cron_expr]
+    at = params.get("at")
+    if isinstance(at, str) and at.strip():
+        args += ["--at", at]
+    agent = params.get("agent") or "main"
+    args += ["--agent", agent]
+    session = params.get("sessionTarget")
+    if isinstance(session, str) and session in ("main", "isolated"):
+        args += ["--session", session]
+    if params.get("announce", True):
+        args += ["--announce"]
+    if params.get("disabled"):
+        args += ["--disabled"]
+    desc = params.get("description")
+    if isinstance(desc, str) and desc.strip():
+        args += ["--description", desc]
+    return args + ["--json"]
+
+
+def _build_cron_edit_args(cron_id: str, params: dict) -> list[str]:
+    args: list[str] = [cron_id]
+    if "name" in params and isinstance(params["name"], str):
+        args += ["--name", params["name"]]
+    if "message" in params and isinstance(params["message"], str):
+        args += ["--message", params["message"]]
+    if "every" in params and isinstance(params["every"], str):
+        args += ["--every", params["every"]]
+    if "cron" in params and isinstance(params["cron"], str):
+        args += ["--cron", params["cron"]]
+    if "agent" in params and isinstance(params["agent"], str):
+        args += ["--agent", params["agent"]]
+    if "description" in params and isinstance(params["description"], str):
+        args += ["--description", params["description"]]
+    return args + ["--json"]
+
+
+def _execute_cron_command(cmd_type: str, params: dict) -> tuple[bool, str]:
+    """Dispatch a `cron.*` command type to the openclaw CLI.
+    Returns (ok, summary)."""
+    cron_id = (params.get("id") or params.get("cronId") or "").strip()
+    if cmd_type == "cron.add":
+        args = _build_cron_add_args(params)
+        rc, stdout, stderr = _run_openclaw_cron("add", *args)
+        if rc != 0:
+            return False, (stderr or stdout or f"rc={rc}")[:300]
+        return True, "added"
+    if cmd_type == "cron.edit":
+        if not cron_id:
+            return False, "missing id"
+        args = _build_cron_edit_args(cron_id, params)
+        rc, stdout, stderr = _run_openclaw_cron("edit", *args)
+        if rc != 0:
+            return False, (stderr or stdout or f"rc={rc}")[:300]
+        return True, "edited"
+    if cmd_type == "cron.rm":
+        if not cron_id:
+            return False, "missing id"
+        rc, stdout, stderr = _run_openclaw_cron("rm", cron_id)
+        if rc != 0:
+            return False, (stderr or stdout or f"rc={rc}")[:300]
+        return True, "removed"
+    if cmd_type == "cron.enable":
+        if not cron_id:
+            return False, "missing id"
+        rc, stdout, stderr = _run_openclaw_cron("enable", cron_id)
+        if rc != 0:
+            return False, (stderr or stdout or f"rc={rc}")[:300]
+        return True, "enabled"
+    if cmd_type == "cron.disable":
+        if not cron_id:
+            return False, "missing id"
+        rc, stdout, stderr = _run_openclaw_cron("disable", cron_id)
+        if rc != 0:
+            return False, (stderr or stdout or f"rc={rc}")[:300]
+        return True, "disabled"
+    return False, f"unknown command type: {cmd_type}"
+
+
+def _query_pending_cron_commands(token: dict, project_id: str) -> list[dict]:
+    """Same shape as query_pending_uploads but for commands/ with
+    cron.* type and status==pending."""
+    parent = (
+        f"projects/{project_id}/databases/(default)/documents"
+        f"/users/{token['uid']}/nodes/{token['nodeId']}"
+    )
+    url = f"https://firestore.googleapis.com/v1/{parent}:runQuery"
+    body = {
+        "structuredQuery": {
+            "from": [{"collectionId": "commands"}],
+            "where": {
+                "compositeFilter": {
+                    "op": "AND",
+                    "filters": [
+                        {"fieldFilter": {
+                            "field": {"fieldPath": "status"},
+                            "op": "EQUAL",
+                            "value": {"stringValue": "pending"},
+                        }},
+                        {"fieldFilter": {
+                            "field": {"fieldPath": "type"},
+                            "op": "IN",
+                            "value": {"arrayValue": {"values": [
+                                {"stringValue": t} for t in sorted(_CRON_COMMAND_TYPES)
+                            ]}},
+                        }},
+                    ],
+                }
+            },
+            "limit": 10,
+        }
+    }
+    headers = {
+        "Authorization": f"Bearer {token['idToken']}",
+        "Content-Type": "application/json",
+    }
+    try:
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode(), headers=headers, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = json.loads(resp.read())
+    except Exception as e:  # noqa: BLE001
+        _log(f"query cron commands failed: {e}")
+        return []
+    out = []
+    for row in raw:
+        if "document" not in row:
+            continue
+        doc = row["document"]
+        cmd_id = doc["name"].rsplit("/", 1)[-1]
+        fields = doc.get("fields") or {}
+        cmd_type = (fields.get("type") or {}).get("stringValue", "")
+        params_field = fields.get("params") or {}
+        params = _fs_unwrap_map(params_field)
+        out.append({"id": cmd_id, "type": cmd_type, "params": params})
+    return out
+
+
+def _fs_unwrap_map(field: dict) -> dict:
+    """Unwrap a Firestore map field into a plain Python dict.
+    Conservative — only handles the subset of types our commands use."""
+    inner = field.get("mapValue", {}).get("fields", {})
+    out: dict = {}
+    for k, v in inner.items():
+        if "stringValue" in v:
+            out[k] = v["stringValue"]
+        elif "booleanValue" in v:
+            out[k] = v["booleanValue"]
+        elif "integerValue" in v:
+            try:
+                out[k] = int(v["integerValue"])
+            except (TypeError, ValueError):
+                out[k] = 0
+        elif "doubleValue" in v:
+            out[k] = v["doubleValue"]
+        elif "mapValue" in v:
+            out[k] = _fs_unwrap_map({"mapValue": v["mapValue"]})
+    return out
+
+
+def _update_cron_command(
+    token: dict, project_id: str, cmd_id: str, status: str, result: str
+) -> None:
+    base = _firestore_base(project_id)
+    url = (
+        f"{base}/users/{token['uid']}/nodes/{token['nodeId']}/commands/{cmd_id}"
+        f"?updateMask.fieldPaths=status&updateMask.fieldPaths=result"
+        f"&updateMask.fieldPaths=updatedAt"
+    )
+    body = {
+        "status": status,
+        "result": {"summary": result[:500]},
+        "updatedAt": {"__server_timestamp__": True},
+    }
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    try:
+        _http_patch_json(url, _fs_fields(body), headers)
+    except urllib.error.HTTPError as e:
+        _log(f"cron cmd update {cmd_id}: {e.code} {e.reason}")
+
+
+def process_cron_commands(token: dict, project_id: str) -> None:
+    """Pop pending cron.* commands, execute, mirror state (the mirror loop
+    re-runs anyway, but doing it inline keeps the UI responsive)."""
+    pending = _query_pending_cron_commands(token, project_id)
+    if not pending:
+        return
+    for cmd in pending:
+        cmd_id = cmd["id"]
+        ok, summary = _execute_cron_command(cmd["type"], cmd["params"])
+        new_status = "done" if ok else "error"
+        _update_cron_command(token, project_id, cmd_id, new_status, summary)
+        _log(f"cron cmd {cmd_id} type={cmd['type']} → {new_status}: {summary[:80]}")
+    # Refresh mirror so the client sees the post-command state immediately.
+    process_crons_mirror(token, project_id)
+
+
 def extract_content(raw):
     if raw is None:
         return ""
@@ -5675,6 +6075,10 @@ def main() -> int:
     # snappy in the UI (the user sees the chip flip from "procesando" to
     # "listo" within ~3s of the PUT landing).
     last_uploads_check = 0.0
+    # Cadence para crons mirror y CRUD commands (v1.11.0+). Mirror cada
+    # ~10s, comandos pendientes cada ~3s para responsividad de la UI.
+    last_cron_mirror_check = 0.0
+    last_cron_command_check = 0.0
 
     while True:
         try:
@@ -5786,6 +6190,35 @@ def main() -> int:
                 except urllib.error.HTTPError as e:
                     if e.code == 401:
                         _log("uploads poll: idToken rejected — refreshing")
+                        token = None
+
+            # Cron CRUD commands poll — fast clock so the app sees the
+            # operation reflected within a few seconds.
+            if (
+                token is not None
+                and (now_f - last_cron_command_check) >= CRON_COMMAND_POLL_INTERVAL_S
+            ):
+                last_cron_command_check = now_f
+                try:
+                    process_cron_commands(token, project_id)
+                except urllib.error.HTTPError as e:
+                    if e.code == 401:
+                        _log("cron commands poll: idToken rejected — refreshing")
+                        token = None
+
+            # Cron mirror — periodic snapshot of `openclaw cron list --json`
+            # to Firestore. Skipped when a command just ran (process_cron_commands
+            # already refreshes the mirror as its last step).
+            if (
+                token is not None
+                and (now_f - last_cron_mirror_check) >= CRON_MIRROR_INTERVAL_S
+            ):
+                last_cron_mirror_check = now_f
+                try:
+                    process_crons_mirror(token, project_id)
+                except urllib.error.HTTPError as e:
+                    if e.code == 401:
+                        _log("cron mirror: idToken rejected — refreshing")
                         token = None
 
             time.sleep(POLL_MS / 1000.0)
