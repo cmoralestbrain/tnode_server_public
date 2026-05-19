@@ -4525,7 +4525,7 @@ Env/overrides:
   TNODE_CHAT_SYNC_POLL_MS   Polling interval ms (default 500)
 """
 from __future__ import annotations
-__VERSION__ = "1.11.1"
+__VERSION__ = "1.11.2"
 
 import hashlib
 import hmac
@@ -5569,7 +5569,10 @@ def _build_cron_edit_args(cron_id: str, params: dict) -> list[str]:
         args += ["--agent", params["agent"]]
     if "description" in params and isinstance(params["description"], str):
         args += ["--description", params["description"]]
-    return args + ["--json"]
+    # NOTE: `openclaw cron edit` does NOT accept --json (only `add` and
+    # `list` do). Including it makes the CLI fail with
+    # "unknown option '--json'" and the edit is never applied.
+    return args
 
 
 def _execute_cron_command(cmd_type: str, params: dict) -> tuple[bool, str]:
