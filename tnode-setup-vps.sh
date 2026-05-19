@@ -4545,7 +4545,7 @@ Env/overrides:
   TNODE_CHAT_SYNC_POLL_MS   Polling interval ms (default 500)
 """
 from __future__ import annotations
-__VERSION__ = "1.11.0"
+__VERSION__ = "1.11.1"
 
 import hashlib
 import hmac
@@ -5361,15 +5361,44 @@ CRON_COMMAND_POLL_INTERVAL_S = float(
 )
 
 
+_OPENCLAW_JSON = OPENCLAW_DIR / "openclaw.json"
+_cron_cli_token_cache: dict = {"value": None, "mtime": 0.0}
+
+
+def _read_gateway_token() -> str | None:
+    """Read `gateway.auth.token` from `~/.openclaw/openclaw.json`. Cached
+    until the file mtime changes (token rotation via re-install)."""
+    try:
+        st = _OPENCLAW_JSON.stat()
+    except OSError:
+        return None
+    if _cron_cli_token_cache["mtime"] == st.st_mtime:
+        return _cron_cli_token_cache["value"]
+    try:
+        with open(_OPENCLAW_JSON, "r") as f:
+            cfg = json.load(f)
+        tok = ((cfg.get("gateway") or {}).get("auth") or {}).get("token")
+    except (OSError, json.JSONDecodeError):
+        tok = None
+    _cron_cli_token_cache["value"] = tok
+    _cron_cli_token_cache["mtime"] = st.st_mtime
+    return tok
+
+
 def _run_openclaw_cron(*args: str) -> tuple[int, str, str]:
     """Run `openclaw cron <args...>` and return (rc, stdout, stderr).
-    Uses the user's PATH — the installer adds openclaw via npm global
-    so the binary is typically `/home/tnode/.npm-global/bin/openclaw`.
-    Sudo wrapping is NOT used here: this daemon already runs as the
-    tnode user via systemd User=tnode (or launchd UserName)."""
+    Auto-injects `--token <gateway.auth.token>` so the CLI can connect
+    to the local gateway WS — the daemon runs in the same user account
+    as the gateway so reading the master token from openclaw.json is
+    legitimate (this is the same file the gateway itself reads)."""
+    token = _read_gateway_token()
+    final_args: list[str] = list(args)
+    # Append token only if caller didn't already include it.
+    if token and "--token" not in final_args:
+        final_args = [*final_args, "--token", token]
     try:
         result = subprocess.run(
-            ["openclaw", "cron", *args],
+            ["openclaw", "cron", *final_args],
             capture_output=True,
             text=True,
             timeout=30,
@@ -5385,7 +5414,7 @@ def _run_openclaw_cron(*args: str) -> tuple[int, str, str]:
             if candidate.is_file():
                 try:
                     result = subprocess.run(
-                        [str(candidate), "cron", *args],
+                        [str(candidate), "cron", *final_args],
                         capture_output=True,
                         text=True,
                         timeout=30,
