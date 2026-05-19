@@ -3984,19 +3984,43 @@ _SUBAGENTS_SECTION_IDENTITY = """
 Eres el coordinador principal. Cuando una tarea encaja con la especialidad de un sub-agente del roster (ver `~/.openclaw/agency-agents/AGENTS_INDEX.md`), delégala con `sessions_spawn(runtime="subagent", agentId=<id>, task=...)` en lugar de hacerla tú mismo.
 """
 
+_SEND_FILE_SECTION_SOUL = """
+## Envío de archivos al chat
+
+Cuando produzcas un archivo (PDF, imagen, código, etc.) que el usuario quiera abrir desde su app, NO le pases la ruta como texto. Incluye un marker exacto en tu respuesta así:
+
+    [adjunto: /ruta/absoluta/al/archivo.pdf]
+
+El sistema detecta el marker, sube el archivo a un canal seguro y lo reemplaza por un chip descargable en el chat (el usuario lo toca y se abre con su visor nativo).
+
+Reglas:
+- El archivo debe vivir bajo `~/.openclaw/workspace/`. Cualquier otra ruta es rechazada por seguridad.
+- Tamaño máximo: 50 MB.
+- Tipos comunes aceptados: PDF, imágenes, texto, código, ZIP/TAR/GZ, JSON/XML.
+- Puedes mezclar varios markers con texto normal: "Aquí tienes el reporte [adjunto: workspace/foo.pdf] y los datos [adjunto: workspace/bar.csv]".
+- NO uses `MEDIA:`, `file://`, ni rutas crudas — siempre el formato `[adjunto: <ruta>]`.
+"""
+
 
 def _ensure_subagents_sections() -> None:
-    """Idempotently append the 'Sub-agentes' section to workspace/SOUL.md
-    (operative: when to read the INDEX) and workspace/IDENTITY.md
-    (identitarian: you are a coordinator, delegate). No-op on each file
-    that already carries its section header. Safe to call repeatedly —
-    each install/uninstall_subagent cycle re-runs it as a guard against
-    workspace drift."""
+    """Idempotently append operative sections to workspace/SOUL.md +
+    workspace/IDENTITY.md. Each section carries its own header marker
+    so the function is safe to call repeatedly — install_subagent and
+    every config-sync boot run it as a guard against workspace drift.
+
+    Sections appended:
+      - `## Sub-agentes disponibles` (SOUL): how to use the roster.
+      - `## Sub-agentes a tu disposición` (IDENTITY): delegate, don't do.
+      - `## Envío de archivos al chat` (SOUL): `[adjunto: <path>]` marker
+        protocol so the agent knows how to surface files to the mobile
+        app — sidecar tnode-chat-sync v1.10.0+ rewrites the marker into
+        an `[archivo:{id}]` after uploading the file."""
     workspace = OPENCLAW_DIR / "workspace"
     targets = (
         ("SOUL.md", "## Sub-agentes disponibles", _SUBAGENTS_SECTION_SOUL),
         ("IDENTITY.md", "## Sub-agentes a tu disposición",
          _SUBAGENTS_SECTION_IDENTITY),
+        ("SOUL.md", "## Envío de archivos al chat", _SEND_FILE_SECTION_SOUL),
     )
     for fname, marker, section in targets:
         p = workspace / fname
@@ -4521,12 +4545,14 @@ Env/overrides:
   TNODE_CHAT_SYNC_POLL_MS   Polling interval ms (default 500)
 """
 from __future__ import annotations
-__VERSION__ = "1.9.1"
+__VERSION__ = "1.10.0"
 
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
+import re
 import secrets as py_secrets
 import sys
 import time
@@ -4561,6 +4587,24 @@ PROVISION_TOKEN_URL = (
 REGISTER_NODE_SYNC_URL = (
     "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/registerNodeSync"
 )
+
+# Assistant file uploads (v1.10.0+) — the inverse of process_uploads. When
+# the agent writes `[adjunto: <path>]` in its turn text, we read the file,
+# negotiate a signed PUT URL with `prepareAssistantFile`, upload, then
+# `confirmAssistantFile` flips the doc to `uploaded` and we rewrite the
+# marker as `[archivo:{attachmentId}]` before persisting to chats/.
+PREPARE_ASSISTANT_FILE_URL = (
+    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/prepareAssistantFile"
+)
+CONFIRM_ASSISTANT_FILE_URL = (
+    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/confirmAssistantFile"
+)
+# Hard cap (mirrors server-side MAX_BYTES). Agents that try to attach a
+# 200MB log get a friendly "[adjunto-error: too-large]" rewrite instead.
+ASSISTANT_FILE_MAX_BYTES = 50 * 1024 * 1024
+# Marker grammar (intentionally narrow — must escape the closing `]` if
+# the path contains one, which is extremely rare in practice).
+ASSISTANT_FILE_MARKER_RE = re.compile(r"\[adjunto:\s*([^\]\n]+?)\s*\]")
 
 HOME = Path.home()
 OPENCLAW_DIR = Path(os.environ.get("OPENCLAW_HOME", str(HOME / ".openclaw")))
@@ -4877,6 +4921,9 @@ def query_pending_uploads(token: dict, project_id: str, limit: int = 20) -> list
     headers = {"Authorization": f"Bearer {token['idToken']}"}
     raw = _http_post_json_authed(url, body, headers, timeout=20)
     out = []
+    # runQuery returns a list of `{document}` entries. The list can be
+    # empty (no matches) or contain `{readTime: ...}` entries which we
+    # skip.
     if not isinstance(raw, list):
         return out
     for item in raw:
@@ -4892,7 +4939,8 @@ def query_pending_uploads(token: dict, project_id: str, limit: int = 20) -> list
 
 
 def _sanitize_segment(s: str) -> str:
-    """Belt-and-suspenders: drop anything that's not alnum/dot/dash/underscore
+    """Belt-and-suspenders: even though the CF already sanitized
+    `sanitizedFileName`, drop anything that's not alnum/dot/dash/underscore
     so a malicious doc can't escape the upload dir."""
     safe = []
     for ch in s:
@@ -5033,8 +5081,8 @@ def process_uploads(token: dict, project_id: str) -> None:
 
         if actual_sha != expected_sha:
             _log(
-                f"upload {aid}: sha mismatch expected={expected_sha[:16]}... "
-                f"actual={actual_sha[:16]}..."
+                f"upload {aid}: sha mismatch expected={expected_sha[:16]}… "
+                f"actual={actual_sha[:16]}…"
             )
             try:
                 dest_path.unlink()
@@ -5044,7 +5092,8 @@ def process_uploads(token: dict, project_id: str) -> None:
             continue
 
         # Refresh ttlExpiresAt → downloadedAt + 24h so the cleanup CF
-        # keeps the doc around for a full day after the download.
+        # keeps the doc around for a full day after the download (the
+        # original ttl was set from createdAt + 24h, which may be sooner).
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         ttl_iso = time.strftime(
             "%Y-%m-%dT%H:%M:%SZ",
@@ -5064,7 +5113,7 @@ def process_uploads(token: dict, project_id: str) -> None:
                 mask=["status", "localPath", "downloadedAt", "ttlExpiresAt"],
             )
             _log(
-                f"upload {aid}: downloaded {written}B -> {local_path}"
+                f"upload {aid}: downloaded {written}B → {local_path}"
             )
         except urllib.error.HTTPError as e:
             if e.code == 401:
@@ -5075,6 +5124,205 @@ def process_uploads(token: dict, project_id: str) -> None:
 
 
 # ── JSONL turn extraction ──────────────────────────────────────
+
+# ── Assistant file uploads (v1.10.0+) ─────────────────────────────
+#
+# Resolves a path written by the agent (typically absolute under
+# `~/.openclaw/workspace/...` or relative like `workspace/foo.pdf`) to a
+# real file on disk, gated to live under OPENCLAW_DIR/workspace for
+# safety — we don't want the agent leaking `/etc/passwd` or its own
+# auth-profiles.json via a clever marker.
+
+WORKSPACE_DIR = OPENCLAW_DIR / "workspace"
+
+
+def _resolve_workspace_path(raw: str) -> Path | None:
+    raw = raw.strip()
+    if not raw:
+        return None
+    # Strip surrounding quotes the agent sometimes adds.
+    for q in ('"', "'", "`"):
+        if raw.startswith(q) and raw.endswith(q):
+            raw = raw[1:-1].strip()
+    # Expand ~ and env vars so `~/.openclaw/workspace/foo.pdf` works.
+    raw = os.path.expandvars(os.path.expanduser(raw))
+    # Strip the MEDIA: prefix some agents emit accidentally (saw in the wild
+    # before the SOUL update — keep handling it gracefully for stragglers).
+    if raw.startswith("MEDIA:"):
+        raw = raw[len("MEDIA:"):].strip()
+    p = Path(raw)
+    if not p.is_absolute():
+        # Treat `workspace/foo.pdf` as relative to OPENCLAW_HOME.
+        p = OPENCLAW_DIR / p
+    try:
+        p = p.resolve(strict=False)
+    except OSError:
+        return None
+    # Reject anything outside the workspace dir.
+    try:
+        workspace_resolved = WORKSPACE_DIR.resolve(strict=False)
+        p.relative_to(workspace_resolved)
+    except (ValueError, OSError):
+        return None
+    if not p.is_file():
+        return None
+    return p
+
+
+def _sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(64 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _guess_mime(path: Path) -> str:
+    mt, _ = mimetypes.guess_type(str(path))
+    return mt or "application/octet-stream"
+
+
+def _hmac_signature(node_secret: str, signing_string: str) -> str:
+    return hmac.new(
+        node_secret.encode(),
+        signing_string.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _prepare_assistant_file(
+    cfg: dict, file_path: Path, sha: str, size: int, mime: str
+) -> dict | None:
+    """POST /prepareAssistantFile. Returns response dict or None on error.
+    Allowed errors get logged but don't crash the watcher — the marker is
+    left untouched in the message so the user at least sees the path."""
+    node_id = cfg["nodeId"]
+    node_secret = cfg["nodeSecret"]
+    ts = str(int(time.time() * 1000))
+    nonce = py_secrets.token_hex(16)
+    signing = f"{node_id}:{ts}:{nonce}:assistant_file:{sha}"
+    body = {
+        "nodeId": node_id,
+        "timestamp": ts,
+        "nonce": nonce,
+        "signature": _hmac_signature(node_secret, signing),
+        "fileName": file_path.name,
+        "mimeType": mime,
+        "sizeBytes": size,
+        "sha256": sha,
+    }
+    try:
+        return _http_post_json(PREPARE_ASSISTANT_FILE_URL, body)
+    except urllib.error.HTTPError as e:
+        _log(f"prepareAssistantFile {e.code}: {e.reason}")
+        return None
+    except Exception as e:  # noqa: BLE001
+        _log(f"prepareAssistantFile error: {e}")
+        return None
+
+
+def _put_file_to_signed_url(url: str, file_path: Path, mime: str) -> bool:
+    try:
+        with open(file_path, "rb") as f:
+            data = f.read()
+        req = urllib.request.Request(
+            url, data=data, method="PUT",
+            headers={"Content-Type": mime},
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError as e:
+        _log(f"PUT signed URL {e.code}: {e.reason}")
+        return False
+    except Exception as e:  # noqa: BLE001
+        _log(f"PUT signed URL error: {e}")
+        return False
+
+
+def _confirm_assistant_file(cfg: dict, attachment_id: str) -> bool:
+    node_id = cfg["nodeId"]
+    node_secret = cfg["nodeSecret"]
+    ts = str(int(time.time() * 1000))
+    nonce = py_secrets.token_hex(16)
+    signing = f"{node_id}:{ts}:{nonce}:confirm:{attachment_id}"
+    body = {
+        "nodeId": node_id,
+        "timestamp": ts,
+        "nonce": nonce,
+        "signature": _hmac_signature(node_secret, signing),
+        "attachmentId": attachment_id,
+    }
+    try:
+        _http_post_json(CONFIRM_ASSISTANT_FILE_URL, body)
+        return True
+    except Exception as e:  # noqa: BLE001
+        _log(f"confirmAssistantFile error: {e}")
+        return False
+
+
+def _process_one_marker(cfg: dict, raw_path: str) -> str | None:
+    """Resolve + upload + confirm. Returns attachmentId on success, None on
+    any failure (caller leaves the marker untouched or rewrites it as
+    `[adjunto-error:...]`)."""
+    resolved = _resolve_workspace_path(raw_path)
+    if resolved is None:
+        _log(f"adjunto: rejected path '{raw_path}' (not under workspace)")
+        return None
+    try:
+        size = resolved.stat().st_size
+    except OSError as e:
+        _log(f"adjunto: stat failed for {resolved}: {e}")
+        return None
+    if size <= 0:
+        _log(f"adjunto: empty file {resolved}")
+        return None
+    if size > ASSISTANT_FILE_MAX_BYTES:
+        _log(f"adjunto: too large {resolved} ({size} bytes)")
+        return None
+    try:
+        sha = _sha256_of(resolved)
+    except OSError as e:
+        _log(f"adjunto: sha256 failed for {resolved}: {e}")
+        return None
+    mime = _guess_mime(resolved)
+    prep = _prepare_assistant_file(cfg, resolved, sha, size, mime)
+    if prep is None:
+        return None
+    attachment_id = prep.get("attachmentId")
+    upload_url = prep.get("uploadUrl")
+    if not attachment_id or not upload_url:
+        _log(f"adjunto: prepare response missing fields: {prep}")
+        return None
+    if not _put_file_to_signed_url(upload_url, resolved, mime):
+        _log(f"adjunto: PUT failed for {resolved}")
+        return None
+    if not _confirm_assistant_file(cfg, attachment_id):
+        # Doc is in `preparing` state — cleanup will reap after TTL. Still
+        # not safe to rewrite the marker because the client needs `uploaded`
+        # to render.
+        return None
+    _log(f"adjunto uploaded: {resolved.name} → attachmentId={attachment_id}")
+    return attachment_id
+
+
+def process_assistant_file_markers(cfg: dict, content: str) -> str:
+    """Walk every `[adjunto: <path>]` in content, upload each, rewrite to
+    `[archivo:{id}]`. On failure, the marker becomes `[adjunto-error: ...]`
+    so the user sees why their file didn't come through.
+
+    Idempotent: an already-rewritten `[archivo:{id}]` won't match the
+    regex and stays as-is, so retries of the same trajectory entry don't
+    re-upload."""
+
+    def replace(m: re.Match) -> str:
+        raw_path = m.group(1).strip()
+        attachment_id = _process_one_marker(cfg, raw_path)
+        if attachment_id:
+            return f"[archivo:{attachment_id}]"
+        return "[adjunto-error: no se pudo subir el archivo]"
+
+    return ASSISTANT_FILE_MARKER_RE.sub(replace, content)
+
 
 def extract_content(raw):
     if raw is None:
@@ -5288,6 +5536,7 @@ class SessionTailer:
                 continue
             session_id = p.stem
             if session_id in traj_sessions:
+                # Legacy jsonl is shadowed by a trajectory file — skip it.
                 continue
             out.append(p)
         return out
@@ -5375,38 +5624,21 @@ def main() -> int:
     pending: dict[str, dict] = {}  # entryId -> turn + {bufferedAt: float}
     PENDING_TIMEOUT_S = 15.0
 
-    # Dedup window for stale flushes (turns without a runId). The agent can
-    # emit the same auto-greeting on every WS reconnect; without this guard
-    # each reconnect writes a new doc with a different content-hash id and
-    # the user sees the message duplicated. Real turns (with runId) bypass.
-    STALE_DEDUP_WINDOW_S = 600.0
-    stale_recent: list[tuple[str, float]] = []
-
-    def _is_recent_stale_dup(content: str, role: str, now: float) -> bool:
-        nonlocal stale_recent
-        stale_recent = [(h, ts) for (h, ts) in stale_recent if ts >= now - STALE_DEDUP_WINDOW_S]
-        h = hashlib.sha256(f"{role}|{content}".encode("utf-8")).hexdigest()
-        if any(rh == h for rh, _ in stale_recent):
-            return True
-        stale_recent.append((h, now))
-        return False
-
     def flush_turn(t: dict):
         if token is None:
             return
-        if not t.get("turnId"):
-            if _is_recent_stale_dup(
-                t.get("content", "") or "",
-                t.get("role", "") or "",
-                time.time(),
-            ):
-                _log("skip duplicate stale turn (content matches recent within window)")
-                return
         mid = message_id_for(t)
+        # Rewrite `[adjunto: <path>]` markers from the agent's text into
+        # `[archivo:{id}]` after uploading the files to Storage. Skip
+        # entirely when no marker present (fast path — the `in` check
+        # avoids regex compilation when the agent didn't attach anything).
+        content = t["content"]
+        if "[adjunto:" in content:
+            content = process_assistant_file_markers(cfg, content)
         body = {
             "id": mid,
             "role": t["role"],
-            "content": t["content"],
+            "content": content,
             "status": "complete",
             "source": "watcher",
             "createdAt": t.get("ts") or "",
@@ -5567,6 +5799,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
 CHATSYNCPYEOF
 }
 
