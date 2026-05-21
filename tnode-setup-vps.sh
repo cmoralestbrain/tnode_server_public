@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.16.0"
+TNODE_SETUP_VERSION="1.17.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -2787,7 +2787,7 @@ from __future__ import annotations
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.4.0"
+__VERSION__ = "1.5.0"
 
 import hashlib
 import hmac
@@ -3413,6 +3413,34 @@ def _write_openclaw_json(cfg: dict) -> None:
     os.replace(tmp, OPENCLAW_JSON_PATH)
 
 
+def _strip_provider_prefix(slug: str, provider: str) -> str:
+    """Get the INTERNAL provider id (no prefix) — what providers[p].models[].id
+    must be. Idempotent: strips `<provider>/` if present, else no-op.
+    """
+    if not isinstance(slug, str) or not isinstance(provider, str):
+        return slug
+    needle = provider + "/"
+    if slug.startswith(needle):
+        return slug[len(needle):]
+    return slug
+
+
+def _build_prefixed_slug(provider: str, model: str) -> str:
+    """Get the PREFIXED slug — what agents.defaults.models[key] and
+    agents.list[].model.primary must be. OpenClaw 2026.5.x exige que el
+    slug del agente lleve el prefix del provider local (ver memoria
+    `or_api_quirks` §6); sin prefix, OpenClaw interpreta `<vendor>/<id>`
+    como `<provider-local>/<model-id>` y falla con `No API key for
+    provider <vendor>`. Idempotente: si ya está prefixed, no-op.
+    """
+    if not isinstance(model, str) or not isinstance(provider, str):
+        return model
+    needle = provider + "/"
+    if model.startswith(needle):
+        return model
+    return needle + model
+
+
 def _apply_provider_to_openclaw(
     provider: str,
     base_url: str,
@@ -3430,11 +3458,23 @@ def _apply_provider_to_openclaw(
     user re-applied an OpenRouter key, leaving the gateway with a single
     allowed model and breaking sub-agent delegation.
 
-    `agents.defaults.models` MUST stay as a dict keyed by id (without the
-    provider prefix). The legacy singular `agents.defaults.model.primary`
-    is dropped on touch — it still triggers `Unknown model` on OpenClaw
-    v2026.4.24+ for any id outside OpenClaw's internal registry.
+    v1.5.0+ — slug normalization (fix OpenClaw 2026.5.x `Unknown model`):
+    `providers[p].models[].id` recibe el slug INTERNO sin prefix
+    (`qwen/qwen3.6-plus`), mientras que `agents.defaults.models[key]`
+    recibe el slug PREFIXED (`openrouter/qwen/qwen3.6-plus`). El parser
+    de OpenClaw splittea por la primera `/` para extraer el provider
+    local; sin prefix `openrouter/`, falla con `No API key found for
+    provider <vendor>`. Ver memoria `or_api_quirks` §6 para el contrato.
+
+    Idempotente — acepta `model` con o sin prefix; internal_id / prefixed
+    se derivan via helpers `_strip_provider_prefix` / `_build_prefixed_slug`.
+
+    El legacy `agents.defaults.model.primary` (singular) se borra en cada
+    escritura — desde OpenClaw v2026.4.24+ produce `Unknown model`.
     """
+    internal_id = _strip_provider_prefix(model, provider)
+    prefixed_slug = _build_prefixed_slug(provider, internal_id)
+
     cfg = read_openclaw_json() or {}
     providers = cfg.setdefault("models", {}).setdefault("providers", {})
     p = providers.setdefault(provider, {
@@ -3451,13 +3491,13 @@ def _apply_provider_to_openclaw(
         models_list = []
         p["models"] = models_list
     existing = next(
-        (m for m in models_list if isinstance(m, dict) and m.get("id") == model),
+        (m for m in models_list if isinstance(m, dict) and m.get("id") == internal_id),
         None,
     )
     if existing is None:
         models_list.append({
-            "id": model,
-            "name": model,
+            "id": internal_id,
+            "name": internal_id,
             "contextWindow": ctx or _default_context_for(provider),
             "maxTokens": max_tokens,
         })
@@ -3468,7 +3508,7 @@ def _apply_provider_to_openclaw(
             existing["maxTokens"] = max_tokens
 
     agents_defaults = cfg.setdefault("agents", {}).setdefault("defaults", {})
-    agents_defaults.setdefault("models", {}).setdefault(model, {})
+    agents_defaults.setdefault("models", {}).setdefault(prefixed_slug, {})
     agents_defaults.pop("model", None)  # drop legacy singular key
 
     _write_openclaw_json(cfg)
@@ -6468,7 +6508,7 @@ from __future__ import annotations
 #          previous default. Idempotent; no-op on un-prefixed slugs.
 # 1.8.14 — _agent_model_set merges into defaults.models instead of
 #          overwriting it (preserves multi-agent distinct picks).
-__VERSION__ = "1.9.0"
+__VERSION__ = "1.10.0"
 
 import argparse
 import asyncio
@@ -7513,6 +7553,31 @@ def _agent_model_get(agent_id: str) -> Dict[str, Any]:
     }
 
 
+def _normalize_agent_slug(slug: str) -> str:
+    """v1.10.0+ — Normaliza slugs OR sin prefix → con prefix `openrouter/`.
+
+    OpenClaw 2026.5.x requiere que el slug del agente lleve prefix del
+    provider local (ver memoria `or_api_quirks` §6). Sin prefix, el parser
+    interpreta `<vendor>/<id>` como `<provider-local>/<model>` y falla
+    con `Unknown model: <vendor>/<id>`.
+
+    Convención: provider prefixes locales reconocidos son `openrouter`,
+    `groq`, `moonshot`, `ollama`, `lmstudio`, `llama-cpp`. Si el primer
+    segmento del slug ya es uno de esos, no-op (idempotente). Si no,
+    asume que es un slug OR canónico `<vendor>/<id>` y prepend
+    `openrouter/`.
+    """
+    if not isinstance(slug, str) or "/" not in slug:
+        return slug
+    _local_providers = (
+        "openrouter", "groq", "moonshot", "ollama", "lmstudio", "llama-cpp",
+    )
+    first_segment = slug.split("/", 1)[0]
+    if first_segment in _local_providers:
+        return slug
+    return "openrouter/" + slug
+
+
 def _agent_model_set(agent_id: str, model_slug: str) -> Dict[str, Any]:
     """Sets the per-agent primary model. If the node has no `agents.list[]`
     entry for `agent_id`, one is created (`{id, default, model: {primary}}`),
@@ -7523,7 +7588,13 @@ def _agent_model_set(agent_id: str, model_slug: str) -> Dict[str, Any]:
     dict). OpenClaw v2026.4.x builds the agent's allowlist from that key —
     if the slug isn't there, the resolver silently falls back to the
     pre-existing default and the user's selection is ignored at runtime.
-    Merges (doesn't replace) so multiple agents can keep distinct models."""
+    Merges (doesn't replace) so multiple agents can keep distinct models.
+
+    v1.10.0+ — `model_slug` se normaliza al inicio (`_normalize_agent_slug`)
+    para garantizar prefix `openrouter/` cuando el cliente envía slugs OR
+    canónicos sin prefix (slugs heredados pre-2026-05-09 en Firestore).
+    """
+    model_slug = _normalize_agent_slug(model_slug)
     if not isinstance(model_slug, str) or "/" not in model_slug:
         raise AgentError(
             "invalid-model-slug",
