@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.18.0"
+TNODE_SETUP_VERSION="1.19.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -308,6 +308,22 @@ setup_tnode_user() {
     if [[ -n "$tnode_uid" ]] && command_exists systemctl; then
         systemctl start "user@${tnode_uid}.service" 2>/dev/null || true
     fi
+
+    # Grant passwordless sudo so the agent (running as `tnode`) can perform
+    # privileged ops (systemctl, apt-get, writes under /etc/, etc.) without
+    # interactive prompts. Drop-in is atomic, validated via visudo, and
+    # removed by --uninstall.
+    local sudoers_file="/etc/sudoers.d/tnode"
+    local sudoers_tmp
+    sudoers_tmp="$(mktemp)"
+    echo "${TNODE_USER} ALL=(ALL) NOPASSWD: ALL" > "$sudoers_tmp"
+    if visudo -c -f "$sudoers_tmp" >/dev/null 2>&1; then
+        install -m 0440 -o root -g root "$sudoers_tmp" "$sudoers_file"
+        success "sudo NOPASSWD habilitado para $TNODE_USER (vía $sudoers_file)"
+    else
+        warn "sudoers drop-in falló validación visudo — saltando grant"
+    fi
+    rm -f "$sudoers_tmp"
 }
 
 # Progress bar for long-running commands (spinner + bar + elapsed time)
@@ -9096,6 +9112,17 @@ do_uninstall() {
                 warn "no pude borrar $cand"
             fi
         done
+    fi
+
+    # Remove sudo NOPASSWD drop-in before deleting the user. Otherwise we
+    # leak a sudoers entry referencing a non-existent user — many sudo
+    # versions warn on every invocation when that happens.
+    if [[ "$OS" != "Darwin" ]] && [[ -f /etc/sudoers.d/tnode ]]; then
+        if _uninstall_sudo rm -f /etc/sudoers.d/tnode; then
+            success "sudoers drop-in /etc/sudoers.d/tnode eliminado"
+        else
+            warn "no pude borrar /etc/sudoers.d/tnode — bórralo manual"
+        fi
     fi
 
     # Optionally remove the dedicated `tnode` user. Done last so that
