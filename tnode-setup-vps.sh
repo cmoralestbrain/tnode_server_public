@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.17.0"
+TNODE_SETUP_VERSION="1.17.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -6508,7 +6508,7 @@ from __future__ import annotations
 #          previous default. Idempotent; no-op on un-prefixed slugs.
 # 1.8.14 — _agent_model_set merges into defaults.models instead of
 #          overwriting it (preserves multi-agent distinct picks).
-__VERSION__ = "1.10.0"
+__VERSION__ = "1.10.1"
 
 import argparse
 import asyncio
@@ -7554,26 +7554,37 @@ def _agent_model_get(agent_id: str) -> Dict[str, Any]:
 
 
 def _normalize_agent_slug(slug: str) -> str:
-    """v1.10.0+ — Normaliza slugs OR sin prefix → con prefix `openrouter/`.
+    """v1.10.1+ — Normaliza slugs OR canónicos sin prefix → con prefix
+    `openrouter/`. Idempotente y safe para slugs ya prefixed o de providers
+    runtime custom (LM Studio en `custom-127-0-0-1-<port>/...`, Ollama, etc).
 
-    OpenClaw 2026.5.x requiere que el slug del agente lleve prefix del
-    provider local (ver memoria `or_api_quirks` §6). Sin prefix, el parser
-    interpreta `<vendor>/<id>` como `<provider-local>/<model>` y falla
-    con `Unknown model: <vendor>/<id>`.
+    OpenClaw 2026.5.x requiere prefix del provider local (memoria
+    `or_api_quirks` §6). Sin prefix, parser interpreta `<vendor>/<id>` como
+    `<provider-local>/<model>` y falla `Unknown model: <vendor>/<id>`.
 
-    Convención: provider prefixes locales reconocidos son `openrouter`,
-    `groq`, `moonshot`, `ollama`, `lmstudio`, `llama-cpp`. Si el primer
-    segmento del slug ya es uno de esos, no-op (idempotente). Si no,
-    asume que es un slug OR canónico `<vendor>/<id>` y prepend
-    `openrouter/`.
+    Heurística (más conservadora que v1.10.0 que falsamente prefijó
+    `custom-127-0-0-1-1234/qwen/qwen3.5-9b` rompiendo LM Studio en Mini):
+    - Solo slugs de EXACTAMENTE 2 segmentos son candidatos a normalize.
+      Slugs de 3+ segmentos (e.g. `openrouter/qwen/qwen3.6-plus`,
+      `custom-127-0-0-1-1234/qwen/qwen3.5-9b`) YA tienen provider prefix.
+    - Si el primer segmento es un provider local conocido (`openrouter`,
+      `groq`, `moonshot`, `ollama`, `lmstudio`, `llama-cpp`) NO normalizar.
+    - Si empieza con `custom-` o contiene `.`/`_` (IP-like), provider runtime
+      custom — NO normalizar.
+    - Lo demás: slug OR canónico `<vendor>/<id>`, prepend `openrouter/`.
     """
     if not isinstance(slug, str) or "/" not in slug:
         return slug
+    parts = slug.split("/")
+    if len(parts) != 2:
+        return slug
+    first = parts[0]
     _local_providers = (
         "openrouter", "groq", "moonshot", "ollama", "lmstudio", "llama-cpp",
     )
-    first_segment = slug.split("/", 1)[0]
-    if first_segment in _local_providers:
+    if first in _local_providers:
+        return slug
+    if first.startswith("custom-") or any(c in first for c in (".", "_")):
         return slug
     return "openrouter/" + slug
 
