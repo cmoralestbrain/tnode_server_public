@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.12.1"
+TNODE_SETUP_VERSION="1.16.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -4545,7 +4545,7 @@ Env/overrides:
   TNODE_CHAT_SYNC_POLL_MS   Polling interval ms (default 500)
 """
 from __future__ import annotations
-__VERSION__ = "1.11.2"
+__VERSION__ = "1.12.0"
 
 import hashlib
 import hmac
@@ -5872,6 +5872,22 @@ def runid_from_custom(entry: dict):
     return (entry.get("parentId"), data.get("runId"))
 
 
+def _derive_originating_channel(session_key) -> str | None:
+    """Map a gateway sessionKey to an `originatingChannel` tag (v1.12.0+).
+
+    The Flutter client always uses `sessionKey = "tnode-mobile-<uuid>"` when
+    issuing `chat.send`. The gateway prefixes it as
+    `"agent:<agentId>:tnode-mobile-<uuid>"` in trajectory events. We tag
+    those turns with `originatingChannel: "tnode-mobile"` so sub-agents and
+    historial conserven el origen del mensaje (vs WhatsApp, webchat, CLI).
+    """
+    if not isinstance(session_key, str):
+        return None
+    if "tnode-mobile-" in session_key:
+        return "tnode-mobile"
+    return None
+
+
 def assistant_turn_from_trajectory(entry: dict):
     """Return a normalized assistant turn from an OpenClaw v2026.5.x
     `type:"model.completed"` trajectory event, or None if `entry` is not
@@ -5906,6 +5922,7 @@ def assistant_turn_from_trajectory(entry: dict):
         # promised `a_{runId}` shape and weakening the dedup guarantee.
         "idempotencyKey": run_id,
         "entryId": None,  # no buffering needed — runId is already populated
+        "originatingChannel": _derive_originating_channel(entry.get("sessionKey")),
     }
 
 
@@ -6078,6 +6095,8 @@ def main() -> int:
         }
         if t.get("turnId"):
             body["turnId"] = t["turnId"]
+        if t.get("originatingChannel"):
+            body["originatingChannel"] = t["originatingChannel"]
         try:
             write_message(
                 token,
