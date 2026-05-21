@@ -89,14 +89,14 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.17.1"
+TNODE_SETUP_VERSION="1.18.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
 # even with a valid Ed25519 signature + master token, blocking cloud
 # provisioning E2E. Override with `OPENCLAW_PIN_VERSION=` (empty) to take
 # whatever is current.
-OPENCLAW_PIN_VERSION="${OPENCLAW_PIN_VERSION-2026.4.23}"
+OPENCLAW_PIN_VERSION="${OPENCLAW_PIN_VERSION-2026.5.19}"
 TNODE_USER="tnode"
 TNODE_HOME=""      # set in setup_tnode_user()
 OPENCLAW_HOME=""   # set in setup_tnode_user()
