@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.19.0"
+TNODE_SETUP_VERSION="1.19.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -8743,6 +8743,65 @@ update_openclaw_gateway_only() {
     success "openclaw-gateway refreshed"
 }
 
+# Detect a stale openclaw-gateway daemon — binary updated on disk (via
+# `npm install -g openclaw@*`, `openclaw update`, or any other path that
+# bypasses the installer) but the daemon still has the old code in RAM —
+# and reload it. Without this, clients on the new version handshake with
+# the stale gateway and get "protocol mismatch" rejection loops every
+# 10s. Linux-only (macOS LaunchAgent path not covered here).
+ensure_openclaw_gateway_fresh() {
+    [[ "$OS" == "Darwin" ]] && return 0
+    command_exists systemctl || return 0
+    local tnode_uid
+    tnode_uid="$(id -u "$TNODE_USER" 2>/dev/null || echo "")"
+    [[ -z "$tnode_uid" ]] && return 0
+
+    # Helper: run `systemctl --user` against the tnode user-bus. Uses
+    # `sudo -u` (passwordless from root) + `env` to set XDG_RUNTIME_DIR
+    # without the quoting hazards of `su -c "..."`.
+    _gw_systemctl() {
+        if [[ "$(id -u)" == "0" ]]; then
+            sudo -u "$TNODE_USER" env "XDG_RUNTIME_DIR=/run/user/$tnode_uid" systemctl --user "$@"
+        else
+            systemctl --user "$@"
+        fi
+    }
+
+    local unit_active
+    unit_active="$(_gw_systemctl is-active openclaw-gateway 2>/dev/null || true)"
+    [[ "$unit_active" != "active" ]] && return 0
+
+    # Locate the openclaw npm package dir; its mtime bumps on every
+    # `npm install -g openclaw@*` so it's the most reliable "binary
+    # updated" signal across all update paths.
+    local pkg_dir=""
+    local cand
+    for cand in /usr/lib/node_modules/openclaw /usr/local/lib/node_modules/openclaw; do
+        if [[ -d "$cand" ]]; then pkg_dir="$cand"; break; fi
+    done
+    [[ -z "$pkg_dir" ]] && return 0
+
+    local pkg_mtime daemon_start_ts daemon_start_epoch
+    pkg_mtime="$(stat -c %Y "$pkg_dir" 2>/dev/null)" || return 0
+    daemon_start_ts="$(_gw_systemctl show openclaw-gateway --property=ActiveEnterTimestamp --value 2>/dev/null)"
+    [[ -z "$daemon_start_ts" ]] && return 0
+    daemon_start_epoch="$(date -d "$daemon_start_ts" +%s 2>/dev/null)" || return 0
+
+    if [[ "$pkg_mtime" -le "$daemon_start_epoch" ]]; then
+        info "openclaw-gateway al día (paquete sin cambios desde último start)"
+        return 0
+    fi
+
+    local installed_ver
+    installed_ver="$(openclaw --version 2>/dev/null | awk '{print $2}')"
+    warn "openclaw-gateway corre binary obsoleto (paquete actualizado tras start del daemon)"
+    info "Reiniciando openclaw-gateway para cargar ${installed_ver:-versión instalada}..."
+    _gw_systemctl daemon-reload 2>/dev/null || true
+    _gw_systemctl restart openclaw-gateway 2>/dev/null || true
+    sleep 2
+    success "openclaw-gateway reiniciado (ahora corre ${installed_ver:-binary nuevo})"
+}
+
 # Refresh cloudflared binary by re-downloading the latest release + restart
 # the system service. Tunnel credentials/config are untouched.
 update_cloudflared_only() {
@@ -9243,6 +9302,11 @@ main() {
             install_tnode_telemetry
         fi
     fi
+    # Belt-and-suspenders: detect a gateway daemon running stale binary
+    # (e.g. `openclaw update` ran outside the installer) and reload it.
+    # In a fresh install or after --component=openclaw-gateway this is a
+    # no-op; the cost is one stat + one systemctl show per run.
+    ensure_openclaw_gateway_fresh
     phase_components_manifest
     [[ "$NO_SMOKE_TEST" == "0" && "$UPDATE_ONLY" == "1" ]] && run_smoke_test_all
     phase_summary
