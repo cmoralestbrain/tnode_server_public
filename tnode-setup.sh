@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.19.1"
+TNODE_SETUP_VERSION="1.19.2"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -2300,7 +2300,16 @@ PWCONFIG
     fi
 
     # ── OS-specific watcher ──
-    touch "$OPENCLAW_HOME/devices/pending.json"
+    # Initialize as `{}` (not just `touch` empty). The openclaw gateway
+    # parses this file on every incoming WS connect; a 0-byte file fails
+    # JSON.parse and the gateway closes EVERY client with `code=1000
+    # reason=n/a` — silent close that's very hard to diagnose. pair_watch.py
+    # tolerates an empty file (catches the parse error), but the gateway
+    # does not. Only initialize if missing/empty to preserve pending state
+    # across re-runs of the installer.
+    if [[ ! -s "$OPENCLAW_HOME/devices/pending.json" ]]; then
+        echo '{}' > "$OPENCLAW_HOME/devices/pending.json"
+    fi
 
     # Ensure all files owned by tnode
     chown -R "$TNODE_USER":"$TNODE_USER" "$OPENCLAW_HOME" 2>/dev/null || true
