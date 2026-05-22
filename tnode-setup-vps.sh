@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.19.2"
+TNODE_SETUP_VERSION="1.19.3"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -1654,6 +1654,24 @@ with open('$tunnel_json', 'w') as f:
         Linux)
             # Install as system service (runs as root, tunnel handles its own permissions)
             "$cfd_bin" service install "$TUNNEL_TOKEN" 2>/dev/null || true
+
+            # Override Restart=on-failure (default from `cloudflared service
+            # install`) → Restart=always. Cloudflare sometimes terminates
+            # connectors cleanly with exit 0 (e.g. "no more connections
+            # active and exiting" after a control-stream failure on the
+            # CF edge side), and on-failure does NOT retry exit 0.
+            # Without this override the tunnel stays dead until a human
+            # runs `systemctl start cloudflared`. Drop-in survives future
+            # `cloudflared service install` re-runs.
+            mkdir -p /etc/systemd/system/cloudflared.service.d
+            cat > /etc/systemd/system/cloudflared.service.d/restart-always.conf <<'CFDOVERRIDE'
+[Service]
+Restart=always
+RestartSec=5s
+StartLimitIntervalSec=0
+CFDOVERRIDE
+            systemctl daemon-reload 2>/dev/null || true
+
             if systemctl is-active --quiet cloudflared 2>/dev/null; then
                 success "Servicio cloudflared activo"
             else
