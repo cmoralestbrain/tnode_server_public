@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.19.3"
+TNODE_SETUP_VERSION="1.20.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -2830,7 +2830,7 @@ from __future__ import annotations
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.5.0"
+__VERSION__ = "1.6.0"
 
 import hashlib
 import hmac
@@ -3051,24 +3051,42 @@ def query_pending_commands(token: dict) -> list[dict]:
     """Run a structured query for pending commands.
 
     Returns list of {id, type, params, createdAt, status} dicts.
+
+    v1.6.0: filtra por `type IN _HANDLED_TYPES` para no agarrar commands
+    de otros daemons (tnode-chat-sync maneja cron.* y tasks.*). Antes,
+    config-sync se llevaba *cualquier* command pending y lo marcaba como
+    `error: unknown_command_type` antes que el daemon dueño lo viera —
+    rompía el flow de cualquier handler que no esté en _HANDLERS.
     """
     base = _firestore_base()
     # Parent for the collectionId `commands` nested under the node doc.
     parent = f"users/{token['uid']}/nodes/{token['nodeId']}"
     url = f"{_firestore_base()}/{parent}:runQuery"
 
-    # No orderBy: a composite index (status + createdAt) would be needed
-    # and command queues never get deep enough for ordering to matter in
-    # practice. Callers that care about order can use __name__ which has
-    # an implicit default index.
+    # No orderBy: a composite index (status + createdAt + type) would be
+    # needed and command queues never get deep enough for ordering to
+    # matter in practice. Callers that care about order can use __name__
+    # which has an implicit default index.
     body = {
         "structuredQuery": {
             "from": [{"collectionId": "commands"}],
             "where": {
-                "fieldFilter": {
-                    "field": {"fieldPath": "status"},
-                    "op": "EQUAL",
-                    "value": {"stringValue": "pending"},
+                "compositeFilter": {
+                    "op": "AND",
+                    "filters": [
+                        {"fieldFilter": {
+                            "field": {"fieldPath": "status"},
+                            "op": "EQUAL",
+                            "value": {"stringValue": "pending"},
+                        }},
+                        {"fieldFilter": {
+                            "field": {"fieldPath": "type"},
+                            "op": "IN",
+                            "value": {"arrayValue": {"values": [
+                                {"stringValue": t} for t in _HANDLED_TYPES
+                            ]}},
+                        }},
+                    ],
                 }
             },
             "limit": 10,
@@ -4231,6 +4249,13 @@ _HANDLERS = {
     "restart_gateway_for_subagents": handle_restart_gateway_for_subagents,
 }
 
+# Tipos que ESTE daemon procesa. `query_pending_commands` (v1.6.0+)
+# filtra por estos, así no se lleva commands de otros daemons (cron.*,
+# tasks.* viven en tnode-chat-sync). Sin este filtro, el handler genérico
+# marcaba como `error: unknown_command_type` antes de que el daemon
+# dueño tuviera chance de procesarlos.
+_HANDLED_TYPES = tuple(sorted(_HANDLERS.keys()))
+
 
 def handle_command(token: dict, cmd: dict) -> dict:
     cmd_type = cmd.get("type") or ""
@@ -4393,6 +4418,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
 CFGSYNCPYEOF
 }
 
@@ -4628,7 +4654,7 @@ Env/overrides:
   TNODE_CHAT_SYNC_POLL_MS   Polling interval ms (default 500)
 """
 from __future__ import annotations
-__VERSION__ = "1.12.0"
+__VERSION__ = "1.14.0"
 
 import hashlib
 import hmac
@@ -4637,6 +4663,7 @@ import mimetypes
 import os
 import re
 import secrets as py_secrets
+import sqlite3
 import subprocess
 import sys
 import time
@@ -5839,6 +5866,456 @@ def process_cron_commands(token: dict, project_id: str) -> None:
     process_crons_mirror(token, project_id)
 
 
+# ── Tasks mirror (v1.13.0+) ─────────────────────────────────────
+#
+# OpenClaw TaskFlow registra cada tarea durable (subagent run, cron
+# trigger, CLI background spawn, ACP request) en
+# `~/.openclaw/tasks/runs.sqlite` table `task_runs`. Cada N segundos
+# mirroreamos un subconjunto a Firestore
+# `users/{uid}/nodes/{nodeId}/tasks/{taskId}` para que el widget
+# "Tareas" en la app cliente las muestre sin necesidad de conexión WS
+# al gateway.
+#
+# Retención en Firestore (no podamos la SQLite local — esa la gobierna
+# OpenClaw con cleanup_after):
+#   - todas las tareas activas (`queued`, `running`)
+#   - últimas TASKS_KEEP_TERMINATED terminadas por endedAt DESC
+#   - el resto se borra del mirror (siguen vivas localmente)
+#
+# v1 es read-only — no hay commands/ para tasks (cancel + notify
+# llegan en v2). El cliente Flutter solo lee la colección.
+
+TASKS_MIRROR_INTERVAL_S = float(
+    os.environ.get("TNODE_CHAT_SYNC_TASKS_MIRROR_S", "10.0")
+)
+TASKS_KEEP_TERMINATED = int(
+    os.environ.get("TNODE_CHAT_SYNC_TASKS_KEEP", "30")
+)
+
+TASKS_DB_PATH = OPENCLAW_DIR / "tasks" / "runs.sqlite"
+
+_TASKS_TERMINAL_STATUSES = frozenset({
+    "succeeded", "failed", "timed_out", "cancelled", "lost",
+})
+
+
+def _fetch_local_tasks() -> list[dict] | None:
+    """Read `task_runs` from the gateway's local SQLite. Returns a list of
+    Firestore-shape dicts (camelCase) or None on error. Empty list when
+    the DB exists but has no rows yet."""
+    if not TASKS_DB_PATH.exists():
+        return []
+    try:
+        # Read-only URI mode + short timeout. The gateway uses WAL so
+        # readers don't block writers; mode=ro is the minimal lock.
+        uri = f"file:{TASKS_DB_PATH}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM task_runs").fetchall()
+        conn.close()
+        return [_task_row_to_firestore(r) for r in rows]
+    except sqlite3.Error as e:
+        _log(f"tasks db read error: {e}")
+        return None
+
+
+def _task_row_to_firestore(row) -> dict:
+    """Map a sqlite3.Row from `task_runs` to the camelCase shape the
+    Flutter client expects (matches `TaskRun.fromMap`)."""
+    d = dict(row)
+    return {
+        "taskId": d["task_id"],
+        "runtime": d.get("runtime") or "",
+        "taskKind": d.get("task_kind"),
+        "sourceId": d.get("source_id"),
+        "agentId": d.get("agent_id"),
+        "runId": d.get("run_id"),
+        "sessionKey": (
+            d.get("requester_session_key")
+            or d.get("child_session_key")
+        ),
+        "label": d.get("label"),
+        "task": d.get("task") or "",
+        "status": d.get("status") or "",
+        "notifyPolicy": d.get("notify_policy"),
+        "progressSummary": d.get("progress_summary"),
+        "terminalSummary": d.get("terminal_summary"),
+        "terminalOutcome": d.get("terminal_outcome"),
+        "error": d.get("error"),
+        "createdAtMs": d.get("created_at"),
+        "startedAtMs": d.get("started_at"),
+        "endedAtMs": d.get("ended_at"),
+        "lastEventAtMs": d.get("last_event_at"),
+    }
+
+
+def _select_tasks_to_mirror(tasks: list[dict]) -> list[dict]:
+    """Retention policy: all active + top N terminated by endedAt DESC."""
+    active = [
+        t for t in tasks
+        if t["status"] not in _TASKS_TERMINAL_STATUSES
+    ]
+    terminated = [
+        t for t in tasks
+        if t["status"] in _TASKS_TERMINAL_STATUSES
+    ]
+    terminated.sort(
+        key=lambda t: t.get("endedAtMs") or 0,
+        reverse=True,
+    )
+    return active + terminated[:TASKS_KEEP_TERMINATED]
+
+
+def _tasks_collection_url(token: dict, project_id: str) -> str:
+    base = _firestore_base(project_id)
+    return f"{base}/users/{token['uid']}/nodes/{token['nodeId']}/tasks"
+
+
+def _query_existing_task_ids(
+    token: dict, project_id: str,
+) -> set[str] | None:
+    """List existing tasks/{id} docs to compute deletes on mirror."""
+    url = _tasks_collection_url(token, project_id) + "?pageSize=300"
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        return {
+            doc["name"].rsplit("/", 1)[-1]
+            for doc in (data.get("documents") or [])
+        }
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return set()
+        _log(f"query tasks failed: {e.code} {e.reason}")
+        return None
+    except Exception as e:  # noqa: BLE001
+        _log(f"query tasks error: {e}")
+        return None
+
+
+def _write_task_doc(token: dict, project_id: str, task: dict) -> None:
+    task_id = task.get("taskId")
+    if not task_id:
+        return
+    base = _firestore_base(project_id)
+    url = (
+        f"{base}/users/{token['uid']}/nodes/{token['nodeId']}"
+        f"/tasks/{task_id}"
+    )
+    body = dict(task)
+    body["mirroredAt"] = {"__server_timestamp__": True}
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    try:
+        _http_patch_json(url, _fs_fields(body), headers)
+    except urllib.error.HTTPError as e:
+        _log(f"task write {task_id}: {e.code} {e.reason}")
+
+
+def _delete_task_doc(token: dict, project_id: str, task_id: str) -> None:
+    base = _firestore_base(project_id)
+    url = (
+        f"{base}/users/{token['uid']}/nodes/{token['nodeId']}"
+        f"/tasks/{task_id}"
+    )
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    try:
+        req = urllib.request.Request(url, method="DELETE", headers=headers)
+        urllib.request.urlopen(req, timeout=15).close()
+    except Exception as e:  # noqa: BLE001
+        _log(f"task delete {task_id}: {e}")
+
+
+def process_tasks_mirror(token: dict, project_id: str) -> None:
+    """Snapshot SQLite `task_runs` → Firestore `tasks/`. Idempotent."""
+    all_tasks = _fetch_local_tasks()
+    if all_tasks is None:
+        return
+    to_mirror = _select_tasks_to_mirror(all_tasks)
+    local_ids = {t["taskId"] for t in to_mirror if t.get("taskId")}
+    remote_ids = _query_existing_task_ids(token, project_id)
+    if remote_ids is None:
+        # Couldn't enumerate — only upsert, skip deletes to avoid
+        # accidental loss on a transient error.
+        for task in to_mirror:
+            _write_task_doc(token, project_id, task)
+        return
+    for task in to_mirror:
+        _write_task_doc(token, project_id, task)
+    for orphan in remote_ids - local_ids:
+        _delete_task_doc(token, project_id, orphan)
+
+
+# ── Task artifact commands (v1.14.0+) ───────────────────────────
+#
+# Cuando la app cliente abre el detail sheet de una tarea, detecta paths
+# bajo `~/.openclaw/workspace/` mencionados por el agente y los muestra
+# como entregables descargables. Tap → push `commands/{id}` con
+# `type: 'tasks.fetchArtifact'` y `params: {taskId, path}`. Acá validamos
+# el path (anti-traversal, must be under workspace, < MAX bytes, exists)
+# y reusamos prepareAssistantFile + confirmAssistantFile — mismo path que
+# los uploads del chat, así que las storage rules y GC ya cubren el doc.
+#
+# Resultado en `commands/{id}.result`:
+#   { summary, attachmentId, publicUrl, name, mime, size }
+# El cliente hace GET al publicUrl (no firebasestorage.googleapis.com —
+# bloqueado por DNS de carriers MX) y lo abre con open_filex / share.
+
+_TASK_COMMAND_TYPES = frozenset({"tasks.fetchArtifact"})
+TASK_COMMAND_POLL_INTERVAL_S = float(
+    os.environ.get("TNODE_CHAT_SYNC_TASK_CMD_S", "3.0")
+)
+TASK_ARTIFACT_MAX_BYTES = int(
+    os.environ.get("TNODE_CHAT_SYNC_ARTIFACT_MAX_BYTES", str(50 * 1024 * 1024))
+)
+WORKSPACE_DIR = (OPENCLAW_DIR / "workspace").resolve()
+
+
+def _resolve_artifact_path(raw: str) -> Path | None:
+    """Convert `~/...` or absolute path to a real Path under WORKSPACE_DIR.
+    Returns None if the path escapes the workspace or doesn't resolve."""
+    if not raw:
+        return None
+    expanded = raw
+    if expanded.startswith("~/"):
+        expanded = str(Path.home() / expanded[2:])
+    try:
+        p = Path(expanded).resolve()
+    except OSError:
+        return None
+    workspace_str = str(WORKSPACE_DIR)
+    if not (str(p) == workspace_str or str(p).startswith(workspace_str + os.sep)):
+        return None
+    return p
+
+
+def _fetch_artifact_for_task(
+    cfg: dict, task_id: str, raw_path: str,
+) -> tuple[bool, str, dict]:
+    """Validate workspace path + upload via assistant-file CF.
+    Returns (ok, summary, result_data)."""
+    if not task_id:
+        return False, "missing taskId", {}
+    p = _resolve_artifact_path(raw_path)
+    if p is None:
+        return False, "path not in workspace", {}
+    if not p.is_file():
+        return False, "file not found", {}
+    try:
+        size = p.stat().st_size
+    except OSError as e:
+        return False, f"stat failed: {e}", {}
+    if size > TASK_ARTIFACT_MAX_BYTES:
+        return (
+            False,
+            f"file too big ({size} bytes, max {TASK_ARTIFACT_MAX_BYTES})",
+            {},
+        )
+
+    try:
+        sha = _sha256_of(p)
+    except OSError as e:
+        return False, f"hash failed: {e}", {}
+    mime = _guess_mime(p)
+
+    prep = _prepare_assistant_file(cfg, p, sha, size, mime)
+    if not prep:
+        return False, "prepareAssistantFile failed", {}
+    attachment_id = prep.get("attachmentId")
+    upload_url = prep.get("uploadUrl")
+    if not attachment_id or not upload_url:
+        return False, "prepare returned no upload target", {}
+    if not _put_file_to_signed_url(upload_url, p, mime):
+        return False, "PUT to signed url failed", {}
+    if not _confirm_assistant_file(cfg, attachment_id):
+        return False, "confirmAssistantFile failed", {}
+
+    # Resolved later from Firestore once the confirm CF has written the
+    # `publicUrl` field on the assistantFiles doc. Saves us from hardcoding
+    # GCS bucket paths here.
+    return True, f"uploaded {p.name} ({size} bytes)", {
+        "attachmentId": attachment_id,
+        "name": p.name,
+        "mime": mime,
+        "size": size,
+        "taskId": task_id,
+        # publicUrl resolved at command-result time.
+    }
+
+
+def _get_assistant_file_public_url(
+    token: dict, project_id: str, attachment_id: str,
+) -> str | None:
+    """Read `users/{uid}/nodes/{nodeId}/assistantFiles/{id}.publicUrl`.
+    The confirmAssistantFile CF writes this field; we poll a few times
+    in case the CF hasn't finished by the time we read."""
+    base = _firestore_base(project_id)
+    url = (
+        f"{base}/users/{token['uid']}/nodes/{token['nodeId']}"
+        f"/assistantFiles/{attachment_id}"
+    )
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    for _ in range(5):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                doc = json.loads(resp.read())
+            fields = doc.get("fields") or {}
+            val = (fields.get("publicUrl") or {}).get("stringValue")
+            if val:
+                return val
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                pass  # doc not yet written by CF — retry
+            else:
+                _log(f"assistantFiles get {attachment_id}: {e.code}")
+                return None
+        except Exception as e:  # noqa: BLE001
+            _log(f"assistantFiles get {attachment_id} error: {e}")
+            return None
+        time.sleep(0.5)
+    return None
+
+
+def _execute_task_command(
+    cmd_type: str, params: dict, cfg: dict,
+) -> tuple[bool, str, dict]:
+    """Returns (ok, summary, extra_result_fields)."""
+    if cmd_type == "tasks.fetchArtifact":
+        return _fetch_artifact_for_task(
+            cfg,
+            (params.get("taskId") or "").strip(),
+            (params.get("path") or "").strip(),
+        )
+    return False, f"unknown task command type: {cmd_type}", {}
+
+
+def _query_pending_task_commands(token: dict, project_id: str) -> list[dict]:
+    """Same shape as `_query_pending_cron_commands` but for tasks.* types."""
+    parent = (
+        f"projects/{project_id}/databases/(default)/documents"
+        f"/users/{token['uid']}/nodes/{token['nodeId']}"
+    )
+    url = f"https://firestore.googleapis.com/v1/{parent}:runQuery"
+    body = {
+        "structuredQuery": {
+            "from": [{"collectionId": "commands"}],
+            "where": {
+                "compositeFilter": {
+                    "op": "AND",
+                    "filters": [
+                        {"fieldFilter": {
+                            "field": {"fieldPath": "status"},
+                            "op": "EQUAL",
+                            "value": {"stringValue": "pending"},
+                        }},
+                        {"fieldFilter": {
+                            "field": {"fieldPath": "type"},
+                            "op": "IN",
+                            "value": {"arrayValue": {"values": [
+                                {"stringValue": t}
+                                for t in sorted(_TASK_COMMAND_TYPES)
+                            ]}},
+                        }},
+                    ],
+                }
+            },
+            "limit": 10,
+        }
+    }
+    headers = {
+        "Authorization": f"Bearer {token['idToken']}",
+        "Content-Type": "application/json",
+    }
+    try:
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode(), headers=headers, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = json.loads(resp.read())
+    except Exception as e:  # noqa: BLE001
+        _log(f"query task commands failed: {e}")
+        return []
+    out = []
+    for row in raw:
+        if "document" not in row:
+            continue
+        doc = row["document"]
+        cmd_id = doc["name"].rsplit("/", 1)[-1]
+        fields = doc.get("fields") or {}
+        cmd_type = (fields.get("type") or {}).get("stringValue", "")
+        params_field = fields.get("params") or {}
+        params = _fs_unwrap_map(params_field)
+        out.append({"id": cmd_id, "type": cmd_type, "params": params})
+    return out
+
+
+def _update_task_command(
+    token: dict,
+    project_id: str,
+    cmd_id: str,
+    status: str,
+    summary: str,
+    extra: dict,
+) -> None:
+    """Like `_update_cron_command` but writes the full result dict (with
+    attachmentId, publicUrl, etc.), not only a summary string."""
+    base = _firestore_base(project_id)
+    url = (
+        f"{base}/users/{token['uid']}/nodes/{token['nodeId']}/commands/{cmd_id}"
+        f"?updateMask.fieldPaths=status&updateMask.fieldPaths=result"
+        f"&updateMask.fieldPaths=updatedAt"
+    )
+    result_body: dict = {"summary": (summary or "")[:500]}
+    for k, v in extra.items():
+        if k == "summary":
+            continue
+        result_body[k] = v
+    body = {
+        "status": status,
+        "result": result_body,
+        "updatedAt": {"__server_timestamp__": True},
+    }
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    try:
+        _http_patch_json(url, _fs_fields(body), headers)
+    except urllib.error.HTTPError as e:
+        _log(f"task cmd update {cmd_id}: {e.code} {e.reason}")
+
+
+def process_task_commands(
+    token: dict, project_id: str, cfg: dict,
+) -> None:
+    """Pop pending tasks.* commands and execute them."""
+    pending = _query_pending_task_commands(token, project_id)
+    if not pending:
+        return
+    for cmd in pending:
+        cmd_id = cmd["id"]
+        ok, summary, extra = _execute_task_command(
+            cmd["type"], cmd["params"], cfg,
+        )
+        # Resolve publicUrl post-confirm — confirmAssistantFile writes it
+        # to assistantFiles/{id}; we read it back so the client has
+        # everything it needs from the command result alone (no extra
+        # Firestore listener required).
+        if ok and "attachmentId" in extra and "publicUrl" not in extra:
+            public_url = _get_assistant_file_public_url(
+                token, project_id, extra["attachmentId"],
+            )
+            if public_url:
+                extra["publicUrl"] = public_url
+            else:
+                ok = False
+                summary = "publicUrl not available after confirm"
+        new_status = "done" if ok else "error"
+        _update_task_command(
+            token, project_id, cmd_id, new_status, summary, extra,
+        )
+        _log(f"task cmd {cmd_id} type={cmd['type']} → {new_status}: {summary[:80]}")
+
+
 def extract_content(raw):
     if raw is None:
         return ""
@@ -6213,6 +6690,8 @@ def main() -> int:
     # ~10s, comandos pendientes cada ~3s para responsividad de la UI.
     last_cron_mirror_check = 0.0
     last_cron_command_check = 0.0
+    last_tasks_mirror_check = 0.0
+    last_task_command_check = 0.0
 
     while True:
         try:
@@ -6355,6 +6834,34 @@ def main() -> int:
                         _log("cron mirror: idToken rejected — refreshing")
                         token = None
 
+            # Tasks mirror — periodic SQLite → Firestore snapshot of
+            # TaskFlow runs.
+            if (
+                token is not None
+                and (now_f - last_tasks_mirror_check) >= TASKS_MIRROR_INTERVAL_S
+            ):
+                last_tasks_mirror_check = now_f
+                try:
+                    process_tasks_mirror(token, project_id)
+                except urllib.error.HTTPError as e:
+                    if e.code == 401:
+                        _log("tasks mirror: idToken rejected — refreshing")
+                        token = None
+
+            # Task artifact commands — fast clock so the app sees the
+            # download ready within a few seconds after tapping.
+            if (
+                token is not None
+                and (now_f - last_task_command_check) >= TASK_COMMAND_POLL_INTERVAL_S
+            ):
+                last_task_command_check = now_f
+                try:
+                    process_task_commands(token, project_id, cfg)
+                except urllib.error.HTTPError as e:
+                    if e.code == 401:
+                        _log("task commands: idToken rejected — refreshing")
+                        token = None
+
             time.sleep(POLL_MS / 1000.0)
         except KeyboardInterrupt:
             return 0
@@ -6366,6 +6873,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
 
 CHATSYNCPYEOF
 }
