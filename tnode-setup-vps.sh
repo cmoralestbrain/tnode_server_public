@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.20.0"
+TNODE_SETUP_VERSION="1.21.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -2830,7 +2830,7 @@ from __future__ import annotations
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.6.0"
+__VERSION__ = "1.7.0"
 
 import hashlib
 import hmac
@@ -4102,6 +4102,23 @@ Reglas:
 - NO uses `MEDIA:`, `file://`, ni rutas crudas — siempre el formato `[adjunto: <ruta>]`.
 """
 
+_DOWNLOAD_FOLDER_SECTION_SOUL = """
+## Entregables descargables — workspace/download/
+
+Cuando produzcas un archivo que el usuario quiera consultar más tarde (no solo este turno del chat), guárdalo bajo:
+
+    ~/.openclaw/workspace/download/<nombre-descriptivo>.<ext>
+
+El usuario lo verá en la app → Almacenamiento → Local → tab "Descarga", ordenado por fecha de modificación. Desde ahí puede descargarlo a su dispositivo o borrarlo.
+
+Cuando lo anuncies en el chat, sigue usando el marker `[adjunto: workspace/download/<nombre>]` (ver sección "Envío de archivos al chat" para reglas del marker) — el chip clicable aparece en la conversación Y el archivo persiste en la pantalla Almacenamiento.
+
+Reglas adicionales para entregables:
+- Usa nombres descriptivos en kebab-case con fecha cuando aplique: `reporte-ventas-q1-2026.pdf`, no `out.pdf`.
+- Si reemplazas un archivo (e.g. nueva versión del mismo reporte), mantén el mismo nombre para no acumular duplicados.
+- Para archivos efímeros del turno actual (cálculos intermedios, screenshots de debug, etc.), usa `workspace/` raíz, no `workspace/download/`. La pantalla Almacenamiento solo lista `upload/` (lo que el user te mandó) y `download/` (tus entregables formales).
+"""
+
 
 def _ensure_subagents_sections() -> None:
     """Idempotently append operative sections to workspace/SOUL.md +
@@ -4117,11 +4134,21 @@ def _ensure_subagents_sections() -> None:
         app — sidecar tnode-chat-sync v1.10.0+ rewrites the marker into
         an `[archivo:{id}]` after uploading the file."""
     workspace = OPENCLAW_DIR / "workspace"
+    # Ensure download / upload folders exist — the storage widget surfaces
+    # entries from here, and the agent is expected to put deliverables in
+    # workspace/download/. Idempotent: existing dirs are left untouched.
+    try:
+        (workspace / "download").mkdir(parents=True, exist_ok=True)
+        (workspace / "upload").mkdir(parents=True, exist_ok=True)
+    except Exception as e:  # noqa: BLE001
+        _log(f"_ensure_subagents_sections: workspace dirs: {e}")
     targets = (
         ("SOUL.md", "## Sub-agentes disponibles", _SUBAGENTS_SECTION_SOUL),
         ("IDENTITY.md", "## Sub-agentes a tu disposición",
          _SUBAGENTS_SECTION_IDENTITY),
         ("SOUL.md", "## Envío de archivos al chat", _SEND_FILE_SECTION_SOUL),
+        ("SOUL.md", "## Entregables descargables — workspace/download/",
+         _DOWNLOAD_FOLDER_SECTION_SOUL),
     )
     for fname, marker, section in targets:
         p = workspace / fname
@@ -4233,6 +4260,213 @@ def handle_restart_gateway_for_subagents(token: dict, params: dict) -> dict:
     return {"status": "done", "result": {"pids": pids}}
 
 
+# ── Channels — Email (himalaya for Gmail/IMAP) ─────────────────
+#
+# `channels.email.link/unlink` write `~/.config/himalaya/config.toml` and
+# mirror the resulting status to `~/.openclaw/channels-state.json`. The
+# telemetry sidecar reads that file to emit the `channels` stream the
+# mobile app subscribes to. AgentMail (auto-provisioned inbox) is gated
+# off in this release because it needs a master API key + billing setup —
+# the handler returns `agentmail_not_implemented` until that lands.
+
+_CHANNELS_STATE_PATH = OPENCLAW_DIR / "channels-state.json"
+_HIMALAYA_CONFIG_DIR = Path.home() / ".config" / "himalaya"
+_HIMALAYA_CONFIG_PATH = _HIMALAYA_CONFIG_DIR / "config.toml"
+
+
+def _read_channels_state() -> dict:
+    try:
+        return json.loads(_CHANNELS_STATE_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _write_channels_state(state: dict) -> None:
+    try:
+        _CHANNELS_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CHANNELS_STATE_PATH.write_text(
+            json.dumps(state, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        try:
+            os.chmod(_CHANNELS_STATE_PATH, 0o600)
+        except OSError:
+            pass
+    except Exception as e:  # noqa: BLE001
+        _log(f"_write_channels_state failed: {e}")
+
+
+def _parse_host_port(s: str, default_port: int) -> tuple[str, int]:
+    s = (s or "").strip()
+    if not s:
+        return "", default_port
+    if ":" in s:
+        host, port_str = s.rsplit(":", 1)
+        try:
+            return host.strip(), int(port_str)
+        except ValueError:
+            return host.strip(), default_port
+    return s, default_port
+
+
+def _render_himalaya_toml(
+    provider: str,
+    address: str,
+    password: str,
+    imap_host: str,
+    imap_port: int,
+    smtp_host: str,
+    smtp_port: int,
+) -> str:
+    """Build a himalaya v1.2 TOML config for a single account. Both raw
+    password fields hold the App Password (Gmail rejects plain passwords
+    since 2022 — see feedback_imap_auth_failed_diagnosis)."""
+    return (
+        "# Himalaya config — managed by tnode-config-sync; do not edit by hand.\n"
+        "# Re-run channels.email.link to rotate credentials.\n"
+        "\n"
+        f"[accounts.{provider}]\n"
+        f'default = true\n'
+        f'email = "{address}"\n'
+        f'display-name = "TNode Agent"\n'
+        f'\n'
+        f'backend.type = "imap"\n'
+        f'backend.host = "{imap_host}"\n'
+        f"backend.port = {imap_port}\n"
+        f'backend.encryption.type = "tls"\n'
+        f'backend.login = "{address}"\n'
+        f'backend.auth.type = "password"\n'
+        f'backend.auth.raw = "{password}"\n'
+        f"\n"
+        f'message.send.backend.type = "smtp"\n'
+        f'message.send.backend.host = "{smtp_host}"\n'
+        f"message.send.backend.port = {smtp_port}\n"
+        f'message.send.backend.encryption.type = "tls"\n'
+        f'message.send.backend.login = "{address}"\n'
+        f'message.send.backend.auth.type = "password"\n'
+        f'message.send.backend.auth.raw = "{password}"\n'
+    )
+
+
+def _himalaya_smoke_test() -> tuple[bool, str]:
+    """Run a 1-envelope INBOX list to confirm IMAP login works. Returns
+    (ok, err_message) — `ok=False` means Gmail/IMAP rejected the
+    credentials or himalaya is missing."""
+    try:
+        result = subprocess.run(
+            ["himalaya", "envelope", "list", "-f", "INBOX", "-p", "1", "-s", "1"],
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        if result.returncode == 0:
+            return True, ""
+        # Gmail surfaces "AUTHENTICATIONFAILED" or "Invalid credentials" via
+        # stderr; surface a trimmed version to the client.
+        err = (result.stderr or result.stdout or "").strip()
+        return False, err[:400]
+    except FileNotFoundError:
+        return False, "himalaya binary not found in PATH"
+    except subprocess.TimeoutExpired:
+        return False, "smoke test timed out (45s)"
+
+
+def handle_channels_email_link(token: dict, params: dict) -> dict:
+    provider = (params.get("provider") or "").strip().lower()
+    if provider == "agentmail":
+        return {
+            "status": "error",
+            "result": {"error": "agentmail_not_implemented"},
+        }
+    if provider not in ("gmail", "imap"):
+        return {
+            "status": "error",
+            "result": {"error": f"unknown_provider: {provider}"},
+        }
+    address = (params.get("address") or "").strip()
+    app_password = (params.get("appPassword") or "").strip()
+    if not address or "@" not in address:
+        return {"status": "error", "result": {"error": "invalid_address"}}
+    if not app_password:
+        return {"status": "error", "result": {"error": "missing_appPassword"}}
+
+    imap_default = "imap.gmail.com:993" if provider == "gmail" else ""
+    smtp_default = "smtp.gmail.com:465" if provider == "gmail" else ""
+    imap_host, imap_port = _parse_host_port(
+        params.get("imapHost") or imap_default, 993
+    )
+    smtp_host, smtp_port = _parse_host_port(
+        params.get("smtpHost") or smtp_default, 465
+    )
+    if not imap_host or not smtp_host:
+        return {
+            "status": "error",
+            "result": {"error": "missing_imap_or_smtp_host"},
+        }
+
+    try:
+        _HIMALAYA_CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        toml = _render_himalaya_toml(
+            provider, address, app_password,
+            imap_host, imap_port, smtp_host, smtp_port,
+        )
+        _HIMALAYA_CONFIG_PATH.write_text(toml, encoding="utf-8")
+        try:
+            os.chmod(_HIMALAYA_CONFIG_PATH, 0o600)
+        except OSError:
+            pass
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "result": {"error": f"write_config: {e}"}}
+
+    ok, err = _himalaya_smoke_test()
+    if not ok:
+        # Roll back the half-written config so the next attempt starts
+        # from a clean state. The state file isn't touched (still unlinked).
+        try:
+            _HIMALAYA_CONFIG_PATH.unlink()
+        except FileNotFoundError:
+            pass
+        return {
+            "status": "error",
+            "result": {"error": "smoke_test_failed", "detail": err},
+        }
+
+    now_ms = int(time.time() * 1000)
+    state = _read_channels_state()
+    state["email"] = {
+        "status": "linked",
+        "provider": provider,
+        "address": address,
+        "linkedAt": now_ms,
+        "lastSyncAt": now_ms,
+    }
+    _write_channels_state(state)
+    _log(f"channels.email.link ok provider={provider} address={address}")
+    return {
+        "status": "done",
+        "result": {
+            "provider": provider,
+            "address": address,
+            "linkedAt": now_ms,
+        },
+    }
+
+
+def handle_channels_email_unlink(token: dict, params: dict) -> dict:
+    try:
+        _HIMALAYA_CONFIG_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        _log(f"channels.email.unlink: rm config: {e}")
+    state = _read_channels_state()
+    state["email"] = {"status": "unlinked"}
+    _write_channels_state(state)
+    _log("channels.email.unlink ok")
+    return {"status": "done", "result": {}}
+
+
 # ── Dispatcher ─────────────────────────────────────────────────
 
 _HANDLERS = {
@@ -4247,6 +4481,8 @@ _HANDLERS = {
     "install_subagent": handle_install_subagent,
     "uninstall_subagent": handle_uninstall_subagent,
     "restart_gateway_for_subagents": handle_restart_gateway_for_subagents,
+    "channels.email.link": handle_channels_email_link,
+    "channels.email.unlink": handle_channels_email_unlink,
 }
 
 # Tipos que ESTE daemon procesa. `query_pending_commands` (v1.6.0+)
@@ -7059,7 +7295,7 @@ from __future__ import annotations
 #          previous default. Idempotent; no-op on un-prefixed slugs.
 # 1.8.14 — _agent_model_set merges into defaults.models instead of
 #          overwriting it (preserves multi-agent distinct picks).
-__VERSION__ = "1.10.1"
+__VERSION__ = "1.11.0"
 
 import argparse
 import asyncio
@@ -7380,19 +7616,17 @@ async def fetch_or_usage(auth: Dict[str, str]) -> Optional[Dict[str, Any]]:
 # ── Telemetry event helpers ───────────────────────────────────────────
 
 USAGE_STREAM = "usage"
+CHANNELS_STREAM = "channels"
+
+# Path that `tnode-config-sync` writes when `channels.email.link/unlink` is
+# handled. Telemetry tails its mtime to emit the `channels` stream so the
+# mobile app reflects state changes within ~1s without a round-trip.
+_CHANNELS_STATE_PATH = OPENCLAW_HOME / "channels-state.json"
 USAGE_VERSION = 1
 
 HEALTH_STREAM = "health"
 HEALTH_VERSION = 3
 HEALTH_TICK_SEC = float(os.environ.get("TNODE_TELEMETRY_HEALTH_TICK_SEC", "15"))
-
-# TODO Channels v1 → CHANNELS_PROTOCOL_v1.md §2
-# CHANNELS_STREAM = "channels"
-# CHANNELS_VERSION = 1
-# WA_PAIR_PATH = os.environ.get("TNODE_WA_PAIR_PATH", str(OPENCLAW_HOME / "wa-pair" / "wa-pair.js"))
-# WA_AUTH_DIR = OPENCLAW_HOME / "credentials" / "whatsapp" / "default"
-# WA_STATE_FILE = WA_AUTH_DIR / "state.json"
-# WA_PAIR_TIMEOUT_SEC = 180
 
 SESSIONS_STORE_FILE = SESSIONS_DIR / "sessions.json"
 
@@ -7578,12 +7812,9 @@ class TelemetryProxy:
         self._auth: Optional[Dict[str, str]] = None
         self._or_cache: Optional[Dict[str, Any]] = None
         self._health_cache: Optional[Dict[str, Any]] = None
-        # TODO Channels v1 → CHANNELS_PROTOCOL_v1.md §4
-        # self._channels_state: Dict[str, Any] = _load_channels_state()
-        # self._channels_cache: Optional[Dict[str, Any]] = None
-        # self._wa_pair_proc: Optional[asyncio.subprocess.Process] = None
-        # self._wa_pair_task: Optional[asyncio.Task] = None
-        # self._wa_pair_lock = asyncio.Lock()
+        self._channels_task: Optional[asyncio.Task] = None
+        self._channels_cache: Optional[Dict[str, Any]] = None
+        self._channels_state_mtime: float = 0.0
 
     async def start_background(self) -> None:
         self._accumulator.bootstrap()
@@ -7613,22 +7844,15 @@ class TelemetryProxy:
                 "psutil not installed — `health` stream disabled. "
                 "Install with: apt install python3-psutil"
             )
-        # TODO Channels v1 → CHANNELS_PROTOCOL_v1.md §4
-        # No periodic loop — channels is event-driven (RPC-triggered).
-        # On boot we just hydrate the in-memory state from state.json
-        # so initial_snapshots() can serve a `linked` snapshot to
-        # incoming clients without waiting for any event.
-        # self._channels_cache = build_channels_event(self._channels_state, snapshot=True)
+        self._channels_task = asyncio.create_task(self._channels_loop())
 
     async def stop_background(self) -> None:
-        # TODO Channels v1 → kill self._wa_pair_proc if running, then await
-        # self._wa_pair_task. State on disk persists; the next boot will
-        # snapshot whatever was last `linked` or fall back to `unlinked`.
         for task in (
             self._tail_task,
             self._refresh_task,
             self._refresh_pending,
             self._health_task,
+            self._channels_task,
         ):
             if task is None:
                 continue
@@ -7641,6 +7865,7 @@ class TelemetryProxy:
         self._refresh_task = None
         self._refresh_pending = None
         self._health_task = None
+        self._channels_task = None
 
     async def _tail_loop(self) -> None:
         while True:
@@ -7813,13 +8038,68 @@ class TelemetryProxy:
         ))
         if self._health_cache is not None:
             snaps.append(self._health_cache)
-        # TODO Channels v1 → CHANNELS_PROTOCOL_v1.md §5
-        # Always include the channels snapshot — even when state is
-        # `unlinked` we want the client to render the empty card immediately
-        # rather than fall back to defaults.
-        # if self._channels_cache is not None:
-        #     snaps.append(self._channels_cache)
+        if self._channels_cache is None:
+            # Build a synthetic empty snapshot so the widget renders
+            # "Sin vincular" instead of a loading spinner forever even
+            # before config-sync writes channels-state.json the first time.
+            self._channels_cache = self._build_channels_event(self._read_channels_state())
+        snaps.append(self._channels_cache)
         return snaps
+
+    @staticmethod
+    def _read_channels_state() -> Dict[str, Any]:
+        try:
+            return json.loads(
+                _CHANNELS_STATE_PATH.read_text(encoding="utf-8")
+            )
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+
+    @staticmethod
+    def _build_channels_event(state: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize the channels-state.json contents into the stream event
+        the mobile client expects. Missing channels collapse to a
+        well-formed `unlinked` shape so the UI always has something to
+        bind to."""
+        whatsapp = state.get("whatsapp") if isinstance(state, dict) else None
+        email = state.get("email") if isinstance(state, dict) else None
+        if not isinstance(whatsapp, dict):
+            whatsapp = {"status": "unlinked"}
+        if not isinstance(email, dict):
+            email = {"status": "unlinked"}
+        return {
+            "type": "event",
+            "stream": CHANNELS_STREAM,
+            "v": 1,
+            "payload": {
+                "whatsapp": whatsapp,
+                "email": email,
+            },
+        }
+
+    async def _channels_loop(self) -> None:
+        """Watch `channels-state.json` for mtime changes and broadcast a
+        fresh `channels` event whenever config-sync mutates it. Cheap poll
+        (1s) — inotify would be slightly nicer but adds a deps chain just
+        for one file."""
+        while True:
+            try:
+                try:
+                    mtime = _CHANNELS_STATE_PATH.stat().st_mtime
+                except (FileNotFoundError, OSError):
+                    mtime = 0.0
+                if mtime != self._channels_state_mtime or self._channels_cache is None:
+                    self._channels_state_mtime = mtime
+                    state = self._read_channels_state()
+                    event = self._build_channels_event(state)
+                    self._channels_cache = event
+                    if self._clients:
+                        await self._broadcast(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.warning("channels loop error: %s", e)
+            await asyncio.sleep(1.0)
 
 
 # ── Mind RPC handlers ────────────────────────────────────────────────
@@ -7985,6 +8265,156 @@ def _dispatch_mind(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
             params.get("note"),
         )
     raise MindError("unknown-method", f"Unknown method {method!r}")
+
+
+# ── Storage RPC handlers ─────────────────────────────────────────────
+#
+# Intercepts `storage.list / storage.delete / storage.download` RPCs from
+# the downstream client. Backs the "Almacenamiento → Local" tabs (Carga /
+# Descarga) by listing files in `~/.openclaw/workspace/{upload,download}/`
+# directly from disk. `storage.download` (file → mobile) is deferred to
+# the next sidecar release and currently returns `not-implemented`.
+
+_STORAGE_FOLDERS = {"upload", "download"}
+_STORAGE_MAX_LIST = 500
+
+
+class StorageError(Exception):
+    """Application-level storage RPC error. The `code` lands in
+    `rpc-response.error.code` so the client can branch on it."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _resolve_workspace_root() -> Optional[Path]:
+    root = OPENCLAW_HOME / "workspace"
+    if root.is_dir():
+        return root
+    return None
+
+
+def _safe_workspace_path(folder: str, name: str) -> Path:
+    """Return workspace/<folder>/<name> if both are safe. Rejects folders
+    outside the allow-list, traversal sequences, separators, and any path
+    that escapes the workspace root after resolution."""
+    if folder not in _STORAGE_FOLDERS:
+        raise StorageError(
+            "invalid-folder",
+            f"folder must be one of {sorted(_STORAGE_FOLDERS)}",
+        )
+    if not name or "/" in name or "\\" in name or name.startswith("."):
+        raise StorageError("invalid-name", "name must be a plain basename")
+    if ".." in name:
+        raise StorageError("invalid-name", "name must not contain traversal")
+    root = _resolve_workspace_root()
+    if root is None:
+        raise StorageError(
+            "workspace-missing", "workspace dir not found on this node"
+        )
+    folder_dir = (root / folder).resolve()
+    p = (folder_dir / name).resolve()
+    try:
+        p.relative_to(folder_dir)
+    except ValueError:
+        raise StorageError("path-escape", "resolved path escapes folder")
+    return p
+
+
+def _ext_to_kind(name: str) -> str:
+    """Mirror the `FileKind` enum on the Flutter side so the row icon and
+    color are picked consistently. Anything unknown lands in `other` and
+    the UI shows a neutral icon."""
+    lower = name.lower()
+    if lower.endswith(".pdf"):
+        return "pdf"
+    for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".bmp"):
+        if lower.endswith(ext):
+            return "image"
+    for ext in (
+        ".sh", ".py", ".dart", ".js", ".ts", ".json", ".yaml", ".yml",
+        ".go", ".rs", ".rb", ".java", ".kt", ".swift", ".html", ".css",
+    ):
+        if lower.endswith(ext):
+            return "code"
+    for ext in (".csv", ".tsv", ".xlsx", ".xls"):
+        if lower.endswith(ext):
+            return "sheet"
+    for ext in (".zip", ".tar", ".gz", ".tgz", ".tar.gz", ".7z", ".bz2"):
+        if lower.endswith(ext):
+            return "archive"
+    for ext in (".txt", ".md", ".log"):
+        if lower.endswith(ext):
+            return "text"
+    return "other"
+
+
+def _storage_list(folder: str) -> Dict[str, Any]:
+    if folder not in _STORAGE_FOLDERS:
+        raise StorageError(
+            "invalid-folder",
+            f"folder must be one of {sorted(_STORAGE_FOLDERS)}",
+        )
+    root = _resolve_workspace_root()
+    if root is None:
+        return {"entries": []}
+    folder_dir = root / folder
+    if not folder_dir.is_dir():
+        return {"entries": []}
+    entries: list[Dict[str, Any]] = []
+    try:
+        with os.scandir(folder_dir) as it:
+            for de in it:
+                if not de.is_file(follow_symlinks=False):
+                    continue
+                if de.name.startswith("."):
+                    continue
+                try:
+                    st = de.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                entries.append({
+                    "name": de.name,
+                    "sizeBytes": int(st.st_size),
+                    "mtimeMs": int(st.st_mtime * 1000),
+                    "kind": _ext_to_kind(de.name),
+                })
+    except OSError as e:
+        raise StorageError("read-failed", str(e))
+    entries.sort(key=lambda e: e["mtimeMs"], reverse=True)
+    return {"entries": entries[:_STORAGE_MAX_LIST]}
+
+
+def _storage_delete(folder: str, name: str) -> Dict[str, Any]:
+    p = _safe_workspace_path(folder, name)
+    if not p.exists():
+        raise StorageError("not-found", f"{name!r} not in {folder!r}")
+    if not p.is_file():
+        raise StorageError("not-file", f"{name!r} is not a regular file")
+    try:
+        p.unlink()
+    except OSError as e:
+        raise StorageError("delete-failed", str(e))
+    logger.info("storage.delete %s/%s", folder, name)
+    return {"ok": True, "folder": folder, "name": name}
+
+
+def _dispatch_storage(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    if method == "storage.list":
+        return _storage_list(str(params.get("folder", "")).strip())
+    if method == "storage.delete":
+        return _storage_delete(
+            str(params.get("folder", "")).strip(),
+            str(params.get("name", "")).strip(),
+        )
+    if method == "storage.download":
+        raise StorageError(
+            "not-implemented",
+            "storage.download lands in the next sidecar release",
+        )
+    raise StorageError("unknown-method", f"Unknown method {method!r}")
 
 
 # ── agent.model.* RPC ─────────────────────────────────────────────────
@@ -8312,15 +8742,8 @@ class ClientSession:
                         continue
                     if await self._maybe_handle_agent_rpc(message):
                         continue
-                # TODO Channels v1 → CHANNELS_PROTOCOL_v1.md §3
-                # Only on the upstream direction (c→u) inspect for
-                # `{"type":"rpc","method":"channels.*"}`. If matched, dispatch
-                # to self._proxy.handle_channels_rpc(method, params) and
-                # send back the rpc-response/rpc-error to self._client
-                # WITHOUT forwarding the message to the gateway. Any other
-                # message (or u→c direction) keeps the current passthrough.
-                # Keep the parse cheap and tolerant — non-JSON or non-rpc
-                # frames must fall through unchanged.
+                    if await self._maybe_handle_storage_rpc(message):
+                        continue
                 await dst.send(message)
         except ConnectionClosed:
             pass
@@ -8362,6 +8785,56 @@ class ClientSession:
             }
         except Exception as e:  # noqa: BLE001
             logger.exception("mind rpc %s failed", method)
+            response = {
+                "type": "res",
+                "id": req_id,
+                "ok": False,
+                "error": {"code": "internal", "message": str(e)},
+            }
+        try:
+            await self.send_downstream(
+                json.dumps(response, separators=(",", ":"))
+            )
+        except ConnectionClosed:
+            pass
+        return True
+
+    async def _maybe_handle_storage_rpc(self, message: Any) -> bool:
+        """If `message` is a `storage.*` RPC, answer it locally and return
+        True so the caller skips the upstream forward."""
+        if not isinstance(message, str):
+            return False
+        try:
+            frame = json.loads(message)
+        except (ValueError, TypeError):
+            return False
+        if not isinstance(frame, dict):
+            return False
+        if frame.get("type") != "req":
+            return False
+        method = frame.get("method")
+        if not isinstance(method, str) or not method.startswith("storage."):
+            return False
+        req_id = frame.get("id", "")
+        raw_params = frame.get("params") or {}
+        params = raw_params if isinstance(raw_params, dict) else {}
+        try:
+            payload = _dispatch_storage(method, params)
+            response = {
+                "type": "res",
+                "id": req_id,
+                "ok": True,
+                "payload": payload,
+            }
+        except StorageError as e:
+            response = {
+                "type": "res",
+                "id": req_id,
+                "ok": False,
+                "error": {"code": e.code, "message": e.message},
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.exception("storage rpc %s failed", method)
             response = {
                 "type": "res",
                 "id": req_id,
