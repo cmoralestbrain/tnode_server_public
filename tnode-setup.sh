@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.21.0"
+TNODE_SETUP_VERSION="1.23.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -2806,11 +2806,19 @@ from __future__ import annotations
 #         the runtime catalog and allowlist via the new helper
 #         _ensure_model_registered, fixing the "model not allowed" failure
 #         on delegate after a fresh sub-agent install.
+# 1.8.0 — channels.email.link: provider=resend branch. Validates the
+#         API key against api.resend.com/domains, persists it to
+#         ~/.openclaw/credentials/resend.json (mode 0600), and appends
+#         a `## Envío de correos — vía skill email-send` section to
+#         workspace/SOUL.md so the on-node agent knows to route mail
+#         through the HTTPS skill instead of smtplib (DigitalOcean
+#         blocks outbound 465/587). channels.email.unlink now cleans
+#         up resend.json alongside the himalaya config.
 # 1.2.0 — sub-agents: install_subagent / uninstall_subagent /
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.7.0"
+__VERSION__ = "1.8.0"
 
 import hashlib
 import hmac
@@ -4100,6 +4108,328 @@ Reglas adicionales para entregables:
 """
 
 
+_EMAIL_SEND_SECTION_SOUL = """
+
+## Envío de correos — vía skill email-send
+
+Para mandar correos electrónicos en este nodo usa el script:
+
+```bash
+~/.openclaw/workspace/skills/email-send/bin/send.py \\
+  --to destinatario@ejemplo.com \\
+  --subject "Asunto" \\
+  --body "Cuerpo en texto plano"
+```
+
+Este es el ÚNICO path de envío que funciona aquí. **NO uses** `smtplib`, `himalaya message send`, `mail`, `sendmail`, ni `curl smtp://...` — todos timeout porque el proveedor cloud bloquea SMTP outbound (puertos 465 y 587).
+
+Para detalles completos (HTML, CC, --from, manejo de errores) consulta `~/.openclaw/workspace/skills/email-send/SKILL.md`.
+"""
+
+
+# `_EMAIL_SEND_SKILL_MD` y `_EMAIL_SEND_SEND_PY` son el contenido canónico
+# del skill cuando se materializa via `channels.email.link(provider=resend)`.
+# DEBEN coincidir byte-a-byte con los heredocs en `setup_workspace_skills()`
+# del bash installer — cuando edites uno actualiza el otro.
+_EMAIL_SEND_SKILL_MD = '''# email-send
+
+Envía correos electrónicos vía **Resend** (HTTPS, port 443) — el único path
+de envío que funciona en este nodo porque DigitalOcean bloquea SMTP
+outbound (ports 465 y 587) como política anti-spam.
+
+## Cuándo usarlo
+
+Cuando el usuario te pida enviar un correo a alguien. Esta es la **única**
+herramienta de envío en este nodo.
+
+**NO uses** ninguna de estas — todas se cuelgan con `Network is unreachable`
+o timeout porque dependen de SMTP outbound:
+
+- `python -c "import smtplib..."`
+- `himalaya message send`
+- `mail`, `sendmail`, `mutt`
+- `curl smtp://...`
+- `nc smtp.gmail.com 465/587`
+
+## Cómo invocar
+
+```bash
+~/.openclaw/workspace/skills/email-send/bin/send.py \\
+  --to destinatario@ejemplo.com \\
+  --subject "Asunto del correo" \\
+  --body "Cuerpo del correo en texto plano."
+```
+
+Argumentos comunes:
+
+- `--to <addr>` — destinatario único (obligatorio).
+- `--subject <str>` — asunto (obligatorio).
+- `--body <texto>` — cuerpo plain text. Si lo omites, lee de stdin
+  (útil para pipes con cuerpos largos: `echo "$body" | send.py --to ... --subject ...`).
+- `--html "<p>...</p>"` — cuerpo HTML opcional. Si lo pasas junto con
+  `--body`, el cliente del usuario rendea el HTML y usa el text como
+  fallback.
+- `--cc <addr>` — repetible, para varios CC.
+- `--reply-to <addr>` — header Reply-To opcional.
+- `--from "<Nombre> <addr>"` — sobrescribe el sender. Por default es
+  `TNode Agent <onboarding@resend.dev>` (sandbox de Resend, funciona sin
+  DNS). Para mandar desde un dominio propio (e.g. `agent@tbrain.app`)
+  hay que verificarlo en el dashboard de Resend primero.
+
+## Ejemplo de turno completo
+
+Pregunta del usuario: *"mándame un correo de bienvenida a ctobal@gmail.com"*
+
+Tu acción (UNA invocación, no múltiples intentos):
+
+```bash
+~/.openclaw/workspace/skills/email-send/bin/send.py \\
+  --to ctobal@gmail.com \\
+  --subject "Bienvenido a TNode Pro" \\
+  --body "Hola Tobal,
+
+Bienvenido a tu nodo TNode Pro. Estoy listo para ayudarte con lo que necesites — desde redactar correos hasta automatizar tareas en tus canales conectados.
+
+Saludos,
+TNode Agent"
+```
+
+## Salida del comando
+
+- **Éxito** (exit code 0): JSON a stdout
+  ```json
+  {"ok": true, "messageId": "<resend-uuid>", "to": "destinatario@...", "from": "..."}
+  ```
+  Cuando veas `ok: true` confirma al usuario que el correo se envió.
+
+- **Fallo** (exit code 1 ó 2): mensaje de error a stderr. Códigos típicos:
+  - `resend HTTP 401`: API key inválida — avisa al usuario y pídele que
+    rote la key en `~/.openclaw/credentials/resend.json`.
+  - `resend HTTP 403`: cuenta suspendida o límite mensual alcanzado.
+  - `resend HTTP 422`: payload inválido (e.g. domain no verificado en el
+    `from`, o `to` con formato incorrecto).
+  - `resend network error`: improbable porque HTTPS está abierto, pero
+    si pasa reporta el `reason` exacto.
+
+## Lectura del inbox (informativo, NO usa este skill)
+
+Para LEER correos del inbox del usuario (`tbrainplatform@gmail.com`) sí
+puedes usar `himalaya` directamente — IMAP port 993 está abierto:
+
+```bash
+himalaya envelope list -f INBOX -p 1 -s 10
+himalaya message read <id>
+```
+
+El `from` de los correos enviados por este skill NO es Gmail (es el
+sandbox de Resend `onboarding@resend.dev`). El destinatario los ve en
+inbox normal pero marca como "via resend.dev". Para envíos desde el
+propio dominio del usuario hay que pasar por verificación DNS en
+Resend.
+
+## Límites del plan free de Resend
+
+- 3,000 correos por mes.
+- 100 correos por día.
+- 1 dominio verificado.
+
+Si llegas al límite y el usuario insiste, sugiérele upgradear el plan
+en https://resend.com/pricing o usar un canal alternativo.
+'''
+
+_EMAIL_SEND_SEND_PY = '''#!/usr/bin/env python3
+"""Send an email via Resend (https://resend.com) HTTPS API. Used by the
+on-node OpenClaw agent when the host has SMTP outbound blocked (e.g.
+DigitalOcean droplets, where ports 465/587 are firewalled by default).
+
+Reads the API key from `~/.openclaw/credentials/resend.json`:
+
+    {"api_key": "re_..."}
+
+Exit codes:
+    0  success — stdout JSON `{"ok":true,"messageId":"...","to":"..."}`
+    1  transport / API error — stderr explains
+    2  configuration error (missing creds, bad args)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+CRED_PATH = Path.home() / ".openclaw" / "credentials" / "resend.json"
+API_URL = "https://api.resend.com/emails"
+# `onboarding@resend.dev` is Resend's sandbox sender — works without DNS
+# verification but lands tagged. To send from a custom domain (e.g.
+# `agent@tbrain.app`) verify the domain in Resend's dashboard, then point
+# this default at the verified sender or pass --from at the call site.
+DEFAULT_FROM = "TNode Agent <onboarding@resend.dev>"
+
+
+def _load_api_key() -> str:
+    try:
+        cred = json.loads(CRED_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        sys.stderr.write(
+            f"credentials missing: {CRED_PATH}. Run `channels.email.link` or "
+            "ask the user to provision a Resend API key.\\n"
+        )
+        sys.exit(2)
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"cannot read {CRED_PATH}: {e}\\n")
+        sys.exit(2)
+    key = (cred.get("api_key") or "").strip()
+    if not key:
+        sys.stderr.write(f"api_key empty in {CRED_PATH}\\n")
+        sys.exit(2)
+    return key
+
+
+def _post(api_key: str, payload: dict) -> dict:
+    req = urllib.request.Request(
+        API_URL,
+        method="POST",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "tnode-agent/email-send-skill (urllib)",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
+        sys.stderr.write(f"resend HTTP {e.code}: {body}\\n")
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        sys.stderr.write(f"resend network error: {e.reason}\\n")
+        sys.exit(1)
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"resend error: {e}\\n")
+        sys.exit(1)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        prog="email-send",
+        description=(
+            "Send an email via Resend HTTPS. The only way to send mail from "
+            "this node — SMTP outbound is blocked by the cloud provider."
+        ),
+    )
+    ap.add_argument("--to", required=True,
+                    help="Recipient email (single address).")
+    ap.add_argument("--subject", required=True, help="Email subject.")
+    ap.add_argument(
+        "--body",
+        help=(
+            "Plain-text body. If omitted, the script reads the body from "
+            "stdin (lets you pipe long messages without quoting headaches)."
+        ),
+    )
+    ap.add_argument(
+        "--html",
+        help=(
+            "Optional HTML body. Sent alongside the plain text — most "
+            "clients render the HTML and use plain text as fallback."
+        ),
+    )
+    ap.add_argument(
+        "--from",
+        dest="from_addr",
+        default=os.environ.get("EMAIL_SEND_FROM", DEFAULT_FROM),
+        help=(
+            "Sender header. Defaults to `TNode Agent <onboarding@resend.dev>` "
+            "(Resend's sandbox sender, works without DNS). Override with the "
+            "EMAIL_SEND_FROM env var or this flag once a custom domain is "
+            "verified in Resend."
+        ),
+    )
+    ap.add_argument(
+        "--cc",
+        action="append",
+        default=[],
+        help="CC address (repeatable).",
+    )
+    ap.add_argument(
+        "--reply-to",
+        dest="reply_to",
+        help="Reply-To header (optional).",
+    )
+    args = ap.parse_args()
+
+    body = args.body
+    if body is None:
+        body = sys.stdin.read()
+    body = (body or "").strip()
+    if not body and not args.html:
+        sys.stderr.write("body is empty (pass --body or pipe via stdin)\\n")
+        sys.exit(2)
+
+    payload: dict = {
+        "from": args.from_addr,
+        "to": [args.to],
+        "subject": args.subject,
+    }
+    if body:
+        payload["text"] = body
+    if args.html:
+        payload["html"] = args.html
+    if args.cc:
+        payload["cc"] = args.cc
+    if args.reply_to:
+        payload["reply_to"] = args.reply_to
+
+    api_key = _load_api_key()
+    result = _post(api_key, payload)
+    out = {
+        "ok": True,
+        "messageId": result.get("id", ""),
+        "to": args.to,
+        "from": args.from_addr,
+    }
+    print(json.dumps(out))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _ensure_email_send_skill() -> None:
+    """Materialize the email-send skill files under workspace/skills/. Run
+    by `_handle_email_link_resend` so the skill appears the moment the
+    user pastes their Resend API key — no separate installer step needed.
+    Idempotent and self-healing: if the user manually deletes or edits a
+    file, re-running `channels.email.link` restores the canonical copy."""
+    skill_dir = OPENCLAW_DIR / "workspace" / "skills" / "email-send"
+    bin_dir = skill_dir / "bin"
+    try:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            _EMAIL_SEND_SKILL_MD, encoding="utf-8"
+        )
+        send_py = bin_dir / "send.py"
+        send_py.write_text(_EMAIL_SEND_SEND_PY, encoding="utf-8")
+        try:
+            os.chmod(send_py, 0o755)
+        except OSError:
+            pass
+    except Exception as e:  # noqa: BLE001
+        _log(f"_ensure_email_send_skill: {e}")
+
+
 def _ensure_subagents_sections() -> None:
     """Idempotently append operative sections to workspace/SOUL.md +
     workspace/IDENTITY.md. Each section carries its own header marker
@@ -4112,7 +4442,12 @@ def _ensure_subagents_sections() -> None:
       - `## Envío de archivos al chat` (SOUL): `[adjunto: <path>]` marker
         protocol so the agent knows how to surface files to the mobile
         app — sidecar tnode-chat-sync v1.10.0+ rewrites the marker into
-        an `[archivo:{id}]` after uploading the file."""
+        an `[archivo:{id}]` after uploading the file.
+      - `## Envío de correos — vía skill email-send` (SOUL): only appears
+        on nodes where Resend has been linked via `channels.email.link`
+        — appended by `_handle_email_link_resend` (NOT by the targets
+        tuple below) because it would mislead Mac/Pi agents that have
+        outbound SMTP available."""
     workspace = OPENCLAW_DIR / "workspace"
     # Ensure download / upload folders exist — the storage widget surfaces
     # entries from here, and the agent is expected to put deliverables in
@@ -4240,18 +4575,29 @@ def handle_restart_gateway_for_subagents(token: dict, params: dict) -> dict:
     return {"status": "done", "result": {"pids": pids}}
 
 
-# ── Channels — Email (himalaya for Gmail/IMAP) ─────────────────
+# ── Channels — Email (Resend HTTPS / himalaya for Gmail/IMAP) ──
 #
-# `channels.email.link/unlink` write `~/.config/himalaya/config.toml` and
-# mirror the resulting status to `~/.openclaw/channels-state.json`. The
-# telemetry sidecar reads that file to emit the `channels` stream the
-# mobile app subscribes to. AgentMail (auto-provisioned inbox) is gated
-# off in this release because it needs a master API key + billing setup —
-# the handler returns `agentmail_not_implemented` until that lands.
+# `channels.email.link/unlink` mirror status to
+# `~/.openclaw/channels-state.json`. The telemetry sidecar reads that file
+# to emit the `channels` stream the mobile app subscribes to.
+#
+# Three providers, two backends:
+#   - resend: HTTPS send via the email-send skill (only path that works on
+#     DigitalOcean droplets, where outbound SMTP 465/587 is firewalled).
+#     The handler validates the API key against api.resend.com, persists
+#     it to ~/.openclaw/credentials/resend.json (0600), and appends a
+#     SOUL section so the on-node agent picks the skill over smtplib.
+#   - gmail / imap: classic IMAP+SMTP via himalaya. Works on Mac mini /
+#     Pi where outbound SMTP is open. The handler writes a himalaya TOML
+#     and runs a 1-envelope smoke test to confirm credentials.
+#   - agentmail: gated off — needs a master API key + billing setup; the
+#     handler returns `agentmail_not_implemented` until that lands.
 
 _CHANNELS_STATE_PATH = OPENCLAW_DIR / "channels-state.json"
 _HIMALAYA_CONFIG_DIR = Path.home() / ".config" / "himalaya"
 _HIMALAYA_CONFIG_PATH = _HIMALAYA_CONFIG_DIR / "config.toml"
+_RESEND_CRED_PATH = OPENCLAW_DIR / "credentials" / "resend.json"
+_RESEND_DOMAINS_URL = "https://api.resend.com/domains"
 
 
 def _read_channels_state() -> dict:
@@ -4352,8 +4698,130 @@ def _himalaya_smoke_test() -> tuple[bool, str]:
         return False, "smoke test timed out (45s)"
 
 
+def _resend_smoke_test(api_key: str) -> tuple[bool, str]:
+    """Validate a Resend API key with a single read-only call to
+    `GET /domains`. Returns `(ok, err_msg)`. 200 = valid key; 401 = bad
+    key; other = surface the HTTP code."""
+    req = urllib.request.Request(
+        _RESEND_DOMAINS_URL,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "tnode-config-sync/resend-smoke",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            r.read()
+            return True, ""
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return False, "invalid_api_key"
+        if e.code == 403:
+            return False, "forbidden (account suspended?)"
+        return False, f"resend HTTP {e.code}"
+    except urllib.error.URLError as e:
+        return False, f"network: {e.reason}"
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)[:200]
+
+
+def _handle_email_link_resend(params: dict) -> dict:
+    """Resend HTTPS path. The user pastes a `re_...` API key from
+    https://resend.com/api-keys; we validate it against the Resend API,
+    persist it to disk (0600), materialize the email-send skill files,
+    and append a SOUL section telling the agent to use the skill."""
+    api_key = (params.get("apiKey") or "").strip()
+    if not api_key:
+        return {"status": "error", "result": {"error": "missing_apiKey"}}
+    if not api_key.startswith("re_"):
+        return {
+            "status": "error",
+            "result": {
+                "error": "invalid_apiKey_format",
+                "detail": "Resend API keys start with 're_'",
+            },
+        }
+    # Optional override; defaults to Resend's sandbox sender (works without
+    # DNS verification). The mobile UI exposes this once the user has
+    # verified a custom domain in the Resend dashboard.
+    from_addr = (
+        params.get("fromAddress") or "onboarding@resend.dev"
+    ).strip() or "onboarding@resend.dev"
+
+    ok, err = _resend_smoke_test(api_key)
+    if not ok:
+        return {
+            "status": "error",
+            "result": {"error": "resend_smoke_failed", "detail": err},
+        }
+
+    try:
+        _RESEND_CRED_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _RESEND_CRED_PATH.write_text(
+            json.dumps(
+                {"api_key": api_key, "from": from_addr},
+                indent=2, sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        try:
+            os.chmod(_RESEND_CRED_PATH, 0o600)
+        except OSError:
+            pass
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "result": {"error": f"write_creds: {e}"}}
+
+    # Materialize the skill files + append SOUL section so the on-node
+    # agent picks the HTTPS path over smtplib on the next bootstrap.
+    _ensure_email_send_skill()
+    _append_email_send_soul_section()
+
+    now_ms = int(time.time() * 1000)
+    state = _read_channels_state()
+    state["email"] = {
+        "status": "linked",
+        "provider": "resend",
+        "address": from_addr,
+        "domainVerified": from_addr != "onboarding@resend.dev",
+        "linkedAt": now_ms,
+        "lastSyncAt": now_ms,
+    }
+    _write_channels_state(state)
+    _log(f"channels.email.link ok provider=resend from={from_addr}")
+    return {
+        "status": "done",
+        "result": {
+            "provider": "resend",
+            "address": from_addr,
+            "linkedAt": now_ms,
+        },
+    }
+
+
+def _append_email_send_soul_section() -> None:
+    """One-shot append of the email-send SOUL section. Kept separate from
+    `_ensure_subagents_sections` so Mac/Pi nodes (where outbound SMTP
+    works) don't get the misleading 'DO blocks SMTP' guidance."""
+    soul = OPENCLAW_DIR / "workspace" / "SOUL.md"
+    if not soul.is_file():
+        return
+    try:
+        text = soul.read_text(encoding="utf-8")
+        marker = "## Envío de correos — vía skill email-send"
+        if marker in text:
+            return
+        soul.write_text(
+            text.rstrip() + _EMAIL_SEND_SECTION_SOUL, encoding="utf-8"
+        )
+    except Exception as e:  # noqa: BLE001
+        _log(f"_append_email_send_soul_section: {e}")
+
+
 def handle_channels_email_link(token: dict, params: dict) -> dict:
     provider = (params.get("provider") or "").strip().lower()
+    if provider == "resend":
+        return _handle_email_link_resend(params)
     if provider == "agentmail":
         return {
             "status": "error",
@@ -4434,12 +4902,20 @@ def handle_channels_email_link(token: dict, params: dict) -> dict:
 
 
 def handle_channels_email_unlink(token: dict, params: dict) -> dict:
-    try:
-        _HIMALAYA_CONFIG_PATH.unlink()
-    except FileNotFoundError:
-        pass
-    except Exception as e:  # noqa: BLE001
-        _log(f"channels.email.unlink: rm config: {e}")
+    # Best-effort cleanup of both backends. We don't track which one is
+    # active because a node could in theory have both linked over time
+    # (Resend on the cloud half, IMAP on a local nested daemon) — clearing
+    # both keeps the unlink semantics simple and idempotent.
+    for path, label in (
+        (_HIMALAYA_CONFIG_PATH, "himalaya"),
+        (_RESEND_CRED_PATH, "resend"),
+    ):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            _log(f"channels.email.unlink: rm {label}: {e}")
     state = _read_channels_state()
     state["email"] = {"status": "unlinked"}
     _write_channels_state(state)
@@ -7316,6 +7792,12 @@ Iteration 1: one stream → `usage`.
 Runs as its own systemd unit (tnode-telemetry.service).
 """
 from __future__ import annotations
+# 1.12.0 — storage.download RPC implemented. Reads file from
+#          workspace/download/, negotiates a signed PUT URL via
+#          prepareAssistantFile (same HMAC path as the chat-sync
+#          assistant_file pipeline), uploads, flips the assistantFiles
+#          doc to `uploaded`, and returns {attachmentId, publicUrl} so
+#          the mobile client can fetch + open with the OS handler.
 # 1.8.15 — _agent_model_set now upserts the slug under
 #          providers[p].models[] (in addition to the existing
 #          defaults.models merge from 1.8.14). Without the catalog
@@ -7325,7 +7807,7 @@ from __future__ import annotations
 #          previous default. Idempotent; no-op on un-prefixed slugs.
 # 1.8.14 — _agent_model_set merges into defaults.models instead of
 #          overwriting it (preserves multi-agent distinct picks).
-__VERSION__ = "1.11.0"
+__VERSION__ = "1.12.0"
 
 import argparse
 import asyncio
@@ -7333,6 +7815,7 @@ import hashlib
 import hmac
 import json
 import logging
+import mimetypes
 import os
 import secrets as py_secrets
 import signal
@@ -8300,13 +8783,28 @@ def _dispatch_mind(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
 # ── Storage RPC handlers ─────────────────────────────────────────────
 #
 # Intercepts `storage.list / storage.delete / storage.download` RPCs from
-# the downstream client. Backs the "Almacenamiento → Local" tabs (Carga /
+# the downstream client. Backs the "Archivos → Local" tabs (Carga /
 # Descarga) by listing files in `~/.openclaw/workspace/{upload,download}/`
-# directly from disk. `storage.download` (file → mobile) is deferred to
-# the next sidecar release and currently returns `not-implemented`.
+# directly from disk. `storage.download` (v1.12.0+) reuses the same
+# `prepareAssistantFile` HMAC bridge that `tnode-chat-sync` already uses
+# for `[adjunto:]` markers — file → signed PUT → Cloud Storage → signed
+# READ URL → mobile client downloads via OS file handler.
 
 _STORAGE_FOLDERS = {"upload", "download"}
 _STORAGE_MAX_LIST = 500
+# Same 50MB ceiling enforced by the `prepareAssistantFile` CF — checked
+# up-front so the user sees a clear error instead of a generic HTTP 400.
+_STORAGE_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024
+# CF endpoints (same constants as chat-sync; redefined here to avoid a
+# cross-daemon import).
+_PREPARE_ASSISTANT_FILE_URL = (
+    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/prepareAssistantFile"
+)
+_CONFIRM_ASSISTANT_FILE_URL = (
+    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/confirmAssistantFile"
+)
+_STORAGE_DOWNLOAD_TIMEOUT_SEC = 30
+_STORAGE_DOWNLOAD_PUT_TIMEOUT_SEC = 120
 
 
 class StorageError(Exception):
@@ -8431,6 +8929,198 @@ def _storage_delete(folder: str, name: str) -> Dict[str, Any]:
     return {"ok": True, "folder": folder, "name": name}
 
 
+def _sha256_of_file(path: Path) -> str:
+    """Streaming SHA-256 so a 50MB file doesn't spike memory."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(64 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _guess_mime_for_storage(path: Path) -> str:
+    mt, _ = mimetypes.guess_type(str(path))
+    return mt or "application/octet-stream"
+
+
+def _storage_prepare_assistant_file(
+    auth: Dict[str, Any], path: Path, sha: str, size: int, mime: str
+) -> Dict[str, Any]:
+    """POST /prepareAssistantFile. HMAC scheme is the same one chat-sync
+    uses for `[adjunto:]` markers — `assistant_file:<sha>` in the signing
+    string binds the signature to this specific file."""
+    node_id = auth["nodeId"]
+    node_secret = auth["nodeSecret"]
+    ts = str(int(time.time() * 1000))
+    nonce = py_secrets.token_hex(16)
+    signing = f"{node_id}:{ts}:{nonce}:assistant_file:{sha}"
+    sig = hmac.new(
+        node_secret.encode(), signing.encode(), hashlib.sha256
+    ).hexdigest()
+    body = json.dumps({
+        "nodeId": node_id,
+        "timestamp": ts,
+        "nonce": nonce,
+        "signature": sig,
+        "fileName": path.name,
+        "mimeType": mime,
+        "sizeBytes": size,
+        "sha256": sha,
+    }).encode()
+    req = urllib.request.Request(
+        _PREPARE_ASSISTANT_FILE_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(
+            req, timeout=_STORAGE_DOWNLOAD_TIMEOUT_SEC
+        ) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode()
+        except Exception:  # noqa: BLE001
+            detail = e.reason
+        raise StorageError(
+            "prepare-failed",
+            f"prepareAssistantFile HTTP {e.code}: {detail}",
+        )
+    except Exception as e:  # noqa: BLE001
+        raise StorageError("prepare-failed", f"prepareAssistantFile: {e}")
+
+
+def _storage_put_to_signed_url(url: str, path: Path, mime: str) -> None:
+    """Single PUT — server-side cap is 50MB so we don't bother chunking."""
+    try:
+        with path.open("rb") as f:
+            data = f.read()
+        req = urllib.request.Request(
+            url, data=data, method="PUT",
+            headers={"Content-Type": mime},
+        )
+        with urllib.request.urlopen(
+            req, timeout=_STORAGE_DOWNLOAD_PUT_TIMEOUT_SEC
+        ) as resp:
+            if not (200 <= resp.status < 300):
+                raise StorageError(
+                    "put-failed", f"signed PUT HTTP {resp.status}"
+                )
+    except urllib.error.HTTPError as e:
+        raise StorageError(
+            "put-failed", f"signed PUT HTTP {e.code}: {e.reason}"
+        )
+    except StorageError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise StorageError("put-failed", f"signed PUT: {e}")
+
+
+def _storage_confirm_assistant_file(
+    auth: Dict[str, Any], attachment_id: str
+) -> None:
+    """POST /confirmAssistantFile. Flips the doc to `status='uploaded'`
+    so the assistantFileProvider on the client emits ready state."""
+    node_id = auth["nodeId"]
+    node_secret = auth["nodeSecret"]
+    ts = str(int(time.time() * 1000))
+    nonce = py_secrets.token_hex(16)
+    signing = f"{node_id}:{ts}:{nonce}:confirm:{attachment_id}"
+    sig = hmac.new(
+        node_secret.encode(), signing.encode(), hashlib.sha256
+    ).hexdigest()
+    body = json.dumps({
+        "nodeId": node_id,
+        "timestamp": ts,
+        "nonce": nonce,
+        "signature": sig,
+        "attachmentId": attachment_id,
+    }).encode()
+    req = urllib.request.Request(
+        _CONFIRM_ASSISTANT_FILE_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(
+            req, timeout=_STORAGE_DOWNLOAD_TIMEOUT_SEC
+        ) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode()
+        except Exception:  # noqa: BLE001
+            detail = e.reason
+        raise StorageError(
+            "confirm-failed",
+            f"confirmAssistantFile HTTP {e.code}: {detail}",
+        )
+    except Exception as e:  # noqa: BLE001
+        raise StorageError("confirm-failed", f"confirmAssistantFile: {e}")
+
+
+def _storage_download(folder: str, name: str) -> Dict[str, Any]:
+    """Resolve workspace/<folder>/<name>, push to Cloud Storage via the
+    existing assistant_file HMAC pipeline, return {attachmentId, publicUrl,
+    fileName, mimeType, sizeBytes} so the Flutter client can fetch + open.
+
+    The mobile UI surfaces these files in the "Descarga" tab; pressing the
+    kebab → "Descargar" calls this RPC, awaits the response, and hands the
+    publicUrl to OpenFilex the same way `AssistantFileChip` does for files
+    the agent attached via `[adjunto:]` markers in chat."""
+    p = _safe_workspace_path(folder, name)
+    if not p.exists():
+        raise StorageError("not-found", f"{name!r} not in {folder!r}")
+    if not p.is_file():
+        raise StorageError("not-file", f"{name!r} is not a regular file")
+    try:
+        size = p.stat().st_size
+    except OSError as e:
+        raise StorageError("stat-failed", str(e))
+    if size <= 0:
+        raise StorageError("empty-file", f"{name!r} is empty")
+    if size > _STORAGE_DOWNLOAD_MAX_BYTES:
+        raise StorageError(
+            "too-large",
+            f"{name!r} exceeds {_STORAGE_DOWNLOAD_MAX_BYTES} bytes",
+        )
+    auth = _load_node_auth()
+    if auth is None:
+        raise StorageError(
+            "auth-unavailable",
+            "tnode-chat-sync.json missing nodeId/nodeSecret",
+        )
+    try:
+        sha = _sha256_of_file(p)
+    except OSError as e:
+        raise StorageError("read-failed", str(e))
+    mime = _guess_mime_for_storage(p)
+    prep = _storage_prepare_assistant_file(auth, p, sha, size, mime)
+    attachment_id = prep.get("attachmentId")
+    upload_url = prep.get("uploadUrl")
+    public_url = prep.get("publicUrl")
+    if not attachment_id or not upload_url or not public_url:
+        raise StorageError(
+            "prepare-incomplete",
+            f"prepareAssistantFile response missing fields: {prep}",
+        )
+    _storage_put_to_signed_url(upload_url, p, mime)
+    _storage_confirm_assistant_file(auth, attachment_id)
+    logger.info(
+        "storage.download %s/%s → attachmentId=%s", folder, name, attachment_id
+    )
+    return {
+        "attachmentId": attachment_id,
+        "publicUrl": public_url,
+        "fileName": name,
+        "sanitizedFileName": prep.get("sanitizedFileName") or name,
+        "mimeType": mime,
+        "sizeBytes": size,
+    }
+
+
 def _dispatch_storage(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
     if method == "storage.list":
         return _storage_list(str(params.get("folder", "")).strip())
@@ -8440,9 +9130,9 @@ def _dispatch_storage(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
             str(params.get("name", "")).strip(),
         )
     if method == "storage.download":
-        raise StorageError(
-            "not-implemented",
-            "storage.download lands in the next sidecar release",
+        return _storage_download(
+            str(params.get("folder", "")).strip(),
+            str(params.get("name", "")).strip(),
         )
     raise StorageError("unknown-method", f"Unknown method {method!r}")
 
