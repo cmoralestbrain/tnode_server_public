@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.24.0"
+TNODE_SETUP_VERSION="1.24.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -10447,6 +10447,60 @@ update_openclaw_gateway_only() {
     success "openclaw-gateway refreshed"
 }
 
+# Recover an openclaw-gateway daemon that exited 78/CONFIG at boot because
+# `openclaw.json` was missing — typical in droplets booted from the bake
+# snapshot (cleanup-pre-snapshot.sh wipes openclaw.json before the snap so
+# each droplet gets a fresh identity). Sequence in the wild:
+#   1. droplet boots; tnode user lingers → systemd --user starts
+#      openclaw-gateway.service automatically.
+#   2. gateway can't find openclaw.json → exits 78/CONFIG.
+#   3. systemd marks the unit failed.
+#   4. phase_tunnel runs later, writes openclaw.json with the right token.
+#   5. But nothing restarts the failed daemon → tunnel CF accepts WS
+#      handshake but upstream is dead → clients see "no se puede conectar".
+# This function detects (failed daemon + openclaw.json present + token
+# present), resets the failure and starts the daemon. Linux-only, idempotent.
+recover_failed_openclaw_gateway() {
+    [[ "$OS" == "Darwin" ]] && return 0
+    command_exists systemctl || return 0
+    local tnode_uid
+    tnode_uid="$(id -u "$TNODE_USER" 2>/dev/null || echo "")"
+    [[ -z "$tnode_uid" ]] && return 0
+
+    _gw_systemctl_recover() {
+        if [[ "$(id -u)" == "0" ]]; then
+            sudo -u "$TNODE_USER" env "XDG_RUNTIME_DIR=/run/user/$tnode_uid" systemctl --user "$@"
+        else
+            systemctl --user "$@"
+        fi
+    }
+
+    local unit_state
+    unit_state="$(_gw_systemctl_recover is-failed openclaw-gateway 2>/dev/null || true)"
+    [[ "$unit_state" != "failed" ]] && return 0
+
+    local oc_json="$OPENCLAW_HOME/openclaw.json"
+    if [[ ! -s "$oc_json" ]]; then
+        warn "openclaw-gateway en estado failed pero $oc_json no existe — no recupero"
+        return 0
+    fi
+    if ! python3 -c "import json,sys;c=json.load(open('$oc_json'));sys.exit(0 if c.get('gateway',{}).get('auth',{}).get('token') else 1)" 2>/dev/null; then
+        warn "openclaw-gateway failed pero gateway.auth.token no está en $oc_json — no recupero"
+        return 0
+    fi
+
+    info "openclaw-gateway en estado failed con openclaw.json válido — reset-failed + start"
+    _gw_systemctl_recover reset-failed openclaw-gateway 2>/dev/null || true
+    _gw_systemctl_recover start openclaw-gateway 2>/dev/null || true
+    sleep 2
+    unit_state="$(_gw_systemctl_recover is-active openclaw-gateway 2>/dev/null || true)"
+    if [[ "$unit_state" == "active" ]]; then
+        success "openclaw-gateway recuperado (active running)"
+    else
+        warn "openclaw-gateway sigue $unit_state tras reset-failed + start — investigar"
+    fi
+}
+
 # Detect a stale openclaw-gateway daemon — binary updated on disk (via
 # `npm install -g openclaw@*`, `openclaw update`, or any other path that
 # bypasses the installer) but the daemon still has the old code in RAM —
@@ -11024,6 +11078,11 @@ main() {
             install_tnode_telemetry
         fi
     fi
+    # Recover daemon stuck failed because it auto-started at boot before
+    # phase_tunnel wrote openclaw.json. Fast-path-from-snapshot scenario.
+    # No-op when the daemon is active or there's no valid config.
+    recover_failed_openclaw_gateway
+
     # Belt-and-suspenders: detect a gateway daemon running stale binary
     # (e.g. `openclaw update` ran outside the installer) and reload it.
     # In a fresh install or after --component=openclaw-gateway this is a
