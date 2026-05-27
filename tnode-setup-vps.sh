@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.23.0"
+TNODE_SETUP_VERSION="1.24.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -141,6 +141,7 @@ TUNNEL_DOMAIN=""      # set by phase_tunnel
 VERBOSE=0
 UPDATE_ONLY=0         # --update-only: refresh scripts/binaries, never rotate secrets
 COMPONENT=""          # --component <name>: only run install_<name> + verify, implies --update-only
+BAKE_MODE=0           # --bake-mode: install baseline only, skip identity (used by tnode-bake.sh)
 NO_SMOKE_TEST=0       # --no-smoke-test: skip post-update verify_<X>.py (escape hatch)
 UNINSTALL=0           # --uninstall: stop+remove local services and ~/.openclaw, NO server-side cleanup
 PURGE_BINARIES=0      # --purge-binaries: also delete /usr/local/bin/cloudflared and /usr/bin/openclaw
@@ -711,6 +712,7 @@ parse_args() {
             --no-smoke-test) NO_SMOKE_TEST=1 ;;
             --uninstall)     UNINSTALL=1 ;;
             --purge-binaries) PURGE_BINARIES=1 ;;
+            --bake-mode)     BAKE_MODE=1 ;;
             --version)       echo "tnode-setup v${TNODE_SETUP_VERSION}"; exit 0 ;;
             -h|--help)       print_usage; exit 0 ;;
             *)               warn "Unknown flag: $1" ;;
@@ -769,6 +771,10 @@ Options:
   --purge-binaries    With --uninstall, also delete /usr/local/bin/cloudflared
                       and /usr/bin/openclaw. Off by default (other apps may
                       use them).
+  --bake-mode         Install baseline (openclaw, daemons, verify scripts)
+                      WITHOUT creating identity state (tunnel, tokens).
+                      Writes ~/.openclaw/.baked and exits. Used by
+                      tnode-bake.sh to produce DO snapshots.
   --version           Print version and exit
   -h, --help          Show this help
 
@@ -10974,13 +10980,31 @@ main() {
         exit 0
     fi
 
+    # Fast-path detection for cloud-provisioned droplets booted from a baked
+    # snapshot. `~/.openclaw/.baked` marker present + TNODE_AUTO_PAIR=1 set
+    # by cloud-init = the baseline (openclaw, daemons, verify scripts) is
+    # already on disk, skip the heavy phases and only run identity setup.
+    BAKED_FAST_PATH=0
+    if [[ -f "/home/tnode/.openclaw/.baked" ]] && [[ "${TNODE_AUTO_PAIR:-}" == "1" ]]; then
+        info "[fast-path] detected /home/tnode/.openclaw/.baked + TNODE_AUTO_PAIR=1"
+        BAKED_FAST_PATH=1
+    fi
+
     phase_validate
     if [[ "$UPDATE_ONLY" == "0" ]]; then
         # Full install path
-        phase_ollama
-        phase_openclaw
-        phase_tunnel
-        phase_tailscale
+        if [[ "$BAKED_FAST_PATH" == "0" ]]; then
+            phase_ollama
+            phase_openclaw
+        else
+            info "[fast-path] skip phase_ollama + phase_openclaw (baseline pre-installed in snapshot)"
+        fi
+        if [[ "$BAKE_MODE" == "1" ]]; then
+            info "[bake-mode] skip phase_tunnel + phase_tailscale (identity-less bake)"
+        else
+            phase_tunnel
+            phase_tailscale
+        fi
     else
         # Update-only path: skip ollama / openclaw kernel reinstall / tunnel
         # provisioning / tailscale. Kernel + cloudflared refresh is delegated
@@ -11007,7 +11031,37 @@ main() {
     ensure_openclaw_gateway_fresh
     phase_components_manifest
     [[ "$NO_SMOKE_TEST" == "0" && "$UPDATE_ONLY" == "1" ]] && run_smoke_test_all
+
+    # Bake mode: write marker and exit before phase_summary's user-facing
+    # banner runs. The marker is consumed by cleanup-pre-snapshot.sh (which
+    # erases identity state) and later by main() itself on subsequent boots
+    # to enter the fast-path.
+    if [[ "$BAKE_MODE" == "1" ]]; then
+        write_bake_marker
+        info "[bake-mode] complete — run cleanup-pre-snapshot.sh next, then DO snapshot."
+        exit 0
+    fi
+
     phase_summary
+}
+
+# write_bake_marker — emit ~/.openclaw/.baked with tag + daemon SHA so the
+# fast-path detection in main() can match it against the current installer
+# tag. Called only in --bake-mode.
+write_bake_marker() {
+    local marker="${OPENCLAW_HOME}/.baked"
+    local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local sha
+    sha=$(cat "${OPENCLAW_HOME}"/scripts/*.py "${OPENCLAW_HOME}"/verify/*.py 2>/dev/null \
+        | sha256sum | awk '{print $1}')
+    run_as_tnode bash -c "cat > '${marker}'" <<EOF
+{
+  "tag": "v${TNODE_SETUP_VERSION}",
+  "bakedAt": "${ts}",
+  "daemonSha256": "${sha}"
+}
+EOF
+    info "wrote bake marker: ${marker}"
 }
 
 main "$@"
