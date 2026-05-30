@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.24.1"
+TNODE_SETUP_VERSION="1.24.2"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -2818,7 +2818,7 @@ from __future__ import annotations
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.8.0"
+__VERSION__ = "1.8.1"
 
 import hashlib
 import hmac
@@ -3655,34 +3655,57 @@ def handle_apply_openrouter_key(token: dict, params: dict) -> dict:
         f"https://us-central1-{PROJECT_ID}.cloudfunctions.net/pullLLMConfig"
     )
 
-    ts = str(int(time.time() * 1000))
-    nonce = py_secrets.token_hex(16)
-    signing = f'{cfg["nodeId"]}:{ts}:{nonce}'  # legacy signature (no scope)
-    mac = hmac.new(
-        cfg["nodeSecret"].encode("utf-8"),
-        signing.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-    try:
-        resp = _http_request(
-            "POST",
-            pull_url,
-            {
-                "nodeId": cfg["nodeId"],
-                "timestamp": ts,
-                "nonce": nonce,
-                "signature": mac,
-            },
-        )
-    except urllib.error.HTTPError as e:
+    # Pull the minted key — retry transient failures (read timeouts /
+    # connection blips). A single read-timeout used to drop the command to
+    # status=error with no retry, leaving the node without its LLM until a
+    # manual re-trigger. HTTP errors (auth/logic) stay terminal. Re-sign per
+    # attempt so a retry never trips replay / stale-timestamp checks.
+    resp = None
+    last_err: Exception | None = None
+    for attempt in range(4):
+        ts = str(int(time.time() * 1000))
+        nonce = py_secrets.token_hex(16)
+        signing = f'{cfg["nodeId"]}:{ts}:{nonce}'  # legacy signature (no scope)
+        mac = hmac.new(
+            cfg["nodeSecret"].encode("utf-8"),
+            signing.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
         try:
-            err_body = json.loads(e.read().decode("utf-8"))
-        except Exception:
-            err_body = {"error": e.reason}
+            resp = _http_request(
+                "POST",
+                pull_url,
+                {
+                    "nodeId": cfg["nodeId"],
+                    "timestamp": ts,
+                    "nonce": nonce,
+                    "signature": mac,
+                },
+            )
+            break
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = json.loads(e.read().decode("utf-8"))
+            except Exception:
+                err_body = {"error": e.reason}
+            return {
+                "status": "error",
+                "result": {"error": f"pull_failed_{e.code}", "detail": err_body},
+            }
+        except (urllib.error.URLError, OSError) as e:  # noqa: BLE001
+            last_err = e
+            _log(
+                f"apply_openrouter_key pull attempt {attempt + 1}/4 "
+                f"transient error: {e}"
+            )
+            if attempt < 3:
+                time.sleep(2 * (2 ** attempt))  # 2s, 4s, 8s
+    if resp is None:
         return {
             "status": "error",
-            "result": {"error": f"pull_failed_{e.code}", "detail": err_body},
+            "result": {
+                "error": f"pull_unreachable_after_retries: {str(last_err)[:200]}"
+            },
         }
 
     api_key = resp.get("apiKey")
