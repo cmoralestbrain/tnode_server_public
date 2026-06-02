@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.24.2"
+TNODE_SETUP_VERSION="1.25.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -2802,6 +2802,13 @@ Env/overrides:
                            (used by the file-watcher trigger).
 """
 from __future__ import annotations
+# 1.9.0 — install_subagent reads `imageGenerationModel` from the agent card
+#         and sets agents.defaults.imageGenerationModel (node-global
+#         image-generation model; OpenClaw 2026.5.x rejects the slot under
+#         agents.list[]). NOT routed through _ensure_model_registered — that
+#         is the *chat* allowlist; the gateway auto-enables the image plugin
+#         from this key on reload. Pairs with telemetry's agent.imageModel
+#         .set RPC (the in-app picker). Node-scoped: uninstall leaves it.
 # 1.4.0 — AGENTS_INDEX.md auto-generation. install_subagent and
 #         uninstall_subagent now regenerate
 #         ~/.openclaw/agency-agents/AGENTS_INDEX.md (Markdown table of
@@ -2844,7 +2851,7 @@ from __future__ import annotations
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.8.1"
+__VERSION__ = "1.9.0"
 
 import hashlib
 import hmac
@@ -3931,7 +3938,8 @@ def _remove_subagent_files(agent_id: str) -> None:
 
 
 def _update_openclaw_config_for_subagent(
-    agent_id: str, action: str, recommended_model: str | None = None
+    agent_id: str, action: str, recommended_model: str | None = None,
+    image_generation_model: str | None = None,
 ) -> bool:
     """Add/remove an entry in agents.list[] and update main.subagents
     .allowAgents accordingly. Returns True if the file changed.
@@ -3998,6 +4006,19 @@ def _update_openclaw_config_for_subagent(
         # was never registered under providers[p].models[] /
         # agents.defaults.models. Idempotent — safe to re-run.
         _ensure_model_registered(cfg, entry["model"]["primary"])
+        # Node-global image-generation model. The card may carry an
+        # `imageGenerationModel` (prefixed `openrouter/...`) — set it under
+        # agents.defaults (per-node: OpenClaw 2026.5.x rejects the slot in
+        # agents.list[]). Unlike the chat model we do NOT register it via
+        # _ensure_model_registered: that adds the slug to agents.defaults
+        # .models / providers[].models[] (the *chat* allowlist), which would
+        # surface the image model as a selectable brain. The gateway
+        # auto-enables the image plugin from this key on reload. Node-scoped,
+        # so uninstall leaves it untouched.
+        if image_generation_model:
+            defaults_section = agents_section.setdefault("defaults", {})
+            if isinstance(defaults_section, dict):
+                defaults_section["imageGenerationModel"] = image_generation_model
     elif action == "uninstall":
         if existing_idx is None:
             return False
@@ -4542,6 +4563,7 @@ def handle_install_subagent(token: dict, params: dict) -> dict:
     files = fields.get("files") or {}
     files_sha = fields.get("filesSha") or ""
     recommended_model = fields.get("recommendedModel")
+    image_generation_model = fields.get("imageGenerationModel")
 
     if not all(k in files for k in _SUBAGENT_FILES) or not files_sha:
         return {
@@ -4552,7 +4574,7 @@ def handle_install_subagent(token: dict, params: dict) -> dict:
     try:
         _materialize_subagent_files(agent_id, files, files_sha)
         config_changed = _update_openclaw_config_for_subagent(
-            agent_id, "install", recommended_model
+            agent_id, "install", recommended_model, image_generation_model
         )
         _firestore_upsert_installed_subagent(
             token,
@@ -4576,6 +4598,7 @@ def handle_install_subagent(token: dict, params: dict) -> dict:
             "filesSha": files_sha,
             "configChanged": config_changed,
             "recommendedModel": recommended_model,
+            "imageGenerationModel": image_generation_model,
         },
     }
 
@@ -5395,7 +5418,7 @@ Env/overrides:
   TNODE_CHAT_SYNC_POLL_MS   Polling interval ms (default 500)
 """
 from __future__ import annotations
-__VERSION__ = "1.14.0"
+__VERSION__ = "1.15.0"
 
 import hashlib
 import hmac
@@ -5404,6 +5427,7 @@ import mimetypes
 import os
 import re
 import secrets as py_secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -6002,6 +6026,10 @@ def process_uploads(token: dict, project_id: str) -> None:
 # auth-profiles.json via a clever marker.
 
 WORKSPACE_DIR = OPENCLAW_DIR / "workspace"
+# OpenClaw's media store — where the image_generate / video_generate / tts
+# tools write their output (e.g. media/tool-image-generation/<name>.png).
+# The media-delivery bridge copies files from here into workspace/download/.
+MEDIA_DIR = OPENCLAW_DIR / "media"
 
 
 def _resolve_workspace_path(raw: str) -> Path | None:
@@ -7227,6 +7255,89 @@ def assistant_turn_from_trajectory(entry: dict):
     }
 
 
+def _copy_media_to_download(abs_path: str) -> str | None:
+    """Copy a tool-generated media file (image_generate/video_generate output
+    under ~/.openclaw/media/) into workspace/download/ so it (a) satisfies the
+    assistant-file workspace policy and (b) shows up in the app's
+    Almacenamiento -> Descarga tab. Returns the workspace-relative path for an
+    `[adjunto: ...]` marker, or None if the source is missing or sits outside
+    the media store (path-injection guard)."""
+    raw = (abs_path or "").strip()
+    if raw.startswith("MEDIA:"):
+        raw = raw[len("MEDIA:"):].strip()
+    if not raw:
+        return None
+    try:
+        src = Path(os.path.expanduser(raw)).resolve(strict=False)
+        media_root = MEDIA_DIR.resolve(strict=False)
+        src.relative_to(media_root)
+    except (ValueError, OSError):
+        _log(f"media-bridge: rejected '{raw}' (outside media dir)")
+        return None
+    if not src.is_file():
+        _log(f"media-bridge: source missing {src}")
+        return None
+    dest_dir = WORKSPACE_DIR / "download"
+    dest = dest_dir / src.name
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        if not dest.exists() or dest.stat().st_size != src.stat().st_size:
+            shutil.copy2(src, dest)
+    except OSError as e:
+        _log(f"media-bridge: copy failed {src} -> {dest}: {e}")
+        return None
+    return f"workspace/download/{src.name}"
+
+
+def media_turn_from_trajectory(entry: dict):
+    """Bridge OpenClaw tool-generated media (image/video/audio) into the mobile
+    chat. OpenClaw delivers such media via its `message` tool, recorded in the
+    `trace.artifacts` trajectory event as `data.messagingToolSentMediaUrls`.
+    chat-sync's normal `model.completed` path syncs only the text, so the media
+    files never reach the phone.
+
+    We copy each sent file into workspace/download/ and return an assistant
+    turn whose content carries `[adjunto: ...]` markers — the existing
+    assistant-file pipeline then uploads them. The turn reuses the runId, so
+    the resulting `a_{runId}` doc OVERWRITES the text-only doc written by the
+    sibling `model.completed`, yielding one combined text+media bubble. Returns
+    None for events that didn't send media."""
+    if entry.get("type") != "trace.artifacts":
+        return None
+    data = entry.get("data") or {}
+    raw_urls = data.get("messagingToolSentMediaUrls") or []
+    if not isinstance(raw_urls, list) or not raw_urls:
+        return None
+    # Dedupe preserving order (OpenClaw repeats one path per attachment slot).
+    seen: dict[str, None] = {}
+    for u in raw_urls:
+        if isinstance(u, str) and u.strip():
+            seen.setdefault(u.strip(), None)
+    markers = [f"[adjunto: {rel}]"
+               for rel in (_copy_media_to_download(u) for u in seen) if rel]
+    if not markers:
+        return None
+    # Image-only bubble: the caption text already arrives via the sibling
+    # `model.completed` turn (written as `a_{runId}`). We MUST use a distinct
+    # doc id here — `write_message` is create-only (currentDocument.exists=
+    # false), so reusing `a_{runId}` would 412-drop this write and the media
+    # would never land. The `:media` suffix makes a separate follow-up bubble
+    # carrying the attachment.
+    content = "\n".join(markers)
+    run_id = entry.get("runId") or data.get("runId")
+    media_key = f"{run_id}:media" if run_id else None
+    ts_raw = entry.get("ts") or entry.get("timestamp") or data.get("ts")
+    return {
+        "role": "assistant",
+        "content": content,
+        "ts": ts_raw,
+        "turnId": run_id,
+        "idempotencyKey": media_key,
+        "entryId": None,
+        "originatingChannel": _derive_originating_channel(entry.get("sessionKey")),
+    }
+
+
 def message_id_for(turn: dict) -> str:
     """Deterministic id so restarts don't duplicate."""
     if turn.get("idempotencyKey"):
@@ -7475,6 +7586,22 @@ def main() -> int:
                 if turn is not None:
                     try:
                         flush_turn(turn)
+                    except urllib.error.HTTPError as e:
+                        if e.code == 401:
+                            token = None
+                            break
+                    continue
+
+                # Case 0b: media-generation delivery (image/video/audio).
+                # OpenClaw sends tool-generated media via the `message` tool;
+                # the paths land in `trace.artifacts.messagingToolSentMediaUrls`,
+                # not in `model.completed`. Bridge them as chat attachments —
+                # same runId, so this overwrites the text-only doc with one
+                # combined text+media bubble.
+                media_turn = media_turn_from_trajectory(entry)
+                if media_turn is not None:
+                    try:
+                        flush_turn(media_turn)
                     except urllib.error.HTTPError as e:
                         if e.code == 401:
                             token = None
@@ -7791,6 +7918,12 @@ Iteration 1: one stream → `usage`.
 Runs as its own systemd unit (tnode-telemetry.service).
 """
 from __future__ import annotations
+# 1.13.0 — agent.imageModel.get/set RPCs — node-global image-generation
+#          model selector. Writes agents.defaults.imageGenerationModel
+#          (per-node, not per-agent: OpenClaw 2026.5.x rejects the slot
+#          under agents.list[]). The gateway auto-enables the image plugin
+#          from this key on reload, so no providers[].models[] upsert.
+#          Backs the "Modelo de imagen" picker in the client.
 # 1.12.0 — storage.download RPC implemented. Reads file from
 #          workspace/download/, negotiates a signed PUT URL via
 #          prepareAssistantFile (same HMAC path as the chat-sync
@@ -7806,7 +7939,7 @@ from __future__ import annotations
 #          previous default. Idempotent; no-op on un-prefixed slugs.
 # 1.8.14 — _agent_model_set merges into defaults.models instead of
 #          overwriting it (preserves multi-agent distinct picks).
-__VERSION__ = "1.12.0"
+__VERSION__ = "1.13.0"
 
 import argparse
 import asyncio
@@ -9385,12 +9518,60 @@ def _agent_model_set(agent_id: str, model_slug: str) -> Dict[str, Any]:
     }
 
 
+def _node_image_model_get() -> Dict[str, Any]:
+    """Returns the node-global image-generation model
+    (`agents.defaults.imageGenerationModel`). Unlike the chat model this is
+    NOT per-agent — OpenClaw 2026.5.x only honors `imageGenerationModel`
+    under `agents.defaults` (the `agents.list[]` schema rejects it). `null`
+    when the node has no image model configured."""
+    config = _load_openclaw_json()
+    img = ((config.get("agents") or {}).get("defaults") or {}).get(
+        "imageGenerationModel"
+    )
+    return {"imageGenerationModel": img if isinstance(img, str) else None}
+
+
+def _node_image_model_set(model_slug: str) -> Dict[str, Any]:
+    """Sets the node-global image-generation model
+    (`agents.defaults.imageGenerationModel`). Node-scoped, not per-agent
+    (see _node_image_model_get). The slug is normalized to carry the
+    `openrouter/` prefix like the chat model. The gateway auto-enables the
+    image-generation plugin from this key on reload, so unlike
+    _agent_model_set we don't upsert a providers[].models[] catalog entry
+    (its text-oriented contextWindow/maxTokens wouldn't fit an image model).
+    Atomic write + best-effort reload."""
+    model_slug = _normalize_agent_slug(model_slug)
+    if not isinstance(model_slug, str) or "/" not in model_slug:
+        raise AgentError(
+            "invalid-model-slug",
+            f"model must be 'provider/model', got {model_slug!r}",
+        )
+    config = _load_openclaw_json()
+    agents = config.setdefault("agents", {})
+    if not isinstance(agents, dict):
+        raise AgentError("agents-malformed", "agents is not an object")
+    defaults = agents.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        raise AgentError("defaults-malformed", "agents.defaults is not an object")
+    defaults["imageGenerationModel"] = model_slug
+    _save_openclaw_json_atomic(config)
+    reload_ok = _reload_gateway()
+    logger.info("node.imageModel.set → %s (reload=%s)", model_slug, reload_ok)
+    return {"imageGenerationModel": model_slug, "gatewayReloaded": reload_ok}
+
+
 def _dispatch_agent(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
     agent_id = str(params.get("agentId") or "main")
     if method == "agent.model.get":
         return _agent_model_get(agent_id)
     if method == "agent.model.set":
         return _agent_model_set(agent_id, str(params.get("model", "")))
+    # Node-global image-generation model (agents.defaults.imageGenerationModel).
+    # agentId is ignored — the slot is per-node, not per-agent.
+    if method == "agent.imageModel.get":
+        return _node_image_model_get()
+    if method == "agent.imageModel.set":
+        return _node_image_model_set(str(params.get("model", "")))
     raise AgentError("unknown-method", f"unknown method {method!r}")
 
 
