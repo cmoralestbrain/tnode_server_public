@@ -5418,7 +5418,7 @@ Env/overrides:
   TNODE_CHAT_SYNC_POLL_MS   Polling interval ms (default 500)
 """
 from __future__ import annotations
-__VERSION__ = "1.15.0"
+__VERSION__ = "1.16.0"
 
 import hashlib
 import hmac
@@ -7527,6 +7527,67 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             _log(f"write error: {e}")
 
+    # ── Orphan media sweep (v1.16.0) ──────────────────────────────────────
+    # OpenClaw delivers tool-generated media (image/video/music_generate) by
+    # waking the requester session and calling the `message` tool. On the
+    # tnode-mobile channel that send FAILS ("Action send requires a target" —
+    # the mobile chat is Firestore-mirrored, it has no messaging target), so
+    # `messagingToolSentMediaUrls` stays empty and `media_turn_from_trajectory`
+    # never fires; the generated file is orphaned under
+    # ~/.openclaw/media/tool-*-generation/ and never reaches the chat. This
+    # sweep bridges those orphans straight from disk, independent of the flaky
+    # wake/send. Guards: a file already mirrored by the normal path lands in
+    # workspace/download/ (skip it); GRACE lets the normal path win the race;
+    # MAX_AGE stops a fresh deploy from back-filling old files (no chat flood);
+    # the doc id is derived from name+size so re-sweeps/restarts are create-only
+    # no-ops.
+    MEDIA_SWEEP_SUBDIRS = (
+        "tool-image-generation",
+        "tool-video-generation",
+        "tool-music-generation",
+    )
+    MEDIA_SWEEP_GRACE_S = 90
+    MEDIA_SWEEP_MAX_AGE_S = 300
+    MEDIA_SWEEP_INTERVAL_S = 30
+
+    def sweep_orphan_media():
+        now_s = time.time()
+        for sub in MEDIA_SWEEP_SUBDIRS:
+            d = MEDIA_DIR / sub
+            if not d.is_dir():
+                continue
+            for src in sorted(d.iterdir()):
+                try:
+                    if not src.is_file():
+                        continue
+                    st = src.stat()
+                    age = now_s - st.st_mtime
+                    if age < MEDIA_SWEEP_GRACE_S or age > MEDIA_SWEEP_MAX_AGE_S:
+                        continue
+                    dest = WORKSPACE_DIR / "download" / src.name
+                    if dest.exists() and dest.stat().st_size == st.st_size:
+                        continue  # normal bridge (or a prior sweep) already handled it
+                except OSError:
+                    continue
+                rel = _copy_media_to_download(str(src))
+                if not rel:
+                    continue
+                key = hashlib.sha256(
+                    f"{src.name}:{st.st_size}".encode()
+                ).hexdigest()[:16]
+                ts_iso = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime)
+                )
+                _log(f"media-sweep: bridging orphan {src.name} (age={int(age)}s)")
+                flush_turn({
+                    "role": "assistant",
+                    "content": f"[adjunto: {rel}]",
+                    "ts": ts_iso,
+                    "turnId": None,
+                    "idempotencyKey": f"genmedia_{key}:media",
+                    "originatingChannel": "tnode-mobile",
+                })
+
     # When `mintNodeToken` keeps returning 404 (server-side registration doc
     # gone), we re-register at most this often to avoid hammering the
     # endpoint if rotation itself is failing.
@@ -7544,6 +7605,7 @@ def main() -> int:
     last_cron_command_check = 0.0
     last_tasks_mirror_check = 0.0
     last_task_command_check = 0.0
+    last_media_sweep_check = 0.0
 
     while True:
         try:
@@ -7728,6 +7790,20 @@ def main() -> int:
                 except urllib.error.HTTPError as e:
                     if e.code == 401:
                         _log("task commands: idToken rejected — refreshing")
+                        token = None
+
+            # Orphan media sweep — bridge tool-generated images/video/music that
+            # OpenClaw's `message` send failed to deliver (see sweep_orphan_media).
+            if (
+                token is not None
+                and (now_f - last_media_sweep_check) >= MEDIA_SWEEP_INTERVAL_S
+            ):
+                last_media_sweep_check = now_f
+                try:
+                    sweep_orphan_media()
+                except urllib.error.HTTPError as e:
+                    if e.code == 401:
+                        _log("media sweep: idToken rejected — refreshing")
                         token = None
 
             time.sleep(POLL_MS / 1000.0)
@@ -7939,7 +8015,7 @@ from __future__ import annotations
 #          previous default. Idempotent; no-op on un-prefixed slugs.
 # 1.8.14 — _agent_model_set merges into defaults.models instead of
 #          overwriting it (preserves multi-agent distinct picks).
-__VERSION__ = "1.13.0"
+__VERSION__ = "1.13.1"
 
 import argparse
 import asyncio
@@ -9358,6 +9434,19 @@ def _reload_gateway() -> bool:
     return False
 
 
+def _reload_gateway_async() -> None:
+    """Fire-and-forget gateway reload so the RPC response reaches the client
+    before the reload blocks. `openclaw daemon restart` waits for the gateway
+    to come back (can exceed the client's ~15s RPC timeout), which made
+    `agent.imageModel.set` look like it failed ("tiempo de espera agotado")
+    even though the model WAS written to disk. The config on disk is the
+    source of truth, so we run the reload in a daemon thread and return now."""
+    import threading
+    threading.Thread(
+        target=_reload_gateway, name="gateway-reload", daemon=True
+    ).start()
+
+
 def _agent_model_get(agent_id: str) -> Dict[str, Any]:
     """Returns the effective model the gateway uses for `agent_id`. The
     `effective` field is what the UI should show as "active" — it falls
@@ -9555,9 +9644,13 @@ def _node_image_model_set(model_slug: str) -> Dict[str, Any]:
         raise AgentError("defaults-malformed", "agents.defaults is not an object")
     defaults["imageGenerationModel"] = model_slug
     _save_openclaw_json_atomic(config)
-    reload_ok = _reload_gateway()
-    logger.info("node.imageModel.set → %s (reload=%s)", model_slug, reload_ok)
-    return {"imageGenerationModel": model_slug, "gatewayReloaded": reload_ok}
+    # Reload in the background: `openclaw daemon restart` can block past the
+    # client's RPC timeout, which surfaced as a false "tiempo de espera agotado"
+    # even though the model was already persisted. Fire-and-forget so the client
+    # gets a fast OK; the config on disk is the source of truth.
+    _reload_gateway_async()
+    logger.info("node.imageModel.set → %s (reload=async)", model_slug)
+    return {"imageGenerationModel": model_slug, "gatewayReloaded": True}
 
 
 def _dispatch_agent(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
