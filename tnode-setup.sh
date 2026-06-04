@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.25.0"
+TNODE_SETUP_VERSION="1.27.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -2776,6 +2776,10 @@ Env/overrides:
                            (used by the file-watcher trigger).
 """
 from __future__ import annotations
+# 1.10.0 — install_subagent also reads `musicGenerationModel` /
+#          `videoGenerationModel` from the agent card and sets them under
+#          agents.defaults (siblings of imageGenerationModel; node-global media
+#          slots, both OpenRouter-served). Write generalized to loop the three.
 # 1.9.0 — install_subagent reads `imageGenerationModel` from the agent card
 #         and sets agents.defaults.imageGenerationModel (node-global
 #         image-generation model; OpenClaw 2026.5.x rejects the slot under
@@ -2825,7 +2829,7 @@ from __future__ import annotations
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.9.0"
+__VERSION__ = "1.10.0"
 
 import hashlib
 import hmac
@@ -3914,6 +3918,8 @@ def _remove_subagent_files(agent_id: str) -> None:
 def _update_openclaw_config_for_subagent(
     agent_id: str, action: str, recommended_model: str | None = None,
     image_generation_model: str | None = None,
+    music_generation_model: str | None = None,
+    video_generation_model: str | None = None,
 ) -> bool:
     """Add/remove an entry in agents.list[] and update main.subagents
     .allowAgents accordingly. Returns True if the file changed.
@@ -3980,19 +3986,27 @@ def _update_openclaw_config_for_subagent(
         # was never registered under providers[p].models[] /
         # agents.defaults.models. Idempotent — safe to re-run.
         _ensure_model_registered(cfg, entry["model"]["primary"])
-        # Node-global image-generation model. The card may carry an
-        # `imageGenerationModel` (prefixed `openrouter/...`) — set it under
-        # agents.defaults (per-node: OpenClaw 2026.5.x rejects the slot in
-        # agents.list[]). Unlike the chat model we do NOT register it via
-        # _ensure_model_registered: that adds the slug to agents.defaults
-        # .models / providers[].models[] (the *chat* allowlist), which would
-        # surface the image model as a selectable brain. The gateway
-        # auto-enables the image plugin from this key on reload. Node-scoped,
-        # so uninstall leaves it untouched.
-        if image_generation_model:
+        # Node-global media-generation models. A card may carry
+        # `imageGenerationModel` / `musicGenerationModel` / `videoGenerationModel`
+        # (each prefixed `openrouter/...`) — set them under agents.defaults
+        # (per-node: OpenClaw 2026.5.x rejects these slots in agents.list[]).
+        # Unlike the chat model we do NOT register them via
+        # _ensure_model_registered: that adds the slug to agents.defaults.models
+        # / providers[].models[] (the *chat* allowlist), which would surface a
+        # media model as a selectable brain. The gateway auto-enables the
+        # matching plugin from each key on reload. Node-scoped, so uninstall
+        # leaves them untouched.
+        media_models = {
+            "imageGenerationModel": image_generation_model,
+            "musicGenerationModel": music_generation_model,
+            "videoGenerationModel": video_generation_model,
+        }
+        if any(media_models.values()):
             defaults_section = agents_section.setdefault("defaults", {})
             if isinstance(defaults_section, dict):
-                defaults_section["imageGenerationModel"] = image_generation_model
+                for slot_key, slot_slug in media_models.items():
+                    if slot_slug:
+                        defaults_section[slot_key] = slot_slug
     elif action == "uninstall":
         if existing_idx is None:
             return False
@@ -4538,6 +4552,8 @@ def handle_install_subagent(token: dict, params: dict) -> dict:
     files_sha = fields.get("filesSha") or ""
     recommended_model = fields.get("recommendedModel")
     image_generation_model = fields.get("imageGenerationModel")
+    music_generation_model = fields.get("musicGenerationModel")
+    video_generation_model = fields.get("videoGenerationModel")
 
     if not all(k in files for k in _SUBAGENT_FILES) or not files_sha:
         return {
@@ -4548,7 +4564,8 @@ def handle_install_subagent(token: dict, params: dict) -> dict:
     try:
         _materialize_subagent_files(agent_id, files, files_sha)
         config_changed = _update_openclaw_config_for_subagent(
-            agent_id, "install", recommended_model, image_generation_model
+            agent_id, "install", recommended_model, image_generation_model,
+            music_generation_model, video_generation_model,
         )
         _firestore_upsert_installed_subagent(
             token,
@@ -4573,6 +4590,8 @@ def handle_install_subagent(token: dict, params: dict) -> dict:
             "configChanged": config_changed,
             "recommendedModel": recommended_model,
             "imageGenerationModel": image_generation_model,
+            "musicGenerationModel": music_generation_model,
+            "videoGenerationModel": video_generation_model,
         },
     }
 
@@ -8018,6 +8037,14 @@ Iteration 1: one stream → `usage`.
 Runs as its own systemd unit (tnode-telemetry.service).
 """
 from __future__ import annotations
+# 1.14.0 — agent.{music,video}Model.get/set RPCs — node-global music/video
+#          generation model selectors (siblings of imageModel). Generalized
+#          _node_image_model_get/set into _node_media_model_get/set(config_key)
+#          so one pair drives all three slots (image/music/videoGenerationModel).
+#          Both modalities are OpenRouter-served (Lyria 3 / grok-imagine-video).
+# 1.13.1 — _node_image_model_set reloads the gateway async so the RPC returns
+#          fast (daemon restart blocked past the client timeout → false
+#          "tiempo de espera agotado" even though the slug was persisted).
 # 1.13.0 — agent.imageModel.get/set RPCs — node-global image-generation
 #          model selector. Writes agents.defaults.imageGenerationModel
 #          (per-node, not per-agent: OpenClaw 2026.5.x rejects the slot
@@ -8039,7 +8066,7 @@ from __future__ import annotations
 #          previous default. Idempotent; no-op on un-prefixed slugs.
 # 1.8.14 — _agent_model_set merges into defaults.models instead of
 #          overwriting it (preserves multi-agent distinct picks).
-__VERSION__ = "1.13.1"
+__VERSION__ = "1.14.0"
 
 import argparse
 import asyncio
@@ -9631,28 +9658,26 @@ def _agent_model_set(agent_id: str, model_slug: str) -> Dict[str, Any]:
     }
 
 
-def _node_image_model_get() -> Dict[str, Any]:
-    """Returns the node-global image-generation model
-    (`agents.defaults.imageGenerationModel`). Unlike the chat model this is
-    NOT per-agent — OpenClaw 2026.5.x only honors `imageGenerationModel`
-    under `agents.defaults` (the `agents.list[]` schema rejects it). `null`
-    when the node has no image model configured."""
+def _node_media_model_get(config_key: str) -> Dict[str, Any]:
+    """Returns a node-global media-generation model from `agents.defaults`
+    (`imageGenerationModel` / `musicGenerationModel` / `videoGenerationModel`).
+    Unlike the chat model these are NOT per-agent — OpenClaw 2026.5.x only
+    honors them under `agents.defaults` (the `agents.list[]` schema rejects
+    them). `null` when the node has no model configured for that slot."""
     config = _load_openclaw_json()
-    img = ((config.get("agents") or {}).get("defaults") or {}).get(
-        "imageGenerationModel"
-    )
-    return {"imageGenerationModel": img if isinstance(img, str) else None}
+    val = ((config.get("agents") or {}).get("defaults") or {}).get(config_key)
+    return {config_key: val if isinstance(val, str) else None}
 
 
-def _node_image_model_set(model_slug: str) -> Dict[str, Any]:
-    """Sets the node-global image-generation model
-    (`agents.defaults.imageGenerationModel`). Node-scoped, not per-agent
-    (see _node_image_model_get). The slug is normalized to carry the
-    `openrouter/` prefix like the chat model. The gateway auto-enables the
-    image-generation plugin from this key on reload, so unlike
-    _agent_model_set we don't upsert a providers[].models[] catalog entry
-    (its text-oriented contextWindow/maxTokens wouldn't fit an image model).
-    Atomic write + best-effort reload."""
+def _node_media_model_set(config_key: str, model_slug: str) -> Dict[str, Any]:
+    """Sets a node-global media-generation model under `agents.defaults`
+    (`imageGenerationModel` / `musicGenerationModel` / `videoGenerationModel`).
+    Node-scoped, not per-agent (see _node_media_model_get). The slug is
+    normalized to carry the `openrouter/` prefix like the chat model. The
+    gateway auto-enables the matching generation plugin from this key on
+    reload, so unlike _agent_model_set we don't upsert a providers[].models[]
+    catalog entry (its text-oriented contextWindow/maxTokens wouldn't fit a
+    media model). Atomic write + best-effort async reload."""
     model_slug = _normalize_agent_slug(model_slug)
     if not isinstance(model_slug, str) or "/" not in model_slug:
         raise AgentError(
@@ -9666,15 +9691,15 @@ def _node_image_model_set(model_slug: str) -> Dict[str, Any]:
     defaults = agents.setdefault("defaults", {})
     if not isinstance(defaults, dict):
         raise AgentError("defaults-malformed", "agents.defaults is not an object")
-    defaults["imageGenerationModel"] = model_slug
+    defaults[config_key] = model_slug
     _save_openclaw_json_atomic(config)
     # Reload in the background: `openclaw daemon restart` can block past the
     # client's RPC timeout, which surfaced as a false "tiempo de espera agotado"
     # even though the model was already persisted. Fire-and-forget so the client
     # gets a fast OK; the config on disk is the source of truth.
     _reload_gateway_async()
-    logger.info("node.imageModel.set → %s (reload=async)", model_slug)
-    return {"imageGenerationModel": model_slug, "gatewayReloaded": True}
+    logger.info("node.%s.set → %s (reload=async)", config_key, model_slug)
+    return {config_key: model_slug, "gatewayReloaded": True}
 
 
 def _dispatch_agent(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -9683,12 +9708,21 @@ def _dispatch_agent(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         return _agent_model_get(agent_id)
     if method == "agent.model.set":
         return _agent_model_set(agent_id, str(params.get("model", "")))
-    # Node-global image-generation model (agents.defaults.imageGenerationModel).
-    # agentId is ignored — the slot is per-node, not per-agent.
+    # Node-global media-generation models (agents.defaults.<X>GenerationModel).
+    # agentId is ignored — these slots are per-node, not per-agent. The gateway
+    # auto-enables the matching plugin (image/music/video) from each key.
     if method == "agent.imageModel.get":
-        return _node_image_model_get()
+        return _node_media_model_get("imageGenerationModel")
     if method == "agent.imageModel.set":
-        return _node_image_model_set(str(params.get("model", "")))
+        return _node_media_model_set("imageGenerationModel", str(params.get("model", "")))
+    if method == "agent.musicModel.get":
+        return _node_media_model_get("musicGenerationModel")
+    if method == "agent.musicModel.set":
+        return _node_media_model_set("musicGenerationModel", str(params.get("model", "")))
+    if method == "agent.videoModel.get":
+        return _node_media_model_get("videoGenerationModel")
+    if method == "agent.videoModel.set":
+        return _node_media_model_set("videoGenerationModel", str(params.get("model", "")))
     raise AgentError("unknown-method", f"unknown method {method!r}")
 
 
