@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.27.0"
+TNODE_SETUP_VERSION="1.28.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -252,6 +252,23 @@ run_as_tnode() {
         fi
         su - "$TNODE_USER" -s /bin/bash -c "${env_prefix}$(printf '%q ' "$@")"
     fi
+}
+
+# Mask the apt auto-upgrade timers (Linux). On a freshly-provisioned droplet
+# unattended-upgrades fires within minutes of first boot, upgrades packages
+# (incl. systemd → `systemctl daemon-reexec`) and restarts a swath of services
+# — systemd-resolved (DNS blips), the tnode daemons, and the gateway — right in
+# the pairing window. For a managed appliance we control updates via golden-image
+# re-bakes, not per-node auto-upgrades, so mask the triggers. No-op off Linux /
+# without systemd+apt. Idempotent.
+disable_apt_auto_upgrades() {
+    [[ "$OS" != "Linux" ]] && return 0
+    command -v systemctl >/dev/null 2>&1 || return 0
+    command -v apt-get >/dev/null 2>&1 || return 0
+    local units="apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service"
+    systemctl disable --now $units 2>/dev/null || true
+    systemctl mask $units 2>/dev/null || true
+    success "apt auto-upgrades deshabilitados (updates vía golden re-bake)"
 }
 
 # Create tnode user if on Linux and running as root
@@ -839,6 +856,10 @@ phase_validate() {
 
     # Create tnode user (Linux) or use current user (macOS / non-root)
     setup_tnode_user
+
+    # Quiet apt auto-upgrades so they don't reexec systemd + churn daemons
+    # right when the user is pairing the fresh node (see fn comment).
+    disable_apt_auto_upgrades
 
     # Internet check
     if curl -fsSL --max-time 5 https://registry.npmjs.org/ >/dev/null 2>&1; then
@@ -2802,6 +2823,12 @@ Env/overrides:
                            (used by the file-watcher trigger).
 """
 from __future__ import annotations
+# 1.11.0 — _apply_provider_to_openclaw seeds default media-generation models
+#          (image=gemini-3.1-flash-image-preview, music=lyria-3-clip-preview,
+#          video=grok-imagine-video) on first OpenRouter provision via
+#          setdefault, so a freshly-provisioned node can generate image/music/
+#          video out of the box without the user hand-picking them in Mente.
+#          OR-scoped + setdefault (a Mente choice or sub-agent card still wins).
 # 1.10.0 — install_subagent also reads `musicGenerationModel` /
 #          `videoGenerationModel` from the agent card and sets them under
 #          agents.defaults (siblings of imageGenerationModel; node-global media
@@ -2855,7 +2882,7 @@ from __future__ import annotations
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.10.0"
+__VERSION__ = "1.11.0"
 
 import hashlib
 import hmac
@@ -3527,6 +3554,18 @@ def _build_prefixed_slug(provider: str, model: str) -> str:
     return needle + model
 
 
+# v1.11.0 — default media-generation models seeded on first OpenRouter
+# provision so a fresh node can generate image/music/video out of the box,
+# mirroring how the cerebro (chat) model is applied. Economic tier; the user
+# can switch any of them in Mente (agent.{image,music,video}Model.set), which
+# wins because we only `setdefault` (never overwrite an explicit choice).
+_DEFAULT_MEDIA_MODELS = {
+    "imageGenerationModel": "openrouter/google/gemini-3.1-flash-image-preview",
+    "musicGenerationModel": "openrouter/google/lyria-3-clip-preview",
+    "videoGenerationModel": "openrouter/x-ai/grok-imagine-video",
+}
+
+
 def _apply_provider_to_openclaw(
     provider: str,
     base_url: str,
@@ -3596,6 +3635,14 @@ def _apply_provider_to_openclaw(
     agents_defaults = cfg.setdefault("agents", {}).setdefault("defaults", {})
     agents_defaults.setdefault("models", {}).setdefault(prefixed_slug, {})
     agents_defaults.pop("model", None)  # drop legacy singular key
+
+    # Seed default media-generation models so a freshly-provisioned node can
+    # generate image/music/video without the user hand-picking them in Mente.
+    # OpenRouter-only (the defaults are OR slugs that need the node's OR key)
+    # and setdefault-only (a prior Mente choice or sub-agent card is kept).
+    if provider == "openrouter":
+        for _slot, _default_slug in _DEFAULT_MEDIA_MODELS.items():
+            agents_defaults.setdefault(_slot, _default_slug)
 
     _write_openclaw_json(cfg)
     return cfg
