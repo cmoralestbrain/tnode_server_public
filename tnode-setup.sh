@@ -2835,7 +2835,7 @@ from __future__ import annotations
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.12.0"
+__VERSION__ = "1.13.0"
 
 import hashlib
 import hmac
@@ -5154,6 +5154,54 @@ def handle_channels_telegram_unlink(token: dict, params: dict) -> dict:
     return {"status": "done", "result": {"restart": restart}}
 
 
+def _derive_telegram_state_if_missing() -> None:
+    """Reflect a hand-configured Telegram channel into channels-state.json.
+
+    If openclaw.json has an enabled `channels.telegram` block but
+    channels-state.json has no `telegram` entry — e.g. the bot was wired by
+    hand before the app's link flow existed (the Pi's `@TBTvisionBot`) —
+    derive a `linked` state so the mobile widget reflects it without forcing
+    a re-link. Idempotent: never overwrites an existing telegram entry, so an
+    app-driven link/unlink stays authoritative. Runs once at daemon startup.
+    """
+    try:
+        state = _read_channels_state()
+        if isinstance(state.get("telegram"), dict):
+            return  # already owned by the app/daemon — don't clobber.
+        cfg = read_openclaw_json() or {}
+        ch = cfg.get("channels") or {}
+        tg = ch.get("telegram") if isinstance(ch, dict) else None
+        if not isinstance(tg, dict) or not tg.get("enabled"):
+            return
+        token = (tg.get("botToken") or "").strip()
+        if not token or ":" not in token:
+            return
+        dm = (tg.get("dmPolicy") or "").strip().lower()
+        allow = tg.get("allowFrom") if isinstance(tg.get("allowFrom"), list) else []
+        if dm == "open" or "*" in allow:
+            access_mode, allow_count = "open", 0
+        else:
+            access_mode = "owner" if len(allow) <= 1 else "list"
+            allow_count = len(allow)
+        ok, username, _ = _telegram_get_me(token)
+        now_ms = int(time.time() * 1000)
+        state["telegram"] = {
+            "status": "linked",
+            "botUsername": username if ok else None,
+            "accessMode": access_mode,
+            "allowCount": allow_count,
+            "linkedAt": now_ms,
+            "lastSyncAt": now_ms,
+        }
+        _write_channels_state(state)
+        _log(
+            f"derived telegram state from openclaw.json "
+            f"(bot=@{username or '?'} mode={access_mode})"
+        )
+    except Exception as e:  # noqa: BLE001
+        _log(f"_derive_telegram_state_if_missing: {e}")
+
+
 # ── Dispatcher ─────────────────────────────────────────────────
 
 _HANDLERS = {
@@ -5234,6 +5282,9 @@ def main() -> int:
         _ensure_subagents_sections()
     except Exception as e:  # noqa: BLE001
         _log(f"startup self-heal failed: {e}")
+    # Reflect a hand-configured Telegram channel (openclaw.json) into
+    # channels-state.json so the mobile widget shows it without a re-link.
+    _derive_telegram_state_if_missing()
     token: dict | None = None
     backoff = 1.0
     empty_polls = 0
