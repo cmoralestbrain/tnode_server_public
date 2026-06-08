@@ -2882,7 +2882,7 @@ from __future__ import annotations
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.13.0"
+__VERSION__ = "1.14.0"
 
 import hashlib
 import hmac
@@ -5160,6 +5160,7 @@ def handle_channels_telegram_link(token: dict, params: dict) -> dict:
         "status": "linked",
         "botUsername": username,
         "accessMode": access_mode,
+        "allowFrom": [] if access_mode == "open" else allow_list,
         "allowCount": 0 if access_mode == "open" else len(allow_list),
         "linkedAt": now_ms,
         "lastSyncAt": now_ms,
@@ -5201,6 +5202,73 @@ def handle_channels_telegram_unlink(token: dict, params: dict) -> dict:
     return {"status": "done", "result": {"restart": restart}}
 
 
+def handle_channels_telegram_access(token: dict, params: dict) -> dict:
+    """Change WHO can DM an already-linked Telegram bot (accessMode +
+    allowFrom), keeping the existing botToken. Rewrites only dmPolicy/allowFrom
+    in openclaw.json and reloads — no getMe (the bot is already validated)."""
+    access_mode = (params.get("accessMode") or "").strip().lower()
+    raw_allow = params.get("allowFrom") or []
+    if access_mode not in ("owner", "list", "open"):
+        return {
+            "status": "error",
+            "result": {"error": f"invalid_accessMode: {access_mode}"},
+        }
+
+    cfg = read_openclaw_json() or {}
+    ch = cfg.get("channels") or {}
+    tg = ch.get("telegram") if isinstance(ch, dict) else None
+    if not isinstance(tg, dict) or not tg.get("botToken"):
+        return {"status": "error", "result": {"error": "not_linked"}}
+
+    if access_mode == "open":
+        dm_policy, allow_list = "open", ["*"]
+    else:
+        if isinstance(raw_allow, list):
+            ids = [str(x).strip() for x in raw_allow if str(x).strip()]
+        else:
+            ids = []
+        if not ids:
+            return {"status": "error", "result": {"error": "missing_allowFrom"}}
+        if not all(i.isdigit() and len(i) >= 5 for i in ids):
+            return {
+                "status": "error",
+                "result": {"error": "non_numeric_allowFrom"},
+            }
+        if access_mode == "owner":
+            ids = ids[:1]
+        dm_policy, allow_list = "allowlist", ids
+
+    try:
+        tg["dmPolicy"] = dm_policy
+        tg["allowFrom"] = allow_list
+        ch["telegram"] = tg
+        cfg["channels"] = ch
+        _write_openclaw_json(cfg)
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "result": {"error": f"write_openclaw: {e}"}}
+
+    now_ms = int(time.time() * 1000)
+    state = _read_channels_state()
+    prev = state.get("telegram")
+    prev = dict(prev) if isinstance(prev, dict) else {"status": "linked"}
+    prev.update({
+        "status": "linked",
+        "accessMode": access_mode,
+        "allowFrom": [] if access_mode == "open" else allow_list,
+        "allowCount": 0 if access_mode == "open" else len(allow_list),
+        "lastSyncAt": now_ms,
+    })
+    state["telegram"] = prev
+    _write_channels_state(state)
+    _log(f"channels.telegram.access ok mode={access_mode} n={len(allow_list)}")
+
+    restart = _restart_openclaw_with_verify()
+    return {
+        "status": "done" if restart.get("ok") else "error",
+        "result": {"accessMode": access_mode, "restart": restart},
+    }
+
+
 def _derive_telegram_state_if_missing() -> None:
     """Reflect a hand-configured Telegram channel into channels-state.json.
 
@@ -5236,6 +5304,7 @@ def _derive_telegram_state_if_missing() -> None:
             "status": "linked",
             "botUsername": username if ok else None,
             "accessMode": access_mode,
+            "allowFrom": [] if access_mode == "open" else allow,
             "allowCount": allow_count,
             "linkedAt": now_ms,
             "lastSyncAt": now_ms,
@@ -5267,6 +5336,7 @@ _HANDLERS = {
     "channels.email.unlink": handle_channels_email_unlink,
     "channels.telegram.link": handle_channels_telegram_link,
     "channels.telegram.unlink": handle_channels_telegram_unlink,
+    "channels.telegram.access": handle_channels_telegram_access,
 }
 
 # Tipos que ESTE daemon procesa. `query_pending_commands` (v1.6.0+)
