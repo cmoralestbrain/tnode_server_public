@@ -2835,7 +2835,7 @@ from __future__ import annotations
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.11.0"
+__VERSION__ = "1.12.0"
 
 import hashlib
 import hmac
@@ -5014,6 +5014,146 @@ def handle_channels_email_unlink(token: dict, params: dict) -> dict:
     return {"status": "done", "result": {}}
 
 
+# ── Telegram ───────────────────────────────────────────────────
+
+def _telegram_get_me(bot_token: str) -> tuple[bool, str, str]:
+    """Validate a bot token against the Bot API `getMe`. Returns
+    `(ok, username, err)`; `username` is the bot handle without the `@`."""
+    url = f"https://api.telegram.org/bot{bot_token}/getMe"
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "tnode-config-sync/telegram-getme"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        if not data.get("ok"):
+            return False, "", "telegram_rejected"
+        result = data.get("result") or {}
+        return True, str(result.get("username") or ""), ""
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return False, "", "invalid_token"
+        return False, "", f"telegram HTTP {e.code}"
+    except urllib.error.URLError as e:
+        return False, "", f"network: {e.reason}"
+    except Exception as e:  # noqa: BLE001
+        return False, "", str(e)[:200]
+
+
+def handle_channels_telegram_link(token: dict, params: dict) -> dict:
+    """Wire a Telegram bot into openclaw.json. The client sends `botToken`,
+    `accessMode` (owner|list|open), and `allowFrom` (numeric Telegram user
+    IDs for owner/list). We validate the token via getMe, resolve the bot
+    @username, write `channels.telegram`, and reload the gateway.
+
+    Access mapping (mirrors the Pi's live config):
+      owner/list → dmPolicy:"allowlist" + allowFrom:[ids]
+      open       → dmPolicy:"open"      + allowFrom:["*"]
+    Guard: never emit allowlist with an empty allowFrom — OpenClaw rejects
+    that config at boot."""
+    bot_token = (params.get("botToken") or "").strip()
+    access_mode = (params.get("accessMode") or "owner").strip().lower()
+    raw_allow = params.get("allowFrom") or []
+    if not bot_token or ":" not in bot_token:
+        return {"status": "error", "result": {"error": "invalid_botToken"}}
+    if access_mode not in ("owner", "list", "open"):
+        return {
+            "status": "error",
+            "result": {"error": f"invalid_accessMode: {access_mode}"},
+        }
+
+    if access_mode == "open":
+        dm_policy = "open"
+        allow_list = ["*"]
+    else:
+        if isinstance(raw_allow, list):
+            ids = [str(x).strip() for x in raw_allow if str(x).strip()]
+        else:
+            ids = []
+        if not ids:
+            return {"status": "error", "result": {"error": "missing_allowFrom"}}
+        if not all(i.isdigit() and len(i) >= 5 for i in ids):
+            return {
+                "status": "error",
+                "result": {"error": "non_numeric_allowFrom"},
+            }
+        if access_mode == "owner":
+            ids = ids[:1]
+        dm_policy = "allowlist"
+        allow_list = ids
+
+    ok, username, err = _telegram_get_me(bot_token)
+    if not ok:
+        return {
+            "status": "error",
+            "result": {"error": "token_validation_failed", "detail": err},
+        }
+
+    try:
+        cfg = read_openclaw_json() or {}
+        channels = cfg.setdefault("channels", {})
+        prev = channels.get("telegram")
+        tg = dict(prev) if isinstance(prev, dict) else {}
+        tg.update({
+            "enabled": True,
+            "botToken": bot_token,
+            "dmPolicy": dm_policy,
+            "allowFrom": allow_list,
+        })
+        tg.setdefault("groupPolicy", "allowlist")
+        tg.setdefault("streaming", {"mode": "partial"})
+        channels["telegram"] = tg
+        _write_openclaw_json(cfg)
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "result": {"error": f"write_openclaw: {e}"}}
+
+    now_ms = int(time.time() * 1000)
+    state = _read_channels_state()
+    state["telegram"] = {
+        "status": "linked",
+        "botUsername": username,
+        "accessMode": access_mode,
+        "allowCount": 0 if access_mode == "open" else len(allow_list),
+        "linkedAt": now_ms,
+        "lastSyncAt": now_ms,
+    }
+    _write_channels_state(state)
+    _log(
+        f"channels.telegram.link ok bot=@{username} "
+        f"mode={access_mode} n={len(allow_list)}"
+    )
+
+    restart = _restart_openclaw_with_verify()
+    return {
+        "status": "done" if restart.get("ok") else "error",
+        "result": {
+            "botUsername": username,
+            "accessMode": access_mode,
+            "restart": restart,
+            "linkedAt": now_ms,
+        },
+    }
+
+
+def handle_channels_telegram_unlink(token: dict, params: dict) -> dict:
+    """Remove the Telegram channel from openclaw.json (drops the bot token)
+    and reload the gateway. Idempotent."""
+    try:
+        cfg = read_openclaw_json() or {}
+        channels = cfg.get("channels")
+        if isinstance(channels, dict) and \
+                channels.pop("telegram", None) is not None:
+            _write_openclaw_json(cfg)
+    except Exception as e:  # noqa: BLE001
+        _log(f"channels.telegram.unlink: openclaw write: {e}")
+    state = _read_channels_state()
+    state["telegram"] = {"status": "unlinked"}
+    _write_channels_state(state)
+    _log("channels.telegram.unlink ok")
+    restart = _restart_openclaw_with_verify()
+    return {"status": "done", "result": {"restart": restart}}
+
+
 # ── Dispatcher ─────────────────────────────────────────────────
 
 _HANDLERS = {
@@ -5030,6 +5170,8 @@ _HANDLERS = {
     "restart_gateway_for_subagents": handle_restart_gateway_for_subagents,
     "channels.email.link": handle_channels_email_link,
     "channels.email.unlink": handle_channels_email_unlink,
+    "channels.telegram.link": handle_channels_telegram_link,
+    "channels.telegram.unlink": handle_channels_telegram_unlink,
 }
 
 # Tipos que ESTE daemon procesa. `query_pending_commands` (v1.6.0+)
@@ -8092,7 +8234,7 @@ from __future__ import annotations
 #          previous default. Idempotent; no-op on un-prefixed slugs.
 # 1.8.14 — _agent_model_set merges into defaults.models instead of
 #          overwriting it (preserves multi-agent distinct picks).
-__VERSION__ = "1.14.0"
+__VERSION__ = "1.15.0"
 
 import argparse
 import asyncio
@@ -8861,10 +9003,13 @@ class TelemetryProxy:
         bind to."""
         whatsapp = state.get("whatsapp") if isinstance(state, dict) else None
         email = state.get("email") if isinstance(state, dict) else None
+        telegram = state.get("telegram") if isinstance(state, dict) else None
         if not isinstance(whatsapp, dict):
             whatsapp = {"status": "unlinked"}
         if not isinstance(email, dict):
             email = {"status": "unlinked"}
+        if not isinstance(telegram, dict):
+            telegram = {"status": "unlinked"}
         return {
             "type": "event",
             "stream": CHANNELS_STREAM,
@@ -8872,6 +9017,7 @@ class TelemetryProxy:
             "payload": {
                 "whatsapp": whatsapp,
                 "email": email,
+                "telegram": telegram,
             },
         }
 
