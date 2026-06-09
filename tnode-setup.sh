@@ -2835,7 +2835,7 @@ from __future__ import annotations
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.14.0"
+__VERSION__ = "1.14.1"
 
 import hashlib
 import hmac
@@ -3273,6 +3273,18 @@ def _openclaw_binary() -> str | None:
     return None
 
 
+def _cli_env() -> dict:
+    """Env for spawning the `openclaw` CLI. The CLI treats OPENCLAW_HOME as the
+    PARENT of the config dir (it appends `.openclaw`), while this daemon uses
+    OPENCLAW_HOME as the config dir itself. Inheriting our value makes the CLI
+    resolve a doubled `.openclaw/.openclaw/` path (phantom device identities,
+    stray restart-intents, failed CLI calls). Point it at the parent so the
+    CLI lands on the real config dir."""
+    env = os.environ.copy()
+    env["OPENCLAW_HOME"] = str(OPENCLAW_DIR.parent)
+    return env
+
+
 def _run_openclaw(*args: str, timeout: int = 60) -> dict:
     bin_path = _openclaw_binary()
     if not bin_path:
@@ -3284,6 +3296,7 @@ def _run_openclaw(*args: str, timeout: int = 60) -> dict:
             text=True,
             timeout=timeout,
             check=False,
+            env=_cli_env(),
         )
         result = {
             "ok": proc.returncode == 0,
@@ -3321,6 +3334,7 @@ def _spawn_openclaw_gateway(bin_path: str) -> dict:
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
+            env=_cli_env(),
         )
         return {"ok": True, "method": "spawn"}
     except Exception as e:  # noqa: BLE001
@@ -5700,7 +5714,7 @@ Env/overrides:
   TNODE_CHAT_SYNC_POLL_MS   Polling interval ms (default 500)
 """
 from __future__ import annotations
-__VERSION__ = "1.16.0"
+__VERSION__ = "1.16.1"
 
 import hashlib
 import hmac
@@ -6546,6 +6560,18 @@ def _read_gateway_token() -> str | None:
     return tok
 
 
+def _cli_env() -> dict:
+    """Env for spawning the `openclaw` CLI. The CLI treats OPENCLAW_HOME as the
+    PARENT of the config dir (it appends `.openclaw`), while this daemon uses
+    OPENCLAW_HOME as the config dir itself. Inheriting our value makes the CLI
+    resolve a doubled `.openclaw/.openclaw/` path (phantom device identities,
+    stray restart-intents, failed cron/CLI calls). Point it at the parent so
+    the CLI lands on the real config dir."""
+    env = os.environ.copy()
+    env["OPENCLAW_HOME"] = str(OPENCLAW_DIR.parent)
+    return env
+
+
 def _run_openclaw_cron(*args: str) -> tuple[int, str, str]:
     """Run `openclaw cron <args...>` and return (rc, stdout, stderr).
     Auto-injects `--token <gateway.auth.token>` so the CLI can connect
@@ -6563,6 +6589,7 @@ def _run_openclaw_cron(*args: str) -> tuple[int, str, str]:
             capture_output=True,
             text=True,
             timeout=30,
+            env=_cli_env(),
         )
         return result.returncode, result.stdout, result.stderr
     except FileNotFoundError:
@@ -6579,6 +6606,7 @@ def _run_openclaw_cron(*args: str) -> tuple[int, str, str]:
                         capture_output=True,
                         text=True,
                         timeout=30,
+                        env=_cli_env(),
                     )
                     return result.returncode, result.stdout, result.stderr
                 except Exception:  # noqa: BLE001
@@ -8355,7 +8383,7 @@ from __future__ import annotations
 #          previous default. Idempotent; no-op on un-prefixed slugs.
 # 1.8.14 — _agent_model_set merges into defaults.models instead of
 #          overwriting it (preserves multi-agent distinct picks).
-__VERSION__ = "1.15.0"
+__VERSION__ = "1.15.1"
 
 import argparse
 import asyncio
@@ -9753,6 +9781,18 @@ def _default_model_from_config(config: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _cli_env() -> dict:
+    """Env for spawning the `openclaw` CLI. The CLI treats OPENCLAW_HOME as the
+    PARENT of the config dir (it appends `.openclaw`), while this daemon uses
+    OPENCLAW_HOME as the config dir itself. Inheriting our value makes the CLI
+    resolve a doubled `.openclaw/.openclaw/` path (phantom identities, stray
+    restart-intents — this is what writes gateway-restart-intent.json to the
+    wrong place). Point it at the parent so the CLI lands on the real dir."""
+    env = os.environ.copy()
+    env["OPENCLAW_HOME"] = str(OPENCLAW_HOME.parent)
+    return env
+
+
 def _reload_gateway() -> bool:
     """Best-effort restart of openclaw-gateway. Tries `openclaw daemon
     restart` first (portable across home/VPS), falls back to systemctl.
@@ -9768,6 +9808,7 @@ def _reload_gateway() -> bool:
         try:
             result = subprocess.run(
                 cmd, check=False, capture_output=True, text=True, timeout=15,
+                env=_cli_env() if cmd[0] == "openclaw" else None,
             )
             if result.returncode == 0:
                 logger.info("gateway reload OK via %s", cmd[0])
