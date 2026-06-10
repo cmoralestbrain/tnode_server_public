@@ -5707,14 +5707,22 @@ Design notes:
 - Polling cadence: 500ms. Low CPU, good-enough latency for chat UX.
 - File tracking: (device, inode) -> byte offset. Handles rotation.
 
+Chat outbox (v1.17.0+): the app writes user messages to chats/ with
+delivery="pending"; when the direct WS path didn't deliver them, this
+daemon injects them into the local gateway (ephemeral WS, chat.send with
+the original idempotencyKey) and flips delivery="node". Firestore is the
+guaranteed messaging path; the direct WS is just the low-latency one.
+
 Env/overrides:
   TNODE_CHAT_SYNC_CONFIG    Path to config JSON (default ~/.openclaw/tnode-chat-sync.json)
   TNODE_CHAT_SYNC_SESSIONS  Sessions dir (default ~/.openclaw/agents/<agent>/sessions)
   TNODE_CHAT_SYNC_LOG       Log file (default ~/.openclaw/logs/tnode-chat-sync.log)
   TNODE_CHAT_SYNC_POLL_MS   Polling interval ms (default 500)
+  TNODE_CHAT_SYNC_OUTBOX_HOT_S / _OUTBOX_IDLE_S  Outbox poll cadence
+  TNODE_CHAT_SYNC_GATEWAY_WS  Gateway WS url (default ws://127.0.0.1:18789)
 """
 from __future__ import annotations
-__VERSION__ = "1.16.1"
+__VERSION__ = "1.17.0"
 
 import hashlib
 import hmac
@@ -5730,6 +5738,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 FIREBASE_API_KEY_URL = "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net"
@@ -7768,6 +7777,421 @@ def resolve_sessions_dir() -> Path:
     return agents_dir / "main" / "sessions"
 
 
+# ── Chat outbox consumer (v1.17.0+) ────────────────────────────
+# Firestore-first messaging: the mobile app writes every user message to
+# `users/{uid}/nodes/{nodeId}/chats/u_{idempotencyKey}` with
+# delivery="pending" and *also* tries the direct WS fast path (which on
+# success flips delivery="ws"). When the direct WS is down (tunnel QUIC
+# drop, gateway restart, iOS suspend) nobody delivers the message — this
+# consumer picks the stale pending docs up, injects them into the local
+# gateway over an ephemeral WebSocket, and flips delivery="node". The
+# gateway dedupes chat.send by idempotencyKey, so a message that raced
+# through both paths lands exactly once.
+
+try:
+    from websockets.sync.client import connect as _ws_connect  # type: ignore
+    _WS_OUTBOX_AVAILABLE = True
+except Exception:  # noqa: BLE001 — websockets missing or <13 (no sync API)
+    _WS_OUTBOX_AVAILABLE = False
+
+OUTBOX_POLL_HOT_S = float(os.environ.get("TNODE_CHAT_SYNC_OUTBOX_HOT_S", "2.5"))
+OUTBOX_POLL_IDLE_S = float(os.environ.get("TNODE_CHAT_SYNC_OUTBOX_IDLE_S", "10.0"))
+# Stay on the hot clock this long after seeing pendings; trajectory
+# activity (user is around) also bumps the window by OUTBOX_TAIL_HOT_S.
+OUTBOX_HOT_WINDOW_S = 300.0
+OUTBOX_TAIL_HOT_S = 60.0
+# Give the app's direct-WS fast path a head start before injecting —
+# avoids pointless double-sends when the WS is healthy.
+OUTBOX_MIN_AGE_S = 3.0
+OUTBOX_MAX_ATTEMPTS = 5
+GATEWAY_WS_URL = os.environ.get(
+    "TNODE_CHAT_SYNC_GATEWAY_WS", "ws://127.0.0.1:18789"
+)
+
+# Firestore REST returns RFC3339 with up to nanosecond fractions;
+# datetime.fromisoformat caps at microseconds — truncate before parsing.
+_ISO_FRAC_RE = re.compile(r"\.(\d{6})\d+")
+
+
+def _iso_to_epoch(s) -> float | None:
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        s2 = _ISO_FRAC_RE.sub(r".\1", s).replace("Z", "+00:00")
+        return datetime.fromisoformat(s2).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+class _GatewayDown(Exception):
+    """Local gateway unreachable / not answering — node-level problem,
+    abort the whole batch without burning per-doc attempts."""
+
+
+class _GatewayAuthFailed(Exception):
+    """Gateway rejected our connect handshake — config-level problem."""
+
+
+def query_pending_outbox(token: dict, project_id: str, limit: int = 10) -> list:
+    """Pending user messages (delivery=="pending") under this node's
+    chats/. Equality-only filters ride the automatic single-field
+    indexes — adding orderBy would require shipping a composite index,
+    so ordering by createdAt happens client-side instead."""
+    parent = (
+        f"projects/{project_id}/databases/(default)/documents"
+        f"/users/{token['uid']}/nodes/{token['nodeId']}"
+    )
+    url = f"https://firestore.googleapis.com/v1/{parent}:runQuery"
+    body = {
+        "structuredQuery": {
+            "from": [{"collectionId": "chats"}],
+            "where": {
+                "compositeFilter": {
+                    "op": "AND",
+                    "filters": [
+                        {
+                            "fieldFilter": {
+                                "field": {"fieldPath": "delivery"},
+                                "op": "EQUAL",
+                                "value": {"stringValue": "pending"},
+                            }
+                        },
+                        {
+                            "fieldFilter": {
+                                "field": {"fieldPath": "role"},
+                                "op": "EQUAL",
+                                "value": {"stringValue": "user"},
+                            }
+                        },
+                    ],
+                }
+            },
+            "limit": limit,
+        }
+    }
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    raw = _http_post_json_authed(url, body, headers, timeout=20)
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        doc = item.get("document") if isinstance(item, dict) else None
+        if not doc:
+            continue
+        name = doc.get("name", "")
+        doc_id = name.rsplit("/", 1)[-1] if name else ""
+        if not doc_id:
+            continue
+        out.append({"id": doc_id, "fields": doc.get("fields", {})})
+    return out
+
+
+def update_chat_outbox_doc(
+    token: dict, project_id: str, message_id: str, fields: dict, mask: list
+) -> bool:
+    """PATCH delivery-tracking fields on a chats/ doc. The
+    `currentDocument.exists=true` precondition keeps a PATCH racing a
+    user delete from resurrecting the doc as a delivery-fields-only
+    husk. Returns False (swallowed) when the doc is gone."""
+    parent = (
+        f"users/{token['uid']}/nodes/{token['nodeId']}/chats/{message_id}"
+    )
+    mask_q = "&".join(f"updateMask.fieldPaths={k}" for k in mask)
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{project_id}"
+        f"/databases/(default)/documents/{parent}"
+        f"?{mask_q}&currentDocument.exists=true"
+    )
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    try:
+        _http_patch_json(url, {"fields": fields}, headers)
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 404, 409):
+            return False  # doc deleted underneath us — fine
+        raise
+
+
+def _now_ts_value() -> dict:
+    return {
+        "timestampValue": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+        )
+    }
+
+
+def _gateway_send_pending(items: list) -> tuple[list, str | None]:
+    """Inject pending user messages into the local gateway over one
+    ephemeral WS connection (challenge → connect → chat.send per item).
+
+    items: [{id, sessionKey, content, idempotencyKey}, ...] in send order.
+    Returns (results, abort_reason) where results is a list of
+    (doc_id, ok, err) for items that got a definitive answer; items not
+    in results were never attempted (connection died mid-batch —
+    abort_reason says why) and keep their pending state untouched.
+    Raises _GatewayDown / _GatewayAuthFailed when nothing was attempted.
+    """
+    gw_token = _read_gateway_token()
+    if not gw_token:
+        raise _GatewayAuthFailed("no gateway.auth.token in openclaw.json")
+
+    deadline = time.time() + 15.0 + 5.0 * len(items)
+
+    def _recv_json(conn):
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise TimeoutError("deadline exceeded")
+        raw = conn.recv(timeout=remaining)
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        conn = _ws_connect(GATEWAY_WS_URL, open_timeout=5, close_timeout=2)
+    except Exception as e:  # noqa: BLE001
+        raise _GatewayDown(str(e) or type(e).__name__)
+
+    results: list = []
+    try:
+        # 1) Wait for the connect.challenge event. The nonce is only
+        # needed for device-identity signatures, which backend clients
+        # authenticating with the master gateway token don't send.
+        while True:
+            try:
+                frame = _recv_json(conn)
+            except TimeoutError:
+                raise _GatewayDown("timeout waiting for connect.challenge")
+            except Exception as e:  # noqa: BLE001
+                raise _GatewayDown(f"recv during handshake: {e}")
+            if (
+                isinstance(frame, dict)
+                and frame.get("type") == "event"
+                and frame.get("event") == "connect.challenge"
+            ):
+                break
+
+        # 2) connect req — token-only backend client (same trust as the
+        # `openclaw cron` CLI calls this daemon already makes).
+        connect_id = py_secrets.token_hex(8)
+        conn.send(json.dumps({
+            "type": "req",
+            "id": connect_id,
+            "method": "connect",
+            "params": {
+                "minProtocol": 4,
+                "maxProtocol": 4,
+                "client": {
+                    "id": "gateway-client",
+                    "displayName": "tnode-chat-sync",
+                    "version": __VERSION__,
+                    "platform": sys.platform,
+                    "mode": "backend",
+                },
+                "auth": {"token": gw_token},
+                "role": "operator",
+                "scopes": ["operator.read", "operator.write"],
+                "caps": [],
+            },
+        }))
+        while True:
+            try:
+                frame = _recv_json(conn)
+            except TimeoutError:
+                raise _GatewayDown("timeout waiting for connect res")
+            except Exception as e:  # noqa: BLE001
+                raise _GatewayDown(f"recv during handshake: {e}")
+            if (
+                isinstance(frame, dict)
+                and frame.get("type") == "res"
+                and frame.get("id") == connect_id
+            ):
+                if not frame.get("ok"):
+                    err = frame.get("error") or {}
+                    raise _GatewayAuthFailed(
+                        f"{err.get('code')}: {err.get('message')}"
+                    )
+                break
+
+        # 3) chat.send per item, awaiting each res to preserve order.
+        for it in items:
+            send_id = py_secrets.token_hex(8)
+            try:
+                conn.send(json.dumps({
+                    "type": "req",
+                    "id": send_id,
+                    "method": "chat.send",
+                    "params": {
+                        "sessionKey": it["sessionKey"],
+                        "message": it["content"],
+                        "idempotencyKey": it["idempotencyKey"],
+                    },
+                }))
+            except Exception as e:  # noqa: BLE001
+                return results, f"send: {e}"
+            while True:
+                try:
+                    frame = _recv_json(conn)
+                except TimeoutError:
+                    return results, "timeout waiting for chat.send res"
+                except Exception as e:  # noqa: BLE001
+                    return results, f"recv: {e}"
+                if (
+                    isinstance(frame, dict)
+                    and frame.get("type") == "res"
+                    and frame.get("id") == send_id
+                ):
+                    if frame.get("ok"):
+                        results.append((it["id"], True, ""))
+                    else:
+                        err = frame.get("error") or {}
+                        results.append((
+                            it["id"],
+                            False,
+                            f"{err.get('code')}: {err.get('message')}",
+                        ))
+                    break
+        return results, None
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def process_outbox(token: dict, project_id: str, state: dict) -> bool:
+    """One outbox sweep: query pendings, inject eligible ones, flip
+    delivery. Returns True when pendings were seen (feeds hot mode)."""
+    if not _WS_OUTBOX_AVAILABLE:
+        if not state.get("warned_no_ws"):
+            state["warned_no_ws"] = True
+            _log("outbox: websockets>=13 not importable — consumer disabled")
+        return False
+
+    docs = query_pending_outbox(token, project_id)
+    if not docs:
+        return False
+
+    now = time.time()
+    items = []
+    for d in docs:
+        f = d.get("fields", {})
+        created = _iso_to_epoch(_fs_field_to_python(f.get("createdAt")))
+        attempts = _fs_field_to_python(f.get("deliveryAttempts")) or 0
+        last_attempt = _iso_to_epoch(
+            _fs_field_to_python(f.get("lastDeliveryAttemptAt"))
+        )
+        # Client clock ahead of ours — treat as brand new, wait it out.
+        if created is not None and created > now:
+            continue
+        if created is not None and (now - created) < OUTBOX_MIN_AGE_S:
+            continue
+        if attempts > 0 and last_attempt is not None:
+            wait = min(600.0, 30.0 * (2 ** max(0, attempts - 1)))
+            if (now - last_attempt) < wait:
+                continue
+        items.append({
+            "id": d["id"],
+            "content": _fs_field_to_python(f.get("content")) or "",
+            "sessionKey": _fs_field_to_python(f.get("sessionKey")) or "",
+            "idempotencyKey": (
+                _fs_field_to_python(f.get("idempotencyKey"))
+                or (d["id"][2:] if d["id"].startswith("u_") else d["id"])
+            ),
+            "created": created or 0.0,
+            "attempts": int(attempts),
+        })
+
+    if not items:
+        return True  # pendings exist but are cooling down — stay hot
+
+    items.sort(key=lambda x: x["created"])
+
+    # Docs a client can't deliver land in failed immediately.
+    sendable = []
+    for it in items:
+        if not it["sessionKey"]:
+            _log(f"outbox: {it['id']} missing sessionKey — marking failed")
+            update_chat_outbox_doc(
+                token, project_id, it["id"],
+                fields={
+                    "delivery": {"stringValue": "failed"},
+                    "deliveryError": {"stringValue": "missing sessionKey"},
+                    "updatedAt": _now_ts_value(),
+                },
+                mask=["delivery", "deliveryError", "updatedAt"],
+            )
+        else:
+            sendable.append(it)
+    if not sendable:
+        return True
+
+    try:
+        results, abort_reason = _gateway_send_pending(sendable)
+    except _GatewayDown as e:
+        if (now - state.get("last_gwdown_warn", 0.0)) > 60:
+            state["last_gwdown_warn"] = now
+            _log(f"outbox: gateway unreachable ({e}) — batch deferred")
+        return True
+    except _GatewayAuthFailed as e:
+        if (now - state.get("last_auth_warn", 0.0)) > 60:
+            state["last_auth_warn"] = now
+            _log(f"outbox: gateway handshake rejected ({e})")
+        return True
+
+    by_id = {it["id"]: it for it in sendable}
+    delivered = 0
+    for doc_id, ok, err in results:
+        it = by_id.get(doc_id) or {"attempts": 0}
+        if ok:
+            delivered += 1
+            update_chat_outbox_doc(
+                token, project_id, doc_id,
+                fields={
+                    "delivery": {"stringValue": "node"},
+                    "updatedAt": _now_ts_value(),
+                },
+                mask=["delivery", "updatedAt"],
+            )
+        else:
+            n = int(it.get("attempts", 0)) + 1
+            if n >= OUTBOX_MAX_ATTEMPTS:
+                _log(f"outbox: {doc_id} failed permanently: {err}")
+                update_chat_outbox_doc(
+                    token, project_id, doc_id,
+                    fields={
+                        "delivery": {"stringValue": "failed"},
+                        "deliveryError": {"stringValue": (err or "")[:500]},
+                        "deliveryAttempts": {"integerValue": str(n)},
+                        "lastDeliveryAttemptAt": _now_ts_value(),
+                        "updatedAt": _now_ts_value(),
+                    },
+                    mask=[
+                        "delivery", "deliveryError", "deliveryAttempts",
+                        "lastDeliveryAttemptAt", "updatedAt",
+                    ],
+                )
+            else:
+                _log(f"outbox: {doc_id} attempt {n} failed: {err}")
+                update_chat_outbox_doc(
+                    token, project_id, doc_id,
+                    fields={
+                        "deliveryAttempts": {"integerValue": str(n)},
+                        "lastDeliveryAttemptAt": _now_ts_value(),
+                        "updatedAt": _now_ts_value(),
+                    },
+                    mask=[
+                        "deliveryAttempts", "lastDeliveryAttemptAt",
+                        "updatedAt",
+                    ],
+                )
+    if delivered:
+        _log(f"outbox: injected {delivered}/{len(sendable)} pending message(s)")
+    if abort_reason:
+        _log(f"outbox: batch aborted mid-way ({abort_reason}) — rest deferred")
+    return True
+
+
 # ── Main loop ──────────────────────────────────────────────────
 
 def main() -> int:
@@ -7916,6 +8340,11 @@ def main() -> int:
     last_tasks_mirror_check = 0.0
     last_task_command_check = 0.0
     last_media_sweep_check = 0.0
+    # Outbox consumer (v1.17.0): adaptive clock — hot after trajectory
+    # activity or recent pendings, idle otherwise.
+    last_outbox_check = 0.0
+    outbox_hot_until = 0.0
+    outbox_state: dict = {}
 
     while True:
         try:
@@ -7944,6 +8373,12 @@ def main() -> int:
                 backoff = 1.0
 
             for line in tailer.read_new_lines():
+                # Any trajectory activity means the user is around — keep
+                # the outbox poll on the hot clock so a WS-down message
+                # lands within a few seconds instead of the idle interval.
+                outbox_hot_until = max(
+                    outbox_hot_until, time.time() + OUTBOX_TAIL_HOT_S
+                )
                 entry = parse_line(line)
                 if entry is None:
                     continue
@@ -8114,6 +8549,27 @@ def main() -> int:
                 except urllib.error.HTTPError as e:
                     if e.code == 401:
                         _log("media sweep: idToken rejected — refreshing")
+                        token = None
+
+            # Chat outbox consumer (v1.17.0) — Firestore-first messaging.
+            # Picks up user messages the app wrote with delivery="pending"
+            # (direct WS down) and injects them into the local gateway.
+            outbox_interval = (
+                OUTBOX_POLL_HOT_S
+                if now_f < outbox_hot_until
+                else OUTBOX_POLL_IDLE_S
+            )
+            if (
+                token is not None
+                and (now_f - last_outbox_check) >= outbox_interval
+            ):
+                last_outbox_check = now_f
+                try:
+                    if process_outbox(token, project_id, outbox_state):
+                        outbox_hot_until = time.time() + OUTBOX_HOT_WINDOW_S
+                except urllib.error.HTTPError as e:
+                    if e.code == 401:
+                        _log("outbox poll: idToken rejected — refreshing")
                         token = None
 
             time.sleep(POLL_MS / 1000.0)
