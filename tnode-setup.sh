@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.34.0"
+TNODE_SETUP_VERSION="1.34.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -5732,7 +5732,7 @@ Env/overrides:
   TNODE_CHAT_SYNC_GATEWAY_WS  Gateway WS url (default ws://127.0.0.1:18789)
 """
 from __future__ import annotations
-__VERSION__ = "1.19.0"
+__VERSION__ = "1.19.1"
 
 import hashlib
 import hmac
@@ -7600,12 +7600,32 @@ def assistant_turn_from_trajectory(entry: dict):
     if not isinstance(texts, list):
         return None
     content = "\n".join(t for t in texts if isinstance(t, str)).strip()
-    if not content:
-        return None
-    if _is_silent_ack("assistant", content):
-        return None
     run_id = entry.get("runId") or data.get("runId")
     ts_raw = entry.get("ts") or entry.get("timestamp") or data.get("ts")
+    session_key = entry.get("sessionKey")
+    channel = _derive_originating_channel(session_key)
+    if not content or _is_silent_ack("assistant", content):
+        # App-originated sessions (owner outbox / shared-agent guest) have a
+        # client holding an "escribiendo…" indicator keyed off this turn.
+        # Dropping a NO_REPLY silently leaves it blinking forever (incident
+        # 2026-06-10: guest "hola" → model replied NO_REPLY → no doc → stuck
+        # bubble). Write an empty `noReply` closure doc so the client can
+        # settle. Channel sessions (telegram/whatsapp/cron/CLI) keep the old
+        # silent skip — nothing waits on a Firestore doc there.
+        if channel in ("tnode-mobile", "tnode-guest") and run_id:
+            return {
+                "role": "assistant",
+                "content": "",
+                "noReply": True,
+                "ts": ts_raw,
+                "turnId": run_id,
+                "idempotencyKey": run_id,
+                "entryId": None,
+                "originatingChannel": channel,
+                "sessionKey": session_key,
+                "targetUid": _guest_uid_from_session(session_key),
+            }
+        return None
     return {
         "role": "assistant",
         "content": content,
@@ -7617,9 +7637,11 @@ def assistant_turn_from_trajectory(entry: dict):
         # promised `a_{runId}` shape and weakening the dedup guarantee.
         "idempotencyKey": run_id,
         "entryId": None,  # no buffering needed — runId is already populated
-        "originatingChannel": _derive_originating_channel(entry.get("sessionKey")),
+        "originatingChannel": channel,
+        # Raw key so flush_turn can scope the mirror to app sessions only.
+        "sessionKey": session_key,
         # For a shared-agent guest, route the reply back to the guest's space.
-        "targetUid": _guest_uid_from_session(entry.get("sessionKey")),
+        "targetUid": _guest_uid_from_session(session_key),
     }
 
 
@@ -8442,6 +8464,20 @@ def main() -> int:
             body["turnId"] = t["turnId"]
         if t.get("originatingChannel"):
             body["originatingChannel"] = t["originatingChannel"]
+        if t.get("noReply"):
+            body["noReply"] = True
+        # Mirror scope (v1.19.1): the app thread carries the app's own
+        # conversations. Turns from channel sessions (telegram/whatsapp/
+        # webchat/CLI/cron) used to land in the owner's mobile thread too —
+        # reported as "broadcast" confusion on 2026-06-10 when a Telegram
+        # reply showed up in the app. Turns without a sessionKey (legacy
+        # OpenClaw ≤2026.4.x message path) keep flowing for compat.
+        sk = t.get("sessionKey")
+        if isinstance(sk, str) and (
+            "tnode-mobile-" not in sk and "tnode-guest-" not in sk
+        ):
+            _log(f"skip {mid}: channel session, not mirrored to app thread")
+            return
         # Shared-agent guests get their reply in their OWN space; everyone
         # else (owner / non-guest sessions) lands in the owner's space.
         # Privacy guard: if this is a guest session but we couldn't decode
