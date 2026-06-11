@@ -2776,6 +2776,21 @@ Env/overrides:
                            (used by the file-watcher trigger).
 """
 from __future__ import annotations
+# 1.15.0 — channels.email.link gmail/imap hardening (fire-tested on the Mini
+#          2026-06-11): (a) the branch now appends a `## Email del usuario —
+#          vía himalaya` section to workspace/SOUL.md so the on-node agent
+#          actually USES the linked account (before this, only the resend
+#          branch wrote agent guidance and agents kept routing mail through
+#          legacy skills); section is replace-on-relink (account changes) and
+#          removed on unlink — unlink now also removes the resend SOUL
+#          section (pre-existing gap). (b) _render_himalaya_toml maps
+#          port→encryption (465/993→tls, 587/143→start-tls): the client used
+#          to preload smtp 587 while the TOML hardcoded implicit tls and
+#          `message send` hung forever in the handshake. (c) himalaya is
+#          auto-installed on demand (macOS: brew; Linux: pinned v1.2.0
+#          release binary per-arch into ~/.local/bin) and the smoke test +
+#          SOUL section use the resolved absolute path (the gateway's PATH
+#          may not include /opt/homebrew/bin).
 # 1.11.0 — _apply_provider_to_openclaw seeds default media-generation models
 #          (image=gemini-3.1-flash-image-preview, music=lyria-3-clip-preview,
 #          video=grok-imagine-video) on first OpenRouter provision via
@@ -2835,18 +2850,21 @@ from __future__ import annotations
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.14.1"
+__VERSION__ = "1.15.0"
 
 import hashlib
 import hmac
 import json
 import os
+import platform
 import re
 import secrets as py_secrets
 import shutil
 import signal
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -4741,6 +4759,20 @@ def _parse_host_port(s: str, default_port: int) -> tuple[str, int]:
     return s, default_port
 
 
+def _encryption_for(kind: str, port: int) -> str:
+    """himalaya v1.2 `encryption.type` for a given port. Implicit TLS vs
+    STARTTLS must match the port or the handshake deadlocks: with
+    `tls` against smtp 587 the server waits for EHLO in the clear while
+    the client waits for a TLS hello — `message send` hangs forever
+    (fire-tested on the Mini 2026-06-11). Standard ports:
+      imap: 993 = implicit tls · 143 = start-tls
+      smtp: 465 = implicit tls · 587/25 = start-tls
+    Unknown ports default to implicit tls."""
+    if kind == "imap":
+        return "start-tls" if port == 143 else "tls"
+    return "start-tls" if port in (587, 25) else "tls"
+
+
 def _render_himalaya_toml(
     provider: str,
     address: str,
@@ -4753,6 +4785,8 @@ def _render_himalaya_toml(
     """Build a himalaya v1.2 TOML config for a single account. Both raw
     password fields hold the App Password (Gmail rejects plain passwords
     since 2022 — see feedback_imap_auth_failed_diagnosis)."""
+    imap_enc = _encryption_for("imap", imap_port)
+    smtp_enc = _encryption_for("smtp", smtp_port)
     return (
         "# Himalaya config — managed by tnode-config-sync; do not edit by hand.\n"
         "# Re-run channels.email.link to rotate credentials.\n"
@@ -4765,7 +4799,7 @@ def _render_himalaya_toml(
         f'backend.type = "imap"\n'
         f'backend.host = "{imap_host}"\n'
         f"backend.port = {imap_port}\n"
-        f'backend.encryption.type = "tls"\n'
+        f'backend.encryption.type = "{imap_enc}"\n'
         f'backend.login = "{address}"\n'
         f'backend.auth.type = "password"\n'
         f'backend.auth.raw = "{password}"\n'
@@ -4773,20 +4807,20 @@ def _render_himalaya_toml(
         f'message.send.backend.type = "smtp"\n'
         f'message.send.backend.host = "{smtp_host}"\n'
         f"message.send.backend.port = {smtp_port}\n"
-        f'message.send.backend.encryption.type = "tls"\n'
+        f'message.send.backend.encryption.type = "{smtp_enc}"\n'
         f'message.send.backend.login = "{address}"\n'
         f'message.send.backend.auth.type = "password"\n'
         f'message.send.backend.auth.raw = "{password}"\n'
     )
 
 
-def _himalaya_smoke_test() -> tuple[bool, str]:
+def _himalaya_smoke_test(himalaya_bin: str = "himalaya") -> tuple[bool, str]:
     """Run a 1-envelope INBOX list to confirm IMAP login works. Returns
     (ok, err_message) — `ok=False` means Gmail/IMAP rejected the
     credentials or himalaya is missing."""
     try:
         result = subprocess.run(
-            ["himalaya", "envelope", "list", "-f", "INBOX", "-p", "1", "-s", "1"],
+            [himalaya_bin, "envelope", "list", "-f", "INBOX", "-p", "1", "-s", "1"],
             capture_output=True,
             text=True,
             timeout=45,
@@ -4801,6 +4835,179 @@ def _himalaya_smoke_test() -> tuple[bool, str]:
         return False, "himalaya binary not found in PATH"
     except subprocess.TimeoutExpired:
         return False, "smoke test timed out (45s)"
+
+
+# Pinned to the release the TOML render + agent guidance were validated
+# against (Mini, 2026-06-11). Bump deliberately, re-running the fire test.
+_HIMALAYA_VERSION = "v1.2.0"
+
+
+def _ensure_himalaya_installed() -> tuple[str, str]:
+    """Resolve the himalaya binary, installing it on demand. Returns
+    `(abs_path, "")` on success or `("", err)`.
+
+    Installed lazily (not in tnode-setup) so only nodes that actually link
+    a Gmail/IMAP account pay the cost. macOS goes through brew; Linux
+    (Pi / VPS) downloads the pinned static musl build for the local arch
+    into ~/.local/bin — the daemon user can write there without sudo, and
+    callers always use the absolute path so the gateway's PATH is moot."""
+    found = shutil.which("himalaya")
+    if found:
+        return found, ""
+
+    if sys.platform == "darwin":
+        brew = shutil.which("brew") or next(
+            (
+                p
+                for p in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew")
+                if Path(p).exists()
+            ),
+            None,
+        )
+        if not brew:
+            return "", "himalaya_missing_and_no_brew"
+        try:
+            r = subprocess.run(
+                [brew, "install", "himalaya"],
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+        except subprocess.TimeoutExpired:
+            return "", "brew_install_timeout"
+        if r.returncode != 0:
+            return "", f"brew_install_failed: {(r.stderr or '')[-200:]}"
+        found = shutil.which("himalaya") or str(Path(brew).parent / "himalaya")
+        if Path(found).exists():
+            return found, ""
+        return "", "brew_install_no_binary"
+
+    # Linux: pinned per-arch static build from the GitHub release.
+    arch = platform.machine()
+    if arch not in ("x86_64", "aarch64", "armv7l", "armv6l", "i686"):
+        return "", f"unsupported_arch: {arch}"
+    url = (
+        "https://github.com/pimalaya/himalaya/releases/download/"
+        f"{_HIMALAYA_VERSION}/himalaya.{arch}-linux.tgz"
+    )
+    dest_dir = Path.home() / ".local" / "bin"
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory() as td:
+            tgz = Path(td) / "himalaya.tgz"
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "tnode-config-sync/himalaya-install"}
+            )
+            with urllib.request.urlopen(req, timeout=120) as r, open(
+                tgz, "wb"
+            ) as f:
+                shutil.copyfileobj(r, f)
+            with tarfile.open(tgz) as tf:
+                tf.extractall(td)
+            candidates = [p for p in Path(td).rglob("himalaya") if p.is_file()]
+            if not candidates:
+                return "", "tarball_no_binary"
+            dest = dest_dir / "himalaya"
+            shutil.copy2(candidates[0], dest)
+            os.chmod(dest, 0o755)
+        return str(dest), ""
+    except Exception as e:  # noqa: BLE001
+        return "", f"himalaya_download_failed: {str(e)[:200]}"
+
+
+# ── Agent guidance for the linked mailbox (SOUL section) ──────
+# Without this the agent never learns the account exists: fire-tested on
+# the Mini (2026-06-11), where legacy instructions kept routing mail to
+# other skills while himalaya sat configured and unused. Replace-on-relink
+# (the address may change), removed on unlink.
+
+_HIMALAYA_SOUL_MARKER = "## Email del usuario — vía himalaya"
+
+_HIMALAYA_SECTION_SOUL = """
+
+## Email del usuario — vía himalaya
+
+Este nodo tiene vinculada la cuenta de correo **{address}** (canal Email
+de la app TNode). La operas con el CLI himalaya — usa SIEMPRE el path
+completo `{himalaya_bin}`. Las credenciales viven en `~/.config/himalaya/`
+con permisos 600; nunca las menciones ni las pidas.
+
+1. ¿Te piden LEER o REVISAR la bandeja o un correo?
+
+```bash
+{himalaya_bin} envelope list -f INBOX -p 1 -s 10
+{himalaya_bin} message read <ID>
+```
+
+2. ¿Te piden MANDAR un correo? Avisa primero ("Voy a mandar el correo,
+   dame un momento...") y ejecuta con el mensaje raw:
+
+```bash
+{himalaya_bin} message send <<'MAIL'
+From: {address}
+To: destinatario@dominio.com
+Subject: Asunto
+
+Cuerpo del mensaje.
+MAIL
+```
+
+3. ¿Te piden RESPONDER un correo? Localiza el ID y el remitente con
+   `envelope list` / `message read`, y manda con `message send` usando
+   `Subject: Re: <asunto original>` y `To: <remitente>`.
+
+Mandar/leer correos cuando el usuario lo pide NO es una operación
+"sensible" ni de "infraestructura": es rutina de tu trabajo. Procede sin
+pedir permiso adicional.
+"""
+
+
+def _strip_soul_section(text: str, marker: str) -> str:
+    """Remove a `## …` section (marker line through the next `## ` heading
+    or EOF). No-op when the marker is absent."""
+    idx = text.find(marker)
+    if idx < 0:
+        return text
+    end = text.find("\n## ", idx + len(marker))
+    if end < 0:
+        return text[:idx].rstrip() + "\n"
+    return text[:idx].rstrip() + "\n\n" + text[end + len("\n") :]
+
+
+def _append_himalaya_soul_section(address: str, himalaya_bin: str) -> None:
+    """Idempotent upsert of the himalaya guidance into workspace/SOUL.md —
+    re-linking with a different account rewrites the section in place."""
+    soul = OPENCLAW_DIR / "workspace" / "SOUL.md"
+    if not soul.is_file():
+        return
+    try:
+        text = _strip_soul_section(
+            soul.read_text(encoding="utf-8"), _HIMALAYA_SOUL_MARKER
+        )
+        section = _HIMALAYA_SECTION_SOUL.format(
+            address=address, himalaya_bin=himalaya_bin
+        )
+        soul.write_text(text.rstrip() + section, encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        _log(f"_append_himalaya_soul_section: {e}")
+
+
+def _remove_email_soul_sections() -> None:
+    """Drop BOTH email guidance sections (himalaya + email-send) on unlink
+    so the agent stops believing it can mail after the channel is gone."""
+    soul = OPENCLAW_DIR / "workspace" / "SOUL.md"
+    if not soul.is_file():
+        return
+    try:
+        text = soul.read_text(encoding="utf-8")
+        for marker in (
+            _HIMALAYA_SOUL_MARKER,
+            "## Envío de correos — vía skill email-send",
+        ):
+            text = _strip_soul_section(text, marker)
+        soul.write_text(text, encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        _log(f"_remove_email_soul_sections: {e}")
 
 
 def _resend_smoke_test(api_key: str) -> tuple[bool, str]:
@@ -4958,6 +5165,13 @@ def handle_channels_email_link(token: dict, params: dict) -> dict:
             "result": {"error": "missing_imap_or_smtp_host"},
         }
 
+    himalaya_bin, ierr = _ensure_himalaya_installed()
+    if not himalaya_bin:
+        return {
+            "status": "error",
+            "result": {"error": "himalaya_not_available", "detail": ierr},
+        }
+
     try:
         _HIMALAYA_CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
         toml = _render_himalaya_toml(
@@ -4972,7 +5186,7 @@ def handle_channels_email_link(token: dict, params: dict) -> dict:
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "result": {"error": f"write_config: {e}"}}
 
-    ok, err = _himalaya_smoke_test()
+    ok, err = _himalaya_smoke_test(himalaya_bin)
     if not ok:
         # Roll back the half-written config so the next attempt starts
         # from a clean state. The state file isn't touched (still unlinked).
@@ -4985,6 +5199,10 @@ def handle_channels_email_link(token: dict, params: dict) -> dict:
             "result": {"error": "smoke_test_failed", "detail": err},
         }
 
+    # Teach the agent the mailbox exists — without this section it keeps
+    # routing mail through whatever legacy skill its workspace mentions.
+    _append_himalaya_soul_section(address, himalaya_bin)
+
     now_ms = int(time.time() * 1000)
     state = _read_channels_state()
     state["email"] = {
@@ -4995,7 +5213,10 @@ def handle_channels_email_link(token: dict, params: dict) -> dict:
         "lastSyncAt": now_ms,
     }
     _write_channels_state(state)
-    _log(f"channels.email.link ok provider={provider} address={address}")
+    _log(
+        f"channels.email.link ok provider={provider} address={address} "
+        f"bin={himalaya_bin}"
+    )
     return {
         "status": "done",
         "result": {
@@ -5021,6 +5242,9 @@ def handle_channels_email_unlink(token: dict, params: dict) -> dict:
             pass
         except Exception as e:  # noqa: BLE001
             _log(f"channels.email.unlink: rm {label}: {e}")
+    # Drop the agent guidance too — a stale section leaves the agent
+    # convinced it can still mail (and leaking the old address).
+    _remove_email_soul_sections()
     state = _read_channels_state()
     state["email"] = {"status": "unlinked"}
     _write_channels_state(state)
