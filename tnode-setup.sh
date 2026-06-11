@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.28.0"
+TNODE_SETUP_VERSION="1.34.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -5713,6 +5713,16 @@ daemon injects them into the local gateway (ephemeral WS, chat.send with
 the original idempotencyKey) and flips delivery="node". Firestore is the
 guaranteed messaging path; the direct WS is just the low-latency one.
 
+Shared-agent guests (v1.18.0+): other users can join this agent via an
+invite link (see architecture_shared_agent_links.md). A guest chats from
+their OWN space `users/<guestUid>/nodes/<nodeId>/chats` with a per-guest
+sessionKey `tnode-guest-<guestUid>__<uuid>`. The outbox consumer adds a
+collection-group sweep (nodeId==, delivery==pending, role==user) so a
+single query covers every guest, validates each message's owner against
+`nodeSyncRegistrations/<nodeId>/members/` (the authz source of truth), and
+routes the assistant reply back to the guest's space by reading the uid
+embedded in the sessionKey. The guest never pairs with the gateway.
+
 Env/overrides:
   TNODE_CHAT_SYNC_CONFIG    Path to config JSON (default ~/.openclaw/tnode-chat-sync.json)
   TNODE_CHAT_SYNC_SESSIONS  Sessions dir (default ~/.openclaw/agents/<agent>/sessions)
@@ -5722,7 +5732,7 @@ Env/overrides:
   TNODE_CHAT_SYNC_GATEWAY_WS  Gateway WS url (default ws://127.0.0.1:18789)
 """
 from __future__ import annotations
-__VERSION__ = "1.17.0"
+__VERSION__ = "1.19.0"
 
 import hashlib
 import hmac
@@ -5881,6 +5891,15 @@ def load_config() -> dict:
         if not cfg.get(k):
             raise RuntimeError(f"Config missing {k}")
     return cfg
+
+
+def _http_error_body(e: urllib.error.HTTPError) -> str:
+    """Best-effort error body for logs (e.g. mint 409 `not_paired` vs
+    `no_secret` — opaque "Conflict" cost us hours on 2026-06-10)."""
+    try:
+        return e.read().decode("utf-8", "replace")[:200]
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def mint_token(cfg: dict) -> dict:
@@ -7523,17 +7542,45 @@ def runid_from_custom(entry: dict):
 def _derive_originating_channel(session_key) -> str | None:
     """Map a gateway sessionKey to an `originatingChannel` tag (v1.12.0+).
 
-    The Flutter client always uses `sessionKey = "tnode-mobile-<uuid>"` when
-    issuing `chat.send`. The gateway prefixes it as
-    `"agent:<agentId>:tnode-mobile-<uuid>"` in trajectory events. We tag
-    those turns with `originatingChannel: "tnode-mobile"` so sub-agents and
-    historial conserven el origen del mensaje (vs WhatsApp, webchat, CLI).
+    The Flutter client uses `sessionKey = "tnode-mobile-<uuid>"` for the
+    owner and `"tnode-guest-<guestUid>__<uuid>"` for a shared-agent guest
+    (v1.18.0+). The gateway prefixes it as `"agent:<agentId>:<sessionKey>"`
+    in trajectory events. We tag turns so sub-agents and historial conserven
+    el origen del mensaje (owner vs invitado vs WhatsApp, webchat, CLI).
     """
     if not isinstance(session_key, str):
         return None
+    if "tnode-guest-" in session_key:
+        return "tnode-guest"
     if "tnode-mobile-" in session_key:
         return "tnode-mobile"
     return None
+
+
+def _is_guest_session(session_key) -> bool:
+    return isinstance(session_key, str) and "tnode-guest-" in session_key
+
+
+def _guest_uid_from_session(session_key) -> str | None:
+    """Extract the destination uid from a guest sessionKey of the form
+    `tnode-guest-<hex(uid)>__<uuid>` (possibly prefixed by the gateway as
+    `agent:<agentId>:`). Returns None for owner/non-guest sessions.
+
+    The uid is HEX-ENCODED because the gateway lowercases sessionKeys, which
+    would corrupt a raw Firebase uid (those are case-sensitive and mixed
+    case). Hex is all lowercase digits, so it survives the case-fold and
+    decodes back exactly. The `__` separator is unambiguous (neither hex nor
+    the uuid suffix contains a double underscore)."""
+    if not isinstance(session_key, str):
+        return None
+    m = re.search(r"tnode-guest-([0-9a-fA-F]+)__", session_key)
+    if not m:
+        return None
+    try:
+        uid = bytes.fromhex(m.group(1)).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return uid or None
 
 
 def assistant_turn_from_trajectory(entry: dict):
@@ -7571,6 +7618,8 @@ def assistant_turn_from_trajectory(entry: dict):
         "idempotencyKey": run_id,
         "entryId": None,  # no buffering needed — runId is already populated
         "originatingChannel": _derive_originating_channel(entry.get("sessionKey")),
+        # For a shared-agent guest, route the reply back to the guest's space.
+        "targetUid": _guest_uid_from_session(entry.get("sessionKey")),
     }
 
 
@@ -7654,6 +7703,7 @@ def media_turn_from_trajectory(entry: dict):
         "idempotencyKey": media_key,
         "entryId": None,
         "originatingChannel": _derive_originating_channel(entry.get("sessionKey")),
+        "targetUid": _guest_uid_from_session(entry.get("sessionKey")),
     }
 
 
@@ -7882,19 +7932,126 @@ def query_pending_outbox(token: dict, project_id: str, limit: int = 10) -> list:
         doc_id = name.rsplit("/", 1)[-1] if name else ""
         if not doc_id:
             continue
-        out.append({"id": doc_id, "fields": doc.get("fields", {})})
+        out.append({"id": doc_id, "uid": token["uid"], "fields": doc.get("fields", {})})
     return out
 
 
-def update_chat_outbox_doc(
-    token: dict, project_id: str, message_id: str, fields: dict, mask: list
-) -> bool:
-    """PATCH delivery-tracking fields on a chats/ doc. The
-    `currentDocument.exists=true` precondition keeps a PATCH racing a
-    user delete from resurrecting the doc as a delivery-fields-only
-    husk. Returns False (swallowed) when the doc is gone."""
+_CG_NAME_RE = re.compile(
+    r"/documents/users/([^/]+)/nodes/([^/]+)/chats/([^/]+)$"
+)
+
+
+def query_pending_outbox_cg(token: dict, project_id: str, limit: int = 20) -> list:
+    """Pending user messages across EVERY space for this node (owner + all
+    shared-agent guests) via one collection-group query on `chats`
+    (nodeId==, delivery==pending, role==user). The owning uid is parsed
+    from each doc's resource name. Requires the collection-group composite
+    index and the collection-group read rule (architecture §5.2).
+
+    Guest docs carry an explicit `nodeId` field (the client writes it from
+    v1.18+); legacy owner docs without it are still covered by the
+    space-scoped `query_pending_outbox`."""
+    parent = f"projects/{project_id}/databases/(default)/documents"
+    url = f"https://firestore.googleapis.com/v1/{parent}:runQuery"
+    body = {
+        "structuredQuery": {
+            "from": [{"collectionId": "chats", "allDescendants": True}],
+            "where": {
+                "compositeFilter": {
+                    "op": "AND",
+                    "filters": [
+                        {"fieldFilter": {
+                            "field": {"fieldPath": "nodeId"},
+                            "op": "EQUAL",
+                            "value": {"stringValue": token["nodeId"]},
+                        }},
+                        {"fieldFilter": {
+                            "field": {"fieldPath": "delivery"},
+                            "op": "EQUAL",
+                            "value": {"stringValue": "pending"},
+                        }},
+                        {"fieldFilter": {
+                            "field": {"fieldPath": "role"},
+                            "op": "EQUAL",
+                            "value": {"stringValue": "user"},
+                        }},
+                    ],
+                }
+            },
+            "limit": limit,
+        }
+    }
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    raw = _http_post_json_authed(url, body, headers, timeout=20)
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        doc = item.get("document") if isinstance(item, dict) else None
+        if not doc:
+            continue
+        m = _CG_NAME_RE.search(doc.get("name", ""))
+        if not m:
+            continue
+        uid, ndid, doc_id = m.group(1), m.group(2), m.group(3)
+        if ndid != token["nodeId"]:
+            continue
+        out.append({"id": doc_id, "uid": uid, "fields": doc.get("fields", {})})
+    return out
+
+
+def load_node_members(token: dict, project_id: str, state: dict) -> set:
+    """Set of guest uids allowed to chat with this node (members/ with
+    revoked==false). Cached 60s in `state` to keep the outbox sweep cheap.
+    On query failure, falls back to the last good cache (or empty)."""
+    now = time.time()
+    cached = state.get("_members_cache")
+    if cached and (now - cached[0]) < 60.0:
+        return cached[1]
     parent = (
-        f"users/{token['uid']}/nodes/{token['nodeId']}/chats/{message_id}"
+        f"projects/{project_id}/databases/(default)/documents"
+        f"/nodeSyncRegistrations/{token['nodeId']}"
+    )
+    url = f"https://firestore.googleapis.com/v1/{parent}:runQuery"
+    body = {
+        "structuredQuery": {
+            "from": [{"collectionId": "members"}],
+            "where": {"fieldFilter": {
+                "field": {"fieldPath": "revoked"},
+                "op": "EQUAL",
+                "value": {"booleanValue": False},
+            }},
+            "limit": 500,
+        }
+    }
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    uids: set = set()
+    try:
+        raw = _http_post_json_authed(url, body, headers, timeout=20)
+        for item in raw or []:
+            doc = item.get("document") if isinstance(item, dict) else None
+            if not doc:
+                continue
+            muid = doc.get("name", "").rsplit("/", 1)[-1]
+            if muid:
+                uids.add(muid)
+    except Exception as e:  # noqa: BLE001
+        _log(f"outbox: members query failed ({e}) — using cached/owner-only")
+        return cached[1] if cached else set()
+    state["_members_cache"] = (now, uids)
+    return uids
+
+
+def update_chat_outbox_doc(
+    token: dict, project_id: str, uid: str, message_id: str, fields: dict, mask: list
+) -> bool:
+    """PATCH delivery-tracking fields on a chats/ doc owned by `uid` (the
+    node owner, or a shared-agent guest). The `currentDocument.exists=true`
+    precondition keeps a PATCH racing a user delete from resurrecting the
+    doc as a delivery-fields-only husk. Returns False (swallowed) when the
+    doc is gone."""
+    parent = (
+        f"users/{uid}/nodes/{token['nodeId']}/chats/{message_id}"
     )
     mask_q = "&".join(f"updateMask.fieldPaths={k}" for k in mask)
     url = (
@@ -7907,8 +8064,12 @@ def update_chat_outbox_doc(
         _http_patch_json(url, {"fields": fields}, headers)
         return True
     except urllib.error.HTTPError as e:
-        if e.code in (400, 404, 409):
-            return False  # doc deleted underneath us — fine
+        # 400/404/409: doc deleted underneath us. 403: we can't write this
+        # space (e.g. a non-member's hand-crafted doc with no node doc to
+        # satisfy the rules' exists() guard) — swallow so one bad doc never
+        # crashes the sweep.
+        if e.code in (400, 403, 404, 409):
+            return False
         raise
 
 
@@ -8068,14 +8229,50 @@ def process_outbox(token: dict, project_id: str, state: dict) -> bool:
             _log("outbox: websockets>=13 not importable — consumer disabled")
         return False
 
-    docs = query_pending_outbox(token, project_id)
+    # Dual query: legacy space-scoped (owner — covers old docs without a
+    # nodeId field) + collection-group (owner's new docs + every guest).
+    # Dedup by (uid, doc_id) so an owner doc that satisfies both is sent once.
+    docs_by_key: dict[tuple, dict] = {}
+    try:
+        for d in query_pending_outbox(token, project_id):
+            docs_by_key[(d["uid"], d["id"])] = d
+    except Exception as e:  # noqa: BLE001
+        _log(f"outbox: owner query failed ({e})")
+    try:
+        for d in query_pending_outbox_cg(token, project_id):
+            docs_by_key[(d["uid"], d["id"])] = d
+    except Exception as e:  # noqa: BLE001
+        _log(f"outbox: collection-group query failed ({e})")
+    docs = list(docs_by_key.values())
     if not docs:
         return False
+
+    owner_uid = token["uid"]
+    members: set | None = None  # lazily loaded only if a guest doc appears
 
     now = time.time()
     items = []
     for d in docs:
+        uid = d.get("uid") or owner_uid
         f = d.get("fields", {})
+        # Authorize non-owner (guest) messages against members/ — the rule
+        # alone can't stop a user inventing nodeIds in their own space, so
+        # the real consume-gate lives here (architecture §8.2).
+        if uid != owner_uid:
+            if members is None:
+                members = load_node_members(token, project_id, state)
+            if uid not in members:
+                _log(f"outbox: {d['id']} from non-member {uid[:8]} — failed")
+                update_chat_outbox_doc(
+                    token, project_id, uid, d["id"],
+                    fields={
+                        "delivery": {"stringValue": "failed"},
+                        "deliveryError": {"stringValue": "not_a_member"},
+                        "updatedAt": _now_ts_value(),
+                    },
+                    mask=["delivery", "deliveryError", "updatedAt"],
+                )
+                continue
         created = _iso_to_epoch(_fs_field_to_python(f.get("createdAt")))
         attempts = _fs_field_to_python(f.get("deliveryAttempts")) or 0
         last_attempt = _iso_to_epoch(
@@ -8092,6 +8289,7 @@ def process_outbox(token: dict, project_id: str, state: dict) -> bool:
                 continue
         items.append({
             "id": d["id"],
+            "uid": uid,
             "content": _fs_field_to_python(f.get("content")) or "",
             "sessionKey": _fs_field_to_python(f.get("sessionKey")) or "",
             "idempotencyKey": (
@@ -8113,7 +8311,7 @@ def process_outbox(token: dict, project_id: str, state: dict) -> bool:
         if not it["sessionKey"]:
             _log(f"outbox: {it['id']} missing sessionKey — marking failed")
             update_chat_outbox_doc(
-                token, project_id, it["id"],
+                token, project_id, it["uid"], it["id"],
                 fields={
                     "delivery": {"stringValue": "failed"},
                     "deliveryError": {"stringValue": "missing sessionKey"},
@@ -8142,11 +8340,12 @@ def process_outbox(token: dict, project_id: str, state: dict) -> bool:
     by_id = {it["id"]: it for it in sendable}
     delivered = 0
     for doc_id, ok, err in results:
-        it = by_id.get(doc_id) or {"attempts": 0}
+        it = by_id.get(doc_id) or {"attempts": 0, "uid": owner_uid}
+        uid = it.get("uid", owner_uid)
         if ok:
             delivered += 1
             update_chat_outbox_doc(
-                token, project_id, doc_id,
+                token, project_id, uid, doc_id,
                 fields={
                     "delivery": {"stringValue": "node"},
                     "updatedAt": _now_ts_value(),
@@ -8158,7 +8357,7 @@ def process_outbox(token: dict, project_id: str, state: dict) -> bool:
             if n >= OUTBOX_MAX_ATTEMPTS:
                 _log(f"outbox: {doc_id} failed permanently: {err}")
                 update_chat_outbox_doc(
-                    token, project_id, doc_id,
+                    token, project_id, uid, doc_id,
                     fields={
                         "delivery": {"stringValue": "failed"},
                         "deliveryError": {"stringValue": (err or "")[:500]},
@@ -8174,7 +8373,7 @@ def process_outbox(token: dict, project_id: str, state: dict) -> bool:
             else:
                 _log(f"outbox: {doc_id} attempt {n} failed: {err}")
                 update_chat_outbox_doc(
-                    token, project_id, doc_id,
+                    token, project_id, uid, doc_id,
                     fields={
                         "deliveryAttempts": {"integerValue": str(n)},
                         "lastDeliveryAttemptAt": _now_ts_value(),
@@ -8243,16 +8442,28 @@ def main() -> int:
             body["turnId"] = t["turnId"]
         if t.get("originatingChannel"):
             body["originatingChannel"] = t["originatingChannel"]
+        # Shared-agent guests get their reply in their OWN space; everyone
+        # else (owner / non-guest sessions) lands in the owner's space.
+        # Privacy guard: if this is a guest session but we couldn't decode
+        # the target uid, DROP the write — never fall back to the owner's
+        # space (that would leak a guest's conversation to the owner).
+        if t.get("originatingChannel") == "tnode-guest" and not t.get("targetUid"):
+            _log(f"skip {mid}: guest session, undecodable target uid")
+            return
+        dest_uid = t.get("targetUid") or token["uid"]
         try:
             write_message(
                 token,
                 project_id,
-                token["uid"],
+                dest_uid,
                 token["nodeId"],
                 mid,
                 body,
             )
-            _log(f"wrote {mid} (runId={t.get('turnId') or 'hash'})")
+            _log(
+                f"wrote {mid} (runId={t.get('turnId') or 'hash'})"
+                + (f" → guest {dest_uid[:8]}" if t.get("targetUid") else "")
+            )
         except urllib.error.HTTPError as e:
             if e.code == 401:
                 _log("idToken expired mid-write — refreshing")
@@ -8327,6 +8538,14 @@ def main() -> int:
     # endpoint if rotation itself is failing.
     REREGISTER_COOLDOWN_S = 300
     last_reregister_attempt = 0.0
+    # Proactive token renewal (v1.19.0): start renewing this far before
+    # expiry. A renewal failure must NOT freeze the loop while the current
+    # token is still valid — incident 2026-06-10: mint 409 `not_paired`
+    # (registration re-created unclaimed) put the whole loop in a 60s
+    # error/backoff cycle for 2h42m, freezing outbox + watcher.
+    TOKEN_RENEW_AHEAD_S = 300
+    MINT_RETRY_COOLDOWN_S = 30
+    last_mint_attempt = 0.0
 
     # Cadence for chat-attachment polling. Runs alongside the JSONL tail
     # loop but at a slower clock so we don't pound Firestore — 2s feels
@@ -8350,6 +8569,8 @@ def main() -> int:
         try:
             now = int(time.time())
             if token is None or now >= token["expiresAt"]:
+                # No usable token — nothing can be written until mint works.
+                last_mint_attempt = now
                 try:
                     token = mint_token(cfg)
                 except urllib.error.HTTPError as e:
@@ -8368,9 +8589,43 @@ def main() -> int:
                             continue
                         except Exception as re:  # noqa: BLE001
                             _log(f"re-register failed: {re}")
+                    _log(f"mintNodeToken failed: {e.code} {_http_error_body(e)}")
                     raise
                 _log(f"minted token for uid={token['uid']} node={token['nodeId']}")
                 backoff = 1.0
+            elif (
+                (token["expiresAt"] - now) <= TOKEN_RENEW_AHEAD_S
+                and (now - last_mint_attempt) >= MINT_RETRY_COOLDOWN_S
+            ):
+                # Proactive renewal — the current token is still valid, so a
+                # failure here only logs and retries on cooldown; the loop
+                # (tailer, outbox, flips) keeps running on the old token.
+                last_mint_attempt = now
+                try:
+                    token = mint_token(cfg)
+                    _log(
+                        f"token renewed for uid={token['uid']} "
+                        f"node={token['nodeId']}"
+                    )
+                except urllib.error.HTTPError as e:
+                    if e.code == 404 and (now - last_reregister_attempt) >= REREGISTER_COOLDOWN_S:
+                        last_reregister_attempt = now
+                        try:
+                            new_secret = reregister_with_server(cfg)
+                            persist_node_secret(cfg, new_secret)
+                            cfg["nodeSecret"] = new_secret
+                            _log(
+                                "re-registered ok (proactive renewal) — "
+                                "new nodeSecret persisted"
+                            )
+                        except Exception as re:  # noqa: BLE001
+                            _log(f"re-register failed: {re}")
+                    _log(
+                        f"token renewal failed ({e.code} {_http_error_body(e)}) "
+                        "— keeping current token, will retry"
+                    )
+                except Exception as re:  # noqa: BLE001
+                    _log(f"token renewal failed: {re} — keeping current token")
 
             for line in tailer.read_new_lines():
                 # Any trajectory activity means the user is around — keep
