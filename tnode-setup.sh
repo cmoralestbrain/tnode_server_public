@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.36.0"
+TNODE_SETUP_VERSION="1.36.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -2776,6 +2776,14 @@ Env/overrides:
                            (used by the file-watcher trigger).
 """
 from __future__ import annotations
+# 1.16.1 — _render_himalaya_toml: message.send.save-copy = false. The
+#          post-SMTP IMAP APPEND targeted himalaya's literal "Sent"
+#          folder, which doesn't exist on Gmail → exit 1 on every send
+#          even though the mail DID go out; agents read the non-zero
+#          exit as a failed send and fell back to stale paths. Gmail/
+#          Outlook/Yahoo auto-save SMTP mail to their sent folder, so
+#          the copy was redundant anyway. Root-cause of the "envío no
+#          funciona" report on the Mini 2026-06-12.
 # 1.16.0 — workspace skills agenda + drive ship inside the daemon: the
 #          startup self-heal now materializes both skills under
 #          workspace/skills/ (byte-canonical via _ensure_workspace_skills;
@@ -2861,7 +2869,7 @@ from __future__ import annotations
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.16.0"
+__VERSION__ = "1.16.1"
 
 import hashlib
 import hmac
@@ -5550,6 +5558,15 @@ def _render_himalaya_toml(
         f'message.send.backend.login = "{address}"\n'
         f'message.send.backend.auth.type = "password"\n'
         f'message.send.backend.auth.raw = "{password}"\n'
+        f"\n"
+        f"# No IMAP-APPEND a copy to the sent folder after SMTP submit.\n"
+        f"# himalaya's default folder is the literal \"Sent\", which does\n"
+        f"# not exist on Gmail ([Gmail]/Sent Mail) → the send exits 1 even\n"
+        f"# though the mail went out, and the agent treats it as a failure\n"
+        f"# (fire-tested on the Mini 2026-06-12). Gmail/Outlook/Yahoo all\n"
+        f"# auto-save SMTP-submitted mail to their sent folder anyway, so\n"
+        f"# the copy would be a duplicate.\n"
+        f"message.send.save-copy = false\n"
     )
 
 
