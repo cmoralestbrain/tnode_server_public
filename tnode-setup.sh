@@ -6714,7 +6714,7 @@ Env/overrides:
   TNODE_CHAT_SYNC_GATEWAY_WS  Gateway WS url (default ws://127.0.0.1:18789)
 """
 from __future__ import annotations
-__VERSION__ = "1.19.1"
+__VERSION__ = "1.19.2"
 
 import hashlib
 import hmac
@@ -7393,7 +7393,8 @@ def _hmac_signature(node_secret: str, signing_string: str) -> str:
 
 
 def _prepare_assistant_file(
-    cfg: dict, file_path: Path, sha: str, size: int, mime: str
+    cfg: dict, file_path: Path, sha: str, size: int, mime: str,
+    target_uid: str | None = None,
 ) -> dict | None:
     """POST /prepareAssistantFile. Returns response dict or None on error.
     Allowed errors get logged but don't crash the watcher — the marker is
@@ -7413,6 +7414,9 @@ def _prepare_assistant_file(
         "sizeBytes": size,
         "sha256": sha,
     }
+    # Shared-agent guest: land the assistantFiles doc in the guest's space.
+    if target_uid:
+        body["targetUid"] = target_uid
     try:
         return _http_post_json(PREPARE_ASSISTANT_FILE_URL, body)
     except urllib.error.HTTPError as e:
@@ -7441,7 +7445,9 @@ def _put_file_to_signed_url(url: str, file_path: Path, mime: str) -> bool:
         return False
 
 
-def _confirm_assistant_file(cfg: dict, attachment_id: str) -> bool:
+def _confirm_assistant_file(
+    cfg: dict, attachment_id: str, target_uid: str | None = None
+) -> bool:
     node_id = cfg["nodeId"]
     node_secret = cfg["nodeSecret"]
     ts = str(int(time.time() * 1000))
@@ -7454,6 +7460,8 @@ def _confirm_assistant_file(cfg: dict, attachment_id: str) -> bool:
         "signature": _hmac_signature(node_secret, signing),
         "attachmentId": attachment_id,
     }
+    if target_uid:
+        body["targetUid"] = target_uid
     try:
         _http_post_json(CONFIRM_ASSISTANT_FILE_URL, body)
         return True
@@ -7462,7 +7470,9 @@ def _confirm_assistant_file(cfg: dict, attachment_id: str) -> bool:
         return False
 
 
-def _process_one_marker(cfg: dict, raw_path: str) -> str | None:
+def _process_one_marker(
+    cfg: dict, raw_path: str, target_uid: str | None = None
+) -> str | None:
     """Resolve + upload + confirm. Returns attachmentId on success, None on
     any failure (caller leaves the marker untouched or rewrites it as
     `[adjunto-error:...]`)."""
@@ -7487,7 +7497,7 @@ def _process_one_marker(cfg: dict, raw_path: str) -> str | None:
         _log(f"adjunto: sha256 failed for {resolved}: {e}")
         return None
     mime = _guess_mime(resolved)
-    prep = _prepare_assistant_file(cfg, resolved, sha, size, mime)
+    prep = _prepare_assistant_file(cfg, resolved, sha, size, mime, target_uid)
     if prep is None:
         return None
     attachment_id = prep.get("attachmentId")
@@ -7498,7 +7508,7 @@ def _process_one_marker(cfg: dict, raw_path: str) -> str | None:
     if not _put_file_to_signed_url(upload_url, resolved, mime):
         _log(f"adjunto: PUT failed for {resolved}")
         return None
-    if not _confirm_assistant_file(cfg, attachment_id):
+    if not _confirm_assistant_file(cfg, attachment_id, target_uid):
         # Doc is in `preparing` state — cleanup will reap after TTL. Still
         # not safe to rewrite the marker because the client needs `uploaded`
         # to render.
@@ -7507,10 +7517,15 @@ def _process_one_marker(cfg: dict, raw_path: str) -> str | None:
     return attachment_id
 
 
-def process_assistant_file_markers(cfg: dict, content: str) -> str:
+def process_assistant_file_markers(
+    cfg: dict, content: str, target_uid: str | None = None
+) -> str:
     """Walk every `[adjunto: <path>]` in content, upload each, rewrite to
     `[archivo:{id}]`. On failure, the marker becomes `[adjunto-error: ...]`
     so the user sees why their file didn't come through.
+
+    `target_uid` (shared-agent guest) routes the uploaded file's assistantFiles
+    doc into the guest's space so their app can resolve `[archivo:id]`.
 
     Idempotent: an already-rewritten `[archivo:{id}]` won't match the
     regex and stays as-is, so retries of the same trajectory entry don't
@@ -7518,7 +7533,7 @@ def process_assistant_file_markers(cfg: dict, content: str) -> str:
 
     def replace(m: re.Match) -> str:
         raw_path = m.group(1).strip()
-        attachment_id = _process_one_marker(cfg, raw_path)
+        attachment_id = _process_one_marker(cfg, raw_path, target_uid)
         if attachment_id:
             return f"[archivo:{attachment_id}]"
         return "[adjunto-error: no se pudo subir el archivo]"
@@ -8565,6 +8580,56 @@ def _guest_uid_from_session(session_key) -> str | None:
     return uid or None
 
 
+def _session_key_for_media_file(filename: str) -> str | None:
+    """Best-effort: find which session generated a tool media file by scanning
+    the most recently active agent trajectories for the filename, returning
+    that entry's sessionKey. Lets the orphan media sweep route guest-generated
+    media back to the guest's space instead of defaulting to the owner
+    (HOTFIX 2026-06-13 — shared-agent guest media leaked to owner)."""
+    try:
+        traj = sorted(
+            (OPENCLAW_DIR / "agents").glob("*/sessions/*.trajectory.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[:8]
+    except OSError:
+        return None
+    for tf in traj:
+        try:
+            with open(tf, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if filename not in line:
+                        continue
+                    try:
+                        sk = json.loads(line).get("sessionKey")
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if isinstance(sk, str) and sk:
+                        return sk
+        except OSError:
+            continue
+    return None
+
+
+def _strip_media_directives(text: str) -> str:
+    """Drop standalone `MEDIA:<path>` directive lines from mirrored text.
+
+    OpenClaw's media protocol has the agent emit `MEDIA:<abs-path>` so a
+    channel adapter sends the file and strips the line (WhatsApp/Telegram do
+    this). On tnode-mobile the file is delivered out-of-band by the orphan
+    media sweep / `[adjunto:]` bridge, so the raw directive must not survive
+    into the chat text — it surfaced as a literal
+    `MEDIA:/home/tnode/...png` bubble under the generated image
+    (shared-agent E2E, 2026-06-13). Inline prose that merely mentions
+    "MEDIA:" is preserved; only lines that START with the directive go."""
+    if "MEDIA:" not in text:
+        return text
+    kept = [
+        ln for ln in text.splitlines() if not ln.lstrip().startswith("MEDIA:")
+    ]
+    return "\n".join(kept).strip()
+
+
 def assistant_turn_from_trajectory(entry: dict):
     """Return a normalized assistant turn from an OpenClaw v2026.5.x
     `type:"model.completed"` trajectory event, or None if `entry` is not
@@ -8582,6 +8647,7 @@ def assistant_turn_from_trajectory(entry: dict):
     if not isinstance(texts, list):
         return None
     content = "\n".join(t for t in texts if isinstance(t, str)).strip()
+    content = _strip_media_directives(content)
     run_id = entry.get("runId") or data.get("runId")
     ts_raw = entry.get("ts") or entry.get("timestamp") or data.get("ts")
     session_key = entry.get("sessionKey")
@@ -9432,7 +9498,9 @@ def main() -> int:
         # avoids regex compilation when the agent didn't attach anything).
         content = t["content"]
         if "[adjunto:" in content:
-            content = process_assistant_file_markers(cfg, content)
+            content = process_assistant_file_markers(
+                cfg, content, t.get("targetUid")
+            )
         body = {
             "id": mid,
             "role": t["role"],
@@ -9541,14 +9609,31 @@ def main() -> int:
                 ts_iso = time.strftime(
                     "%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime)
                 )
-                _log(f"media-sweep: bridging orphan {src.name} (age={int(age)}s)")
+                # HOTFIX 2026-06-13: route guest-generated media to the guest,
+                # not the owner. The wake/`message`-tool delivery fails on
+                # app/guest sessions, so this orphan sweep is the only path —
+                # but it used to hardcode `tnode-mobile` (owner) with no
+                # targetUid, leaking guest media into the owner's chat. Now we
+                # correlate the file with its originating session via the
+                # trajectory and set the real channel/targetUid. Unknown →
+                # owner (legacy fallback); guest-but-undecodable → the flush
+                # privacy guard drops it (never leaks to owner).
+                sk = _session_key_for_media_file(src.name)
+                channel = _derive_originating_channel(sk) or "tnode-mobile"
+                target_uid = _guest_uid_from_session(sk)
+                _log(
+                    f"media-sweep: bridging orphan {src.name} (age={int(age)}s) "
+                    f"channel={channel} guest={'y' if target_uid else 'n'}"
+                )
                 flush_turn({
                     "role": "assistant",
                     "content": f"[adjunto: {rel}]",
                     "ts": ts_iso,
                     "turnId": None,
                     "idempotencyKey": f"genmedia_{key}:media",
-                    "originatingChannel": "tnode-mobile",
+                    "originatingChannel": channel,
+                    "sessionKey": sk,
+                    "targetUid": target_uid,
                 })
 
     # When `mintNodeToken` keeps returning 404 (server-side registration doc
