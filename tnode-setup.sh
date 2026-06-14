@@ -2879,7 +2879,7 @@ from __future__ import annotations
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.17.0"
+__VERSION__ = "1.18.0"
 
 import hashlib
 import hmac
@@ -5350,7 +5350,7 @@ def _ensure_tools_rules() -> None:
     p = OPENCLAW_DIR / "workspace" / "TOOLS.md"
     try:
         existed = p.is_file()
-        text = p.read_text(encoding="utf-8") if existed else "# TOOLS\n"
+        text = p.read_text(encoding="utf-8") if existed else _tools_golden_base()
         out = text
         for marker, section in _TOOLS_RULES:
             if marker not in out:
@@ -5360,6 +5360,120 @@ def _ensure_tools_rules() -> None:
             p.write_text(out, encoding="utf-8")
     except Exception as e:  # noqa: BLE001
         _log(f"_ensure_tools_rules: {e}")
+
+
+# ── TOOLS.md renderer (zona gestionada, compuesta por el servidor) ──
+# La CF tnodeConfigSyncTools + su trigger componen un JSON declarativo de
+# la ZONA GESTIONADA del TOOLS.md y lo cachean en el doc del nodo
+# (toolsJson + toolsHash). Aquí SOLO renderizamos esa zona entre markers,
+# comparando el hash para no reescribir si nada cambió. Todo lo de fuera de
+# los markers (agenda/drive de _ensure_tools_rules, reglas custom del
+# usuario) se preserva. Patrón base para el resto de los .md.
+_TOOLS_ZONE_START = "<!-- tnode:tools:start -->"
+_TOOLS_ZONE_END = "<!-- tnode:tools:end -->"
+_TOOLS_HASH_PATH = OPENCLAW_DIR / ".tnode-tools-hash"
+
+# Fallback resiliente del golden: un nodo recién nacido (sin MCPs → sin
+# toolsJson) nace con la zona gestionada conteniendo solo la Regla 0, para
+# que el agente tenga la guía MCP-first desde el arranque aunque la CF no
+# haya compuesto nada todavía. La CF la re-provee (idéntica) cuando hay
+# cambios y el render reemplaza la zona. Mantener en sync con tools_sync.ts.
+_TOOLS_REGLA_0 = """## Regla 0 - Herramienta especifica antes que el navegador (CRITICO)
+
+Antes de abrir el navegador (browser) o usar web_search, revisa si tienes una
+herramienta ESPECIFICA para la tarea y usala primero. El navegador y web_search
+son SOLO el ultimo recurso (fallback), cuando NINGUNA herramienta especifica aplica."""
+
+
+def _tools_golden_base() -> str:
+    return f"# TOOLS.md\n\n{_TOOLS_ZONE_START}\n{_TOOLS_REGLA_0}\n{_TOOLS_ZONE_END}\n"
+
+
+def _read_local_tools_hash() -> str:
+    try:
+        return _TOOLS_HASH_PATH.read_text(encoding="utf-8").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _write_local_tools_hash(value: str) -> None:
+    try:
+        _TOOLS_HASH_PATH.write_text(value, encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        _log(f"tools-sync: hash write failed: {e}")
+
+
+def _firestore_get_node_field(token: dict, field: str):
+    """GET a single masked field of the node doc (cheap)."""
+    url = (
+        f"{_firestore_base()}/users/{token['uid']}/nodes/{token['nodeId']}"
+        f"?mask.fieldPaths={field}"
+    )
+    doc = _http_request(
+        "GET", url, headers={"Authorization": f"Bearer {token['idToken']}"}
+    )
+    fields = doc.get("fields") or {}
+    return _fs_unwrap(fields[field]) if field in fields else None
+
+
+def _render_tools_zone(blocks: list) -> str:
+    ordered = sorted(blocks, key=lambda b: b.get("order", 0))
+    parts = [str(b.get("text", "")).strip() for b in ordered]
+    return "\n\n".join(p for p in parts if p)
+
+
+def _apply_tools_zone(zone_text: str) -> None:
+    """Replace the content between the managed markers in workspace/TOOLS.md.
+    Creates the markers (right after the title) if absent. Atomic write."""
+    p = OPENCLAW_DIR / "workspace" / "TOOLS.md"
+    text = p.read_text(encoding="utf-8") if p.is_file() else "# TOOLS.md\n"
+    block = f"{_TOOLS_ZONE_START}\n{zone_text}\n{_TOOLS_ZONE_END}"
+    if _TOOLS_ZONE_START in text and _TOOLS_ZONE_END in text:
+        pre = text.split(_TOOLS_ZONE_START, 1)[0].rstrip()
+        post = text.split(_TOOLS_ZONE_END, 1)[1].lstrip("\n")
+        new = pre + "\n\n" + block + ("\n\n" + post if post.strip() else "\n")
+    else:
+        head, _, rest = text.partition("\n")
+        new = head + "\n\n" + block + (
+            "\n\n" + rest.lstrip("\n") if rest.strip() else "\n"
+        )
+    if new != text:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(new, encoding="utf-8")
+        os.replace(tmp, p)
+
+
+def _sync_tools_md_from_json(token: dict) -> None:
+    """Render the managed zone of TOOLS.md from the node's cached toolsJson.
+    Cheap hash check first; only rewrites on change. Resilient: any failure
+    leaves the current TOOLS.md untouched. (v1.1: CF bootstrap for nodes that
+    have no cache yet — today the golden ships Regla 0 inside the markers.)"""
+    try:
+        remote_hash = _firestore_get_node_field(token, "toolsHash")
+    except Exception as e:  # noqa: BLE001
+        _log(f"tools-sync: hash read failed: {e}")
+        return
+    if not remote_hash:
+        return  # sin cache server → conservamos el TOOLS.md actual (golden)
+    md = OPENCLAW_DIR / "workspace" / "TOOLS.md"
+    if remote_hash == _read_local_tools_hash() and md.is_file():
+        return  # sin cambios → no reescribir
+    try:
+        raw = _firestore_get_node_field(token, "toolsJson")
+        doc = json.loads(raw) if raw else None
+    except Exception as e:  # noqa: BLE001
+        _log(f"tools-sync: json read/parse failed: {e}")
+        return
+    if not isinstance(doc, dict):
+        return
+    blocks = doc.get("blocks") or []
+    try:
+        _apply_tools_zone(_render_tools_zone(blocks))
+        _write_local_tools_hash(remote_hash)
+        _log(f"tools-sync: rendered {len(blocks)} blocks (hash {remote_hash[:12]})")
+    except Exception as e:  # noqa: BLE001
+        _log(f"tools-sync: render failed: {e}")
 
 
 def _ensure_subagents_sections() -> None:
@@ -5527,6 +5641,10 @@ def handle_restart_gateway_for_subagents(token: dict, params: dict) -> dict:
 # headers (the client clears them from the command doc afterwards).
 
 _MCP_REMOTE_TRANSPORTS = ("http", "sse")
+# OpenClaw 2026.5.x wants the entry under mcp.servers.<id> with transport
+# "streamable-http"/"sse". The catalog + client keep the friendly
+# "http"/"sse" names; translate to OpenClaw's vocabulary on write.
+_MCP_OPENCLAW_TRANSPORT = {"http": "streamable-http", "sse": "sse"}
 
 
 def _build_mcp_remote_entry(fields: dict, secrets: dict) -> dict:
@@ -5542,7 +5660,7 @@ def _build_mcp_remote_entry(fields: dict, secrets: dict) -> dict:
             f"invalid_remote_config: transport={transport or 'none'} "
             f"url={'set' if url else 'empty'}"
         )
-    entry: dict = {"transport": transport, "url": url}
+    entry: dict = {"transport": _MCP_OPENCLAW_TRANSPORT.get(transport, transport), "url": url}
     headers: dict = {}
     for spec in fields.get("secretsSchema") or []:
         if not isinstance(spec, dict) or (spec.get("target") or "") != "header":
@@ -5591,10 +5709,14 @@ def handle_mcp_install(token: dict, params: dict) -> dict:
 
     try:
         cfg = read_openclaw_json() or {}
-        servers = cfg.get("mcpServers")
+        mcp = cfg.get("mcp")
+        if not isinstance(mcp, dict):
+            mcp = {}
+            cfg["mcp"] = mcp
+        servers = mcp.get("servers")
         if not isinstance(servers, dict):
             servers = {}
-            cfg["mcpServers"] = servers
+            mcp["servers"] = servers
         servers[server_id] = entry
         _write_openclaw_json(cfg)
 
@@ -5633,7 +5755,8 @@ def handle_mcp_remove(token: dict, params: dict) -> dict:
         return {"status": "error", "result": {"error": "missing_serverId"}}
     try:
         cfg = read_openclaw_json() or {}
-        servers = cfg.get("mcpServers")
+        mcp = cfg.get("mcp")
+        servers = mcp.get("servers") if isinstance(mcp, dict) else None
         removed = isinstance(servers, dict) and server_id in servers
         if removed:
             del servers[server_id]
@@ -6645,6 +6768,11 @@ def main() -> int:
                             pass
             else:
                 empty_polls += 1
+
+            # Render the managed zone of TOOLS.md from the server-built JSON
+            # (cheap hash check; only rewrites on change; failures are
+            # swallowed so the existing file is never left half-written).
+            _sync_tools_md_from_json(token)
 
             interval = POLL_IDLE_S if empty_polls >= IDLE_AFTER else POLL_ACTIVE_S
             time.sleep(interval)
