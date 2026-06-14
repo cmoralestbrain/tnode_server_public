@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.39.0"
+TNODE_SETUP_VERSION="1.40.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -2879,7 +2879,13 @@ from __future__ import annotations
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.18.0"
+# 1.19.0 — TOOLS.md declarativo v1.1: el servidor compone TODO el estándar
+#          (anti-loop/aviso/email/agenda/drive) además de Regla 0 + MCPs.
+#          _sync_channels_to_firestore refleja el canal email a la subcolección
+#          `channels`; _migrate_tools_v11 fuerza el compose, renderiza y limpia
+#          (una vez) las copias viejas que viven fuera de los markers;
+#          _ensure_tools_rules retirado; bootstrap-via-CF para nodos sin cache.
+__VERSION__ = "1.19.0"
 
 import hashlib
 import hmac
@@ -4004,6 +4010,43 @@ def _firestore_upsert_mcp_server(token: dict, server_id: str, payload: dict) -> 
         f"https://firestore.googleapis.com/v1/projects/{PROJECT_ID}"
         f"/databases/(default)/documents/users/{uid}/nodes/{node_id}"
         f"/mcpServers/{server_id}?{mask}"
+    )
+    body = json.dumps({"fields": fields}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f'Bearer {token["idToken"]}',
+            "Content-Type": "application/json",
+        },
+        method="PATCH",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
+
+
+def _firestore_upsert_channel(token: dict, channel_id: str, payload: dict) -> None:
+    """Upsert users/{uid}/nodes/{nodeId}/channels/{channel_id} via PATCH +
+    updateMask (idempotent). Flat types only. Mirrors _firestore_upsert_mcp_server.
+    The server reads this subcollection to compose the email block of TOOLS.md."""
+    cfg = load_config()
+    uid = token["uid"]
+    node_id = cfg["nodeId"]
+    fields: dict = {}
+    for k, v in payload.items():
+        if isinstance(v, bool):
+            fields[k] = {"booleanValue": v}
+        elif isinstance(v, str):
+            fields[k] = {"stringValue": v}
+        elif isinstance(v, int):
+            fields[k] = {"integerValue": str(v)}
+        elif v is None:
+            fields[k] = {"nullValue": None}
+    mask = "&".join(f"updateMask.fieldPaths={k}" for k in payload.keys())
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{PROJECT_ID}"
+        f"/databases/(default)/documents/users/{uid}/nodes/{node_id}"
+        f"/channels/{channel_id}?{mask}"
     )
     body = json.dumps({"fields": fields}).encode("utf-8")
     req = urllib.request.Request(
@@ -5294,15 +5337,12 @@ contenido sensible salvo que el dueño lo haya pedido. Leer su carpeta NO
 es operación sensible: procede sin pedir permiso adicional.
 """
 
-# Marker = path del binario del skill, NO el header de la sección: el
-# despliegue manual del 2026-06-11/12 dejó headers DISTINTOS por nodo
-# ("## Regla 5 — …" en el Mini, "## Regla: …" en Pi/Oracles). Si el
-# TOOLS.md ya enseña el skill — cualquiera que sea su header — la regla
-# no se re-agrega.
-_TOOLS_RULES = (
-    ("skills/agenda/bin/agenda.py", _AGENDA_RULE_SECTION),
-    ("skills/drive/bin/drive.py", _DRIVE_RULE_SECTION),
-)
+# v1.1: las reglas de agenda/drive (y anti-loop/aviso/email) ahora las compone
+# el SERVIDOR (functions/src/tools_sync.ts) dentro de la zona gestionada del
+# TOOLS.md; el daemon solo renderiza ese JSON por hash. _ensure_tools_rules
+# (que las appendeaba fuera de los markers) quedó retirado — ver
+# _migrate_tools_v11, que limpia las copias viejas una vez. Las constantes
+# _AGENDA_RULE_SECTION / _DRIVE_RULE_SECTION quedan solo como referencia.
 
 
 def _ensure_workspace_skill(name: str, files: dict) -> None:
@@ -5343,23 +5383,9 @@ def _ensure_workspace_skills() -> None:
     })
 
 
-def _ensure_tools_rules() -> None:
-    """Idempotently append the agenda/drive usage rules to
-    workspace/TOOLS.md (created if missing). Append-only by semantic
-    marker — see _TOOLS_RULES."""
-    p = OPENCLAW_DIR / "workspace" / "TOOLS.md"
-    try:
-        existed = p.is_file()
-        text = p.read_text(encoding="utf-8") if existed else _tools_golden_base()
-        out = text
-        for marker, section in _TOOLS_RULES:
-            if marker not in out:
-                out = out.rstrip() + "\n\n" + section.strip() + "\n"
-        if out != text or not existed:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(out, encoding="utf-8")
-    except Exception as e:  # noqa: BLE001
-        _log(f"_ensure_tools_rules: {e}")
+# _ensure_tools_rules() retirado en v1.1 — las reglas (agenda/drive/anti-loop/
+# aviso/email) las compone el servidor (tools_sync.ts) y _migrate_tools_v11
+# limpia las copias viejas que vivían fuera de los markers.
 
 
 # ── TOOLS.md renderer (zona gestionada, compuesta por el servidor) ──
@@ -5455,7 +5481,14 @@ def _sync_tools_md_from_json(token: dict) -> None:
         _log(f"tools-sync: hash read failed: {e}")
         return
     if not remote_hash:
-        return  # sin cache server → conservamos el TOOLS.md actual (golden)
+        # Bootstrap: nodo sin cache (golden recién nacido, sin MCPs/canales que
+        # disparen el trigger). Forzamos UNA composición vía la CF para que el
+        # agente nazca con todas las reglas estándar. Si falla, conservamos el
+        # golden (Regla 0) y reintentamos al próximo arranque.
+        resp = _bootstrap_tools_via_cf()
+        if isinstance(resp, dict) and resp.get("ok"):
+            _render_tools_from_resp(resp)
+        return
     md = OPENCLAW_DIR / "workspace" / "TOOLS.md"
     if remote_hash == _read_local_tools_hash() and md.is_file():
         return  # sin cambios → no reescribir
@@ -5474,6 +5507,223 @@ def _sync_tools_md_from_json(token: dict) -> None:
         _log(f"tools-sync: rendered {len(blocks)} blocks (hash {remote_hash[:12]})")
     except Exception as e:  # noqa: BLE001
         _log(f"tools-sync: render failed: {e}")
+
+
+# ── v1.1: compose vía CF + reflejo de canales + migración one-time ──
+TOOLS_SYNC_URL = os.environ.get(
+    "TNODE_TOOLS_SYNC_URL",
+    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/tnodeConfigSyncTools",
+)
+_CHANNELS_HASH_PATH = OPENCLAW_DIR / ".tnode-channels-hash"
+_TOOLS_V11_SENTINEL = OPENCLAW_DIR / ".tnode-tools-v11-migrated"
+_tools_bootstrap_attempted = False
+
+
+def _compose_tools_via_cf() -> dict | None:
+    """POST el endpoint HMAC para forzar que el servidor componga el TOOLS.md.
+    Firma `${nodeId}:${ts}:${nonce}:tools:refresh` con nodeSecret (no necesita
+    idToken). Devuelve la respuesta {ok, hash, doc}, o None si falla."""
+    cfg = load_config()
+    node_id = cfg.get("nodeId")
+    node_secret = cfg.get("nodeSecret")
+    if not node_id or not node_secret:
+        return None
+    ts = str(int(time.time() * 1000))
+    nonce = os.urandom(16).hex()
+    action = "refresh"
+    sig = hmac.new(
+        node_secret.encode("utf-8"),
+        f"{node_id}:{ts}:{nonce}:tools:{action}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    body = json.dumps({
+        "nodeId": node_id,
+        "timestamp": ts,
+        "nonce": nonce,
+        "signature": sig,
+        "action": action,
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            TOOLS_SYNC_URL,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:  # noqa: BLE001
+        _log(f"tools-sync: CF compose failed: {e}")
+        return None
+
+
+def _bootstrap_tools_via_cf() -> dict | None:
+    """Force-compose una sola vez por proceso, para un nodo fresco sin cache
+    (sin MCPs/canales aún → ningún trigger disparó)."""
+    global _tools_bootstrap_attempted
+    if _tools_bootstrap_attempted:
+        return None
+    _tools_bootstrap_attempted = True
+    return _compose_tools_via_cf()
+
+
+def _render_tools_from_resp(resp: dict) -> bool:
+    """Renderiza la zona gestionada desde una respuesta de compose + persiste
+    el hash local."""
+    doc = resp.get("doc") if isinstance(resp, dict) else None
+    if not isinstance(doc, dict):
+        return False
+    try:
+        _apply_tools_zone(_render_tools_zone(doc.get("blocks") or []))
+        h = resp.get("hash") or ""
+        if h:
+            _write_local_tools_hash(h)
+        _log(f"tools-sync: rendered {len(doc.get('blocks') or [])} blocks via CF")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _log(f"tools-sync: CF render failed: {e}")
+        return False
+
+
+def _strip_legacy_tools_sections(text: str) -> str:
+    """Quita las secciones que ahora compone el servidor (anti-loop/aviso/email/
+    agenda/drive) cuando viven FUERA de los markers; preserva la zona gestionada
+    y cualquier sección custom (web-scraper/HEB, reglas del usuario)."""
+    zone = ""
+    pre, post = text, ""
+    if _TOOLS_ZONE_START in text and _TOOLS_ZONE_END in text:
+        pre = text.split(_TOOLS_ZONE_START, 1)[0]
+        rest = text.split(_TOOLS_ZONE_START, 1)[1]
+        zone_body = rest.split(_TOOLS_ZONE_END, 1)[0]
+        post = rest.split(_TOOLS_ZONE_END, 1)[1]
+        zone = f"{_TOOLS_ZONE_START}{zone_body}{_TOOLS_ZONE_END}"
+
+    def _strip_chunk(chunk: str) -> str:
+        lines = chunk.split("\n")
+        out: list = []
+        i, n = 0, len(lines)
+        while i < n and not lines[i].startswith("## "):
+            out.append(lines[i])
+            i += 1
+        while i < n:
+            sec = [lines[i]]
+            i += 1
+            while i < n and not lines[i].startswith("## "):
+                sec.append(lines[i])
+                i += 1
+            header = sec[0].strip().lower()
+            body = "\n".join(sec)
+            drop = (
+                header.startswith("## regla anti-loop")
+                or header.startswith("## regla de aviso")
+                or header.startswith("## regla 4")
+                or "skills/agenda/bin/agenda.py" in body
+                or "skills/drive/bin/drive.py" in body
+            )
+            if not drop:
+                out.extend(sec)
+        return "\n".join(out)
+
+    new_pre = _strip_chunk(pre).rstrip()
+    new_post = _strip_chunk(post).strip()
+    if zone:
+        parts = [p for p in (new_pre, zone, new_post) if p]
+        return "\n\n".join(parts) + "\n"
+    return (new_pre + "\n") if new_pre else ""
+
+
+def _migrate_tools_v11() -> None:
+    """v1.1 one-time: fuerza al servidor a componer el TOOLS.md completo, lo
+    renderiza en la zona gestionada, y luego quita las copias viejas de esas
+    secciones que viven FUERA de los markers (para que no se dupliquen). Las
+    secciones custom se preservan. Backup de TOOLS.md una vez. SOLO quita
+    después de un compose+render exitoso → sin gap si la CF no responde
+    (reintenta al próximo arranque)."""
+    if _TOOLS_V11_SENTINEL.exists():
+        return
+    resp = _compose_tools_via_cf()
+    if not (isinstance(resp, dict) and resp.get("ok")):
+        return  # CF inalcanzable / no pareado → reintenta, no quita nada aún
+    if not _render_tools_from_resp(resp):
+        return
+    p = OPENCLAW_DIR / "workspace" / "TOOLS.md"
+    try:
+        text = p.read_text(encoding="utf-8") if p.is_file() else ""
+        if text:
+            new = _strip_legacy_tools_sections(text)
+            if new != text:
+                bak = p.with_name("TOOLS.md.bak-pre-v1.1")
+                if not bak.exists():
+                    bak.write_text(text, encoding="utf-8")
+                tmp = p.with_suffix(".tmp")
+                tmp.write_text(new, encoding="utf-8")
+                os.replace(tmp, p)
+                _log("tools-migrate: stripped legacy sections outside markers")
+        _TOOLS_V11_SENTINEL.write_text("done", encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        _log(f"tools-migrate: {e}")
+
+
+def _resolve_himalaya_path() -> str:
+    """Path absoluto al binario himalaya (which() falla bajo el PATH no
+    interactivo de launchd en macOS, así que probamos ubicaciones comunes)."""
+    found = shutil.which("himalaya")
+    if found:
+        return found
+    for cand in (
+        "/opt/homebrew/bin/himalaya",
+        str(Path.home() / ".local" / "bin" / "himalaya"),
+        "/usr/local/bin/himalaya",
+    ):
+        if Path(cand).is_file():
+            return cand
+    return "himalaya"
+
+
+def _channels_firestore_payload() -> dict:
+    """Mapea channels-state.json → los docs por-canal que el servidor lee para
+    componer el TOOLS.md. Hoy solo `email` produce bloque (telegram es canal
+    nativo, sin regla de uso)."""
+    st = _read_channels_state()
+    email = st.get("email") if isinstance(st.get("email"), dict) else {}
+    if email.get("status") == "linked":
+        provider = (email.get("provider") or "gmail").lower()
+        variant = "resend" if provider == "resend" else "himalaya"
+        payload = {
+            "linked": True,
+            "variant": variant,
+            "account": email.get("address") or "",
+        }
+        if variant == "himalaya":
+            payload["himalayaPath"] = _resolve_himalaya_path()
+        return {"email": payload}
+    return {"email": {"linked": False}}
+
+
+def _sync_channels_to_firestore(token: dict) -> None:
+    """Refleja el estado de canales a users/{uid}/nodes/{nodeId}/channels/{id}
+    para que el servidor componga el bloque email. Guard por hash (evita PATCH
+    en cada poll). Best-effort: los errores se loguean, nunca son fatales."""
+    try:
+        payload = _channels_firestore_payload()
+        digest = hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        try:
+            prev = _CHANNELS_HASH_PATH.read_text(encoding="utf-8").strip()
+        except Exception:  # noqa: BLE001
+            prev = ""
+        if digest == prev:
+            return
+        for channel_id, fields in payload.items():
+            _firestore_upsert_channel(token, channel_id, fields)
+        try:
+            _CHANNELS_HASH_PATH.write_text(digest, encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+        _log(f"channels-sync: pushed {list(payload.keys())}")
+    except Exception as e:  # noqa: BLE001
+        _log(f"channels-sync: {e}")
 
 
 def _ensure_subagents_sections() -> None:
@@ -6685,7 +6935,6 @@ def main() -> int:
         _regenerate_agents_index()
         _ensure_subagents_sections()
         _ensure_workspace_skills()
-        _ensure_tools_rules()
     except Exception as e:  # noqa: BLE001
         _log(f"startup self-heal failed: {e}")
     # Reflect a hand-configured Telegram channel (openclaw.json) into
@@ -6769,9 +7018,14 @@ def main() -> int:
             else:
                 empty_polls += 1
 
-            # Render the managed zone of TOOLS.md from the server-built JSON
-            # (cheap hash check; only rewrites on change; failures are
-            # swallowed so the existing file is never left half-written).
+            # Reflect channel state to Firestore (email variant/account/path)
+            # so the server can compose the email block; run the one-time v1.1
+            # migration (force compose + strip legacy sections); then render the
+            # managed zone of TOOLS.md from the server-built JSON (cheap hash
+            # check; only rewrites on change; failures swallowed so the file is
+            # never left half-written).
+            _sync_channels_to_firestore(token)
+            _migrate_tools_v11()
             _sync_tools_md_from_json(token)
 
             interval = POLL_IDLE_S if empty_polls >= IDLE_AFTER else POLL_ACTIVE_S
