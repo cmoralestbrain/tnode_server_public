@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.36.2"
+TNODE_SETUP_VERSION="1.37.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -2823,6 +2823,16 @@ Env/overrides:
                            (used by the file-watcher trigger).
 """
 from __future__ import annotations
+# 1.17.0 — MCP servers (Direction A, remote-only): mcp.install /
+#          mcp.remove / restart_gateway_for_mcp handlers. Enabling a
+#          server writes openclaw.json["mcpServers"][id] for http/sse
+#          transports (the API key rides in `headers`) and mirrors to
+#          users/{uid}/nodes/{nodeId}/mcpServers/{id}; disabling removes
+#          the entry but keeps the mirror config for one-tap re-enable.
+#          Secrets travel once in the command params, never stored in
+#          the mirror. stdio (command/args/env) is F2, gated behind the
+#          curated mcpCatalog allowlist. OpenClaw 2026.5.x is already a
+#          native MCP client — this only writes its config.
 # 1.16.1 — _render_himalaya_toml: message.send.save-copy = false. The
 #          post-SMTP IMAP APPEND targeted himalaya's literal "Sent"
 #          folder, which doesn't exist on Gmail → exit 1 on every send
@@ -2916,7 +2926,7 @@ from __future__ import annotations
 #         restart_gateway_for_subagents handlers (Firestore-driven
 #         per-node materialization replacing the agency-agents/ dir
 #         + symlink hack).
-__VERSION__ = "1.16.1"
+__VERSION__ = "1.17.0"
 
 import hashlib
 import hmac
@@ -3995,6 +4005,65 @@ def _firestore_delete_installed_subagent(token: dict, agent_id: str) -> None:
     except urllib.error.HTTPError as e:
         if e.code != 404:
             raise
+
+
+def _firestore_get_mcp_catalog_doc(token: dict, server_id: str) -> dict | None:
+    """Read mcpCatalog/{server_id} via Firestore REST."""
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{PROJECT_ID}"
+        f"/databases/(default)/documents/mcpCatalog/{server_id}"
+    )
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f'Bearer {token["idToken"]}'},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+
+
+def _firestore_upsert_mcp_server(token: dict, server_id: str, payload: dict) -> None:
+    """Upsert users/{uid}/nodes/{nodeId}/mcpServers/{server_id} via PATCH +
+    updateMask (idempotent; creates the doc if absent). Flat types only —
+    `config` is JSON-encoded into a stringValue so we avoid a nested-map
+    serializer. Only keys present in `payload` are written, so a disable
+    that omits `config` keeps the stored config for one-tap re-enable."""
+    cfg = load_config()
+    uid = token["uid"]
+    node_id = cfg["nodeId"]
+    fields: dict = {}
+    for k, v in payload.items():
+        if isinstance(v, bool):
+            fields[k] = {"booleanValue": v}
+        elif isinstance(v, str):
+            fields[k] = {"stringValue": v}
+        elif isinstance(v, int):
+            fields[k] = {"integerValue": str(v)}
+        elif v is None:
+            fields[k] = {"nullValue": None}
+    mask = "&".join(f"updateMask.fieldPaths={k}" for k in payload.keys())
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{PROJECT_ID}"
+        f"/databases/(default)/documents/users/{uid}/nodes/{node_id}"
+        f"/mcpServers/{server_id}?{mask}"
+    )
+    body = json.dumps({"fields": fields}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f'Bearer {token["idToken"]}',
+            "Content-Type": "application/json",
+        },
+        method="PATCH",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
 
 
 def _materialize_subagent_files(agent_id: str, files: dict, files_sha: str) -> None:
@@ -5492,6 +5561,151 @@ def handle_restart_gateway_for_subagents(token: dict, params: dict) -> dict:
     return {"status": "done", "result": {"pids": pids}}
 
 
+# ── MCP servers (Direction A — node CONSUMES 3rd-party MCP servers) ──
+#
+# OpenClaw 2026.5.x is a native MCP client: enabling a server is just
+# writing an entry under openclaw.json["mcpServers"][id] and restarting
+# the gateway, which connects it and exposes its tools to every agent.
+# F1 ships REMOTE transports only (http/sse) — the API key rides in
+# `headers` and NO process runs on the node. stdio servers (command/
+# args/env) are F2, gated behind the curated mcpCatalog allowlist.
+# Mirror: users/{uid}/nodes/{nodeId}/mcpServers/{serverId}. Secrets
+# travel once in the command params and land only in openclaw.json
+# headers (the client clears them from the command doc afterwards).
+
+_MCP_REMOTE_TRANSPORTS = ("http", "sse")
+
+
+def _build_mcp_remote_entry(fields: dict, secrets: dict) -> dict:
+    """Build an openclaw.json mcpServers[] entry for a REMOTE server.
+    secretsSchema entries with target=='header' are injected into
+    `headers`; an Authorization header gets the `Bearer ` prefix unless
+    the value already carries one. Raises ValueError on bad config or a
+    missing required secret."""
+    transport = (fields.get("transport") or "").strip()
+    url = (fields.get("url") or "").strip()
+    if transport not in _MCP_REMOTE_TRANSPORTS or not url:
+        raise ValueError(
+            f"invalid_remote_config: transport={transport or 'none'} "
+            f"url={'set' if url else 'empty'}"
+        )
+    entry: dict = {"transport": transport, "url": url}
+    headers: dict = {}
+    for spec in fields.get("secretsSchema") or []:
+        if not isinstance(spec, dict) or (spec.get("target") or "") != "header":
+            continue
+        key = spec.get("key") or ""
+        value = secrets.get(key)
+        if not value:
+            if spec.get("required"):
+                raise ValueError(f"missing_secret: {key}")
+            continue
+        header_name = spec.get("headerName") or "Authorization"
+        if header_name.lower() == "authorization" and not str(value).lower().startswith("bearer "):
+            headers[header_name] = f"Bearer {value}"
+        else:
+            headers[header_name] = str(value)
+    if headers:
+        entry["headers"] = headers
+    return entry
+
+
+def handle_mcp_install(token: dict, params: dict) -> dict:
+    server_id = (params.get("serverId") or params.get("catalogId") or "").strip()
+    if not server_id:
+        return {"status": "error", "result": {"error": "missing_serverId"}}
+    secrets = params.get("secrets") or {}
+
+    doc = _firestore_get_mcp_catalog_doc(token, server_id)
+    if doc is None:
+        return {"status": "error", "result": {"error": f"mcp_not_found: {server_id}"}}
+    fields = {k: _fs_unwrap(v) for k, v in doc.get("fields", {}).items()}
+
+    transport = (fields.get("transport") or "").strip()
+    if transport not in _MCP_REMOTE_TRANSPORTS:
+        # F1 ships remote-only; stdio (command/args/env) lands in F2.
+        return {
+            "status": "error",
+            "result": {
+                "error": f"unsupported_transport: {transport or 'none'} (remote-only in F1)"
+            },
+        }
+
+    try:
+        entry = _build_mcp_remote_entry(fields, secrets)
+    except ValueError as e:
+        return {"status": "error", "result": {"error": str(e)}}
+
+    try:
+        cfg = read_openclaw_json() or {}
+        servers = cfg.get("mcpServers")
+        if not isinstance(servers, dict):
+            servers = {}
+            cfg["mcpServers"] = servers
+        servers[server_id] = entry
+        _write_openclaw_json(cfg)
+
+        # Mirror WITHOUT secrets: drop headers before persisting config.
+        safe_config = {k: v for k, v in entry.items() if k != "headers"}
+        _firestore_upsert_mcp_server(
+            token,
+            server_id,
+            {
+                "catalogId": server_id,
+                "enabled": True,
+                "status": "enabled",
+                "config": json.dumps(safe_config),
+                "error": None,
+            },
+        )
+    except Exception as e:  # noqa: BLE001
+        _log(f"mcp_install {server_id} failed: {e}")
+        try:
+            _firestore_upsert_mcp_server(
+                token, server_id, {"status": "error", "error": str(e)[:500]}
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return {"status": "error", "result": {"error": str(e)[:500]}}
+
+    # Goes live on the next restart_gateway_for_mcp (the client coalesces a
+    # batch of toggles into one restart on screen close). Connect health /
+    # toolCount reconciliation is F4 (telemetry via `openclaw mcp list`).
+    return {"status": "done", "result": {"serverId": server_id, "transport": transport}}
+
+
+def handle_mcp_remove(token: dict, params: dict) -> dict:
+    server_id = (params.get("serverId") or params.get("catalogId") or "").strip()
+    if not server_id:
+        return {"status": "error", "result": {"error": "missing_serverId"}}
+    try:
+        cfg = read_openclaw_json() or {}
+        servers = cfg.get("mcpServers")
+        removed = isinstance(servers, dict) and server_id in servers
+        if removed:
+            del servers[server_id]
+            _write_openclaw_json(cfg)
+        # Keep `config` (omit from the mask) so re-enabling only needs the
+        # secret again; flip enabled/status and clear any prior error.
+        _firestore_upsert_mcp_server(
+            token,
+            server_id,
+            {"enabled": False, "status": "disabled", "error": None},
+        )
+    except Exception as e:  # noqa: BLE001
+        _log(f"mcp_remove {server_id} failed: {e}")
+        return {"status": "error", "result": {"error": str(e)[:500]}}
+    return {"status": "done", "result": {"serverId": server_id, "removed": removed}}
+
+
+def handle_restart_gateway_for_mcp(token: dict, params: dict) -> dict:
+    """SIGTERM the gateway so it reconnects with the updated mcpServers.
+    Functionally identical to the sub-agents restart — delegates to the
+    one shared routine. The client coalesces a batch of mcp.* commands
+    into a single restart on screen close."""
+    return handle_restart_gateway_for_subagents(token, params)
+
+
 # ── Channels — Email (Resend HTTPS / himalaya for Gmail/IMAP) ──
 #
 # `channels.email.link/unlink` mirror status to
@@ -6326,6 +6540,9 @@ _HANDLERS = {
     "install_subagent": handle_install_subagent,
     "uninstall_subagent": handle_uninstall_subagent,
     "restart_gateway_for_subagents": handle_restart_gateway_for_subagents,
+    "mcp.install": handle_mcp_install,
+    "mcp.remove": handle_mcp_remove,
+    "restart_gateway_for_mcp": handle_restart_gateway_for_mcp,
     "channels.email.link": handle_channels_email_link,
     "channels.email.unlink": handle_channels_email_unlink,
     "channels.telegram.link": handle_channels_telegram_link,
