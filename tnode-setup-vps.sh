@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.38.0"
+TNODE_SETUP_VERSION="1.39.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -10539,7 +10539,11 @@ from __future__ import annotations
 #          previous default. Idempotent; no-op on un-prefixed slugs.
 # 1.8.14 — _agent_model_set merges into defaults.models instead of
 #          overwriting it (preserves multi-agent distinct picks).
-__VERSION__ = "1.15.1"
+# 1.16.0 — agent.context.get RPC: friendly compiled-context breakdown
+#          (tools-by-source + system-prompt/tool/chat token split) for the
+#          CTX detail screen. Reads the newest trajectory's context.compiled
+#          and correlates live usage from sessions.json.
+__VERSION__ = "1.16.0"
 
 import argparse
 import asyncio
@@ -10962,6 +10966,161 @@ def _collect_active_ctx() -> Dict[str, Any]:
         "inputTokens": best["inputTokens"],
         "outputTokens": best["outputTokens"],
         "model": best["model"],
+    }
+
+
+def _newest_trajectory() -> Optional[Path]:
+    """The most-recently-modified `<sessionId>.trajectory.jsonl` under the main
+    agent's sessions dir — i.e. the conversation the user is in right now."""
+    try:
+        files = list(SESSIONS_DIR.glob("*.trajectory.jsonl"))
+        if not files:
+            return None
+        return max(files, key=lambda p: p.stat().st_mtime)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _last_context_compiled(path: Path) -> Optional[Dict[str, Any]]:
+    """Last `context.compiled` trace event in a trajectory (one is emitted per
+    turn, right before the model call). None if the file has none yet."""
+    found = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if '"context.compiled"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(obj, dict) and obj.get("type") == "context.compiled":
+                    found = obj
+    except Exception as e:  # noqa: BLE001
+        logger.warning("ctx: failed to read trajectory %s: %s", path, e)
+    return found
+
+
+def _collect_compiled_context() -> Dict[str, Any]:
+    """Friendly breakdown of the agent's *compiled* context for the current
+    session — what `agent.context.get` returns to the CTX screen.
+
+    Reads the newest trajectory's last `context.compiled` event (the exact tool
+    set + system-prompt size the runner fed the model) and correlates it with
+    the live token usage from sessions.json (`_collect_active_ctx`). Tools are
+    grouped by source: native tools vs `<server>__` MCP-prefixed ones. Each MCP
+    source is flagged connected/error by whether its tools actually made it into
+    the compiled context vs being merely configured in openclaw.json (the red-dot
+    diagnostic). Heavy `parameters` JSON-schemas are stripped — the screen only
+    needs name+description. `fresh: false` => no compiled context yet (fresh node
+    / new session before its first turn)."""
+    traj = _newest_trajectory()
+    evt = _last_context_compiled(traj) if traj else None
+    if evt is None:
+        return {"fresh": False, "reason": "no-context-compiled"}
+
+    data = evt.get("data") or {}
+    tools = data.get("tools") if isinstance(data.get("tools"), list) else []
+    messages = data.get("messages") if isinstance(data.get("messages"), list) else []
+    prompt = data.get("prompt") if isinstance(data.get("prompt"), str) else ""
+
+    # System-prompt size: originalChars is the true length (the text itself is
+    # truncated in the trace by a field-size limit, but the count is exact).
+    sp = data.get("systemPrompt")
+    sp_chars = 0
+    if isinstance(sp, dict):
+        sp_chars = int(sp.get("originalChars") or sp.get("limitChars") or 0)
+    elif isinstance(sp, str):
+        sp_chars = len(sp)
+
+    # Tool weight: serialize WITH parameters (that's what occupies context),
+    # then strip parameters from the payload we ship.
+    try:
+        tools_chars = len(json.dumps(tools, separators=(",", ":")))
+    except Exception:  # noqa: BLE001
+        tools_chars = 0
+
+    def _toks(chars: int) -> int:
+        return int(round(chars / 4.0)) if chars and chars > 0 else 0
+
+    sp_tokens = _toks(sp_chars)
+    tools_tokens = _toks(tools_chars)
+
+    # Live usage (authoritative used/max/model) correlated from sessions.json.
+    live = _collect_active_ctx()
+    used_fresh = bool(live.get("fresh"))
+    used = live.get("used") if used_fresh else None
+    window = live.get("max") if used_fresh else None
+    model = live.get("model") or evt.get("modelId")
+
+    if used_fresh and isinstance(used, int):
+        chat_tokens = max(0, used - sp_tokens - tools_tokens)
+    else:
+        try:
+            msg_chars = len(json.dumps(messages, separators=(",", ":")))
+        except Exception:  # noqa: BLE001
+            msg_chars = 0
+        chat_tokens = _toks(msg_chars + len(prompt))
+        used = sp_tokens + tools_tokens + chat_tokens
+
+    pct = round(used / window, 4) if (window and used) else None
+
+    # Group tools by source (native = no `<server>__` prefix).
+    grouped: Dict[str, list] = {}
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        name = str(t.get("name") or "")
+        src = name.split("__", 1)[0] if "__" in name else "system"
+        grouped.setdefault(src, []).append({
+            "name": name,
+            "description": str(t.get("description") or ""),
+        })
+
+    # Connected/error per MCP: configured in openclaw.json but absent from the
+    # compiled tool set => it failed to load/auth.
+    try:
+        cfg = _load_openclaw_json()
+        configured = (cfg.get("mcp") or {}).get("servers") or {}
+        configured_ids = list(configured.keys()) if isinstance(configured, dict) else []
+    except Exception:  # noqa: BLE001
+        configured_ids = []
+
+    sources = [
+        {
+            "id": src_id,
+            "kind": "system" if src_id == "system" else "mcp",
+            "toolCount": len(src_tools),
+            "status": "connected",
+            "tools": src_tools,
+        }
+        for src_id, src_tools in grouped.items()
+    ]
+    for mid in configured_ids:
+        if mid not in grouped:
+            sources.append({
+                "id": mid, "kind": "mcp", "toolCount": 0,
+                "status": "error", "tools": [],
+            })
+    # Stable order: system first, then MCPs by tool count desc, then id.
+    sources.sort(key=lambda s: (s["kind"] != "system", -s["toolCount"], s["id"]))
+
+    return {
+        "fresh": True,
+        "sessionId": evt.get("sessionId"),
+        "ts": evt.get("ts"),
+        "model": model,
+        "provider": evt.get("provider"),
+        "window": window,
+        "used": used,
+        "usedFresh": used_fresh,
+        "pct": pct,
+        "sections": {
+            "systemPrompt": {"chars": sp_chars, "tokens": sp_tokens},
+            "tools": {"count": len(tools), "chars": tools_chars, "tokens": tools_tokens},
+            "chat": {"messages": len(messages), "tokens": chat_tokens},
+        },
+        "sources": sources,
     }
 
 
@@ -12213,6 +12372,10 @@ def _dispatch_agent(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         return _node_media_model_get("videoGenerationModel")
     if method == "agent.videoModel.set":
         return _node_media_model_set("videoGenerationModel", str(params.get("model", "")))
+    # Read-only: compiled-context breakdown for the CTX screen. agentId ignored
+    # (the active session is whichever trajectory was touched most recently).
+    if method == "agent.context.get":
+        return _collect_compiled_context()
     raise AgentError("unknown-method", f"unknown method {method!r}")
 
 

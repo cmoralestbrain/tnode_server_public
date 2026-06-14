@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-06-14T19:21:51.587371+00:00",
-  "tag": "tnode-setup-v1.38.0",
+  "generatedAt": "2026-06-14T21:34:39.715216+00:00",
+  "tag": "tnode-setup-v1.39.0",
   "components": [
     {
       "id": "tnode-chat-sync",
@@ -18,7 +18,7 @@
     {
       "id": "tnode-telemetry",
       "kind": "daemon-embedded",
-      "version": "1.15.1",
+      "version": "1.16.0",
       "source": "scripts/tnode_telemetry.py"
     },
     {
