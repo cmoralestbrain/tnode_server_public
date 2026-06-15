@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.42.0"
+TNODE_SETUP_VERSION="1.42.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -2951,7 +2951,17 @@ from __future__ import annotations
 #          se aplicó). Quita la dependencia del dispose() del cliente (frágil, sin
 #          orderBy) — arregla el punto rojo en CTX al activar un MCP, y el gemelo
 #          de Sub-Agentes.
-__VERSION__ = "1.21.0"
+# 1.21.1 — Revierte el restart coalescido de 1.21.0 (b): el gateway YA
+#          hot-recarga openclaw.json (mcp.servers + agents.list) — verificado en
+#          el Mini ("[reload] config hot reload applied (mcp.servers.X)"). El
+#          restart era innecesario; además el SIGTERM-por-pgrep NUNCA funcionó
+#          (el patrón "openclaw-gatewa" no matchea `node …/openclaw/dist/index.js
+#          gateway`, y el gateway atrapa SIGTERM). El punto rojo de CTX no era del
+#          gateway sino de telemetry (deriva el dot del compiled del último
+#          turno). handle_restart_gateway_for_mcp/_subagents quedan como no-ops
+#          que ack-ean el comando del dispose() del cliente. Se conserva el
+#          valuePrefix de 1.21.0 (a).
+__VERSION__ = "1.21.1"
 
 import hashlib
 import hmac
@@ -6099,70 +6109,24 @@ def handle_uninstall_subagent(token: dict, params: dict) -> dict:
     }
 
 
-# Gateway reload is coalesced via a process-local "dirty" flag: any command
-# that mutates openclaw.json (mcp.install/remove, install/uninstall_subagent)
-# marks it dirty, and the command loop SIGTERMs the gateway ONCE at the end of
-# a batch iff dirty (systemd Restart=always respawns with the new config).
-# This replaces the old reliance on the client posting a separate
-# restart_gateway_* command from a screen's dispose() — fragile because dispose
-# may never fire AND query_pending_commands has no orderBy, so that restart
-# could race ahead of the install in the same batch. The client's explicit
-# command is still accepted but is now dirty-gated, so it no-ops when the loop
-# already applied the change (no double restart during the +141 transition).
-_gateway_dirty = False
-
-# Command types that mutate openclaw.json and thus require a gateway reload.
-_GATEWAY_RESTART_TRIGGERS = frozenset(
-    {"mcp.install", "mcp.remove", "install_subagent", "uninstall_subagent"}
-)
-
-
-def _mark_gateway_dirty() -> None:
-    global _gateway_dirty
-    _gateway_dirty = True
-
-
-def _sigterm_gateway() -> dict:
-    """SIGTERM every running openclaw-gateway process. systemd Restart=always
-    respawns it with the current openclaw.json (mcp.servers + agents.list)."""
-    pids: list[int] = []
-    try:
-        out = subprocess.check_output(
-            ["pgrep", "-f", "openclaw-gatewa"], text=True
-        )
-        pids = [int(p) for p in out.split() if p.strip()]
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
-    if not pids:
-        return {"status": "done", "result": {"pids": [], "note": "no_running"}}
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    return {"status": "done", "result": {"pids": pids}}
-
-
-def _restart_gateway_if_dirty(reason: str = "") -> dict:
-    """Restart the gateway only if openclaw.json changed since the last restart;
-    clears the dirty flag. Coalesces the end-of-batch auto-restart and the
-    client's explicit restart command into a single SIGTERM."""
-    global _gateway_dirty
-    if not _gateway_dirty:
-        return {"status": "done", "result": {"note": "no_change"}}
-    _gateway_dirty = False
-    res = _sigterm_gateway()
-    _log(f"gateway restart ({reason}): {res.get('result')}")
-    return res
+# Gateway reload for openclaw.json changes (mcp.servers + agents.list) is
+# AUTOMATIC: the gateway watches openclaw.json and hot-reloads on change.
+# Verified on the Mini — the instant config-sync writes the file the gateway
+# logs `[reload] config hot reload applied (mcp.servers.huggingface)`. So
+# enabling/disabling an MCP or sub-agent needs NO restart — just the write.
+# The client still posts restart_gateway_for_mcp / _for_subagents on screen
+# dispose(); we ack them as no-ops (the hot-reload already applied the change).
+# NB: the legacy SIGTERM-by-pgrep approach never actually worked — it matched
+# "openclaw-gatewa" while the process is `node .../openclaw/dist/index.js
+# gateway`, AND the gateway traps SIGTERM (it does not exit on it). Things
+# worked anyway precisely because of the hot-reload above.
 
 
 def handle_restart_gateway_for_subagents(token: dict, params: dict) -> dict:
-    """Client-posted coalesced restart (sub-agents + MCP share this handler).
-    Now dirty-gated: it SIGTERMs only when an install/remove left the config
-    dirty — otherwise the end-of-batch auto-restart already handled it and this
-    is a no-op. Kept for backward-compat with shipped clients that still post it
-    on screen dispose()."""
-    return _restart_gateway_if_dirty("explicit command")
+    """No-op: the gateway hot-reloads openclaw.json (agents.list + mcp.servers)
+    on its own, so no restart is needed. Kept so shipped clients that still post
+    this on screen dispose() get a clean `done` instead of unknown_command_type."""
+    return {"status": "done", "result": {"note": "hot-reload; no restart needed"}}
 
 
 # ── MCP servers (Direction A — node CONSUMES 3rd-party MCP servers) ──
@@ -6325,10 +6289,9 @@ def handle_mcp_remove(token: dict, params: dict) -> dict:
 
 
 def handle_restart_gateway_for_mcp(token: dict, params: dict) -> dict:
-    """SIGTERM the gateway so it reconnects with the updated mcpServers.
-    Functionally identical to the sub-agents restart — delegates to the
-    one shared routine. The client coalesces a batch of mcp.* commands
-    into a single restart on screen close."""
+    """No-op (delegates to the shared handler): the gateway hot-reloads
+    mcp.servers from openclaw.json, so enabling/disabling a server needs no
+    restart. Kept so the client's dispose() restart gets a clean `done`."""
     return handle_restart_gateway_for_subagents(token, params)
 
 
@@ -7177,13 +7140,6 @@ def main() -> int:
                         }
                         update_command(token, cmd["id"], patch)
                         _log(f"cmd {cmd['id']} -> {patch['status']}")
-                        if (
-                            cmd["type"] in _GATEWAY_RESTART_TRIGGERS
-                            and patch["status"] == "done"
-                        ):
-                            # Config mutated → gateway needs a reload, coalesced
-                            # into one restart at the end of this batch.
-                            _mark_gateway_dirty()
                     except urllib.error.HTTPError as e:
                         if e.code == 401:
                             token = None
@@ -7215,11 +7171,6 @@ def main() -> int:
                             )
                         except Exception:
                             pass
-                # One coalesced gateway restart per batch that mutated the
-                # config — replaces the client's fragile per-screen dispose
-                # restart (which could be lost) and avoids the no-orderBy race
-                # of a separate restart command landing before the install.
-                _restart_gateway_if_dirty("end of batch")
             else:
                 empty_polls += 1
 
@@ -10961,7 +10912,15 @@ from __future__ import annotations
 #          (tools-by-source + system-prompt/tool/chat token split) for the
 #          CTX detail screen. Reads the newest trajectory's context.compiled
 #          and correlates live usage from sessions.json.
-__VERSION__ = "1.16.0"
+# 1.17.0 — CTX dot honesto: un MCP configurado pero ausente del compiled ya no
+#          es siempre "error" (rojo). Si telemetry lo vio por primera vez DESPUÉS
+#          del último turno (recién activado, el gateway lo hot-recargó pero aún
+#          no entra a un contexto compilado) queda "connected" + pendingTurn:true
+#          ("listo en tu próximo mensaje"); solo si estaba desde antes del último
+#          turno y sus tools no aparecieron es "error" real (token malo). Arregla
+#          el rojo falso al activar un MCP y abrir CTX sin mandar mensaje. El
+#          gateway NO necesita reinicio (hot-reload); ver config-sync 1.21.1.
+__VERSION__ = "1.17.0"
 
 import argparse
 import asyncio
@@ -11419,6 +11378,12 @@ def _last_context_compiled(path: Path) -> Optional[Dict[str, Any]]:
     return found
 
 
+# First time telemetry saw each configured MCP id (epoch seconds). Lets the
+# CTX dot tell "freshly enabled, hot-loaded, lands next turn" (stays connected)
+# apart from "was available last turn but never compiled" (real error).
+_mcp_first_seen: Dict[str, float] = {}
+
+
 def _collect_compiled_context() -> Dict[str, Any]:
     """Friendly breakdown of the agent's *compiled* context for the current
     session — what `agent.context.get` returns to the CTX screen.
@@ -11514,12 +11479,34 @@ def _collect_compiled_context() -> Dict[str, Any]:
         }
         for src_id, src_tools in grouped.items()
     ]
+    # A configured MCP whose tools aren't in the compiled set is either freshly
+    # enabled (the gateway hot-reloaded it but no turn has compiled it in yet —
+    # its tools land in the agent's NEXT message) or genuinely failed (it was
+    # available when the last turn compiled but its tools never showed, e.g. a
+    # bad token). Distinguish by recency: an id first seen AFTER the last turn's
+    # trajectory write stays "connected" (hot-loaded, ready next turn) with a
+    # `pendingTurn` hint; one seen before that turn is a real "error". Fixes the
+    # stale red dot when you enable an MCP and open CTX before sending a message.
+    now = time.time()
+    for known in list(_mcp_first_seen):
+        if known not in configured_ids:
+            del _mcp_first_seen[known]
+    for mid in configured_ids:
+        _mcp_first_seen.setdefault(mid, now)
+    try:
+        last_turn_at = traj.stat().st_mtime if traj else 0.0
+    except OSError:
+        last_turn_at = 0.0
     for mid in configured_ids:
         if mid not in grouped:
-            sources.append({
+            fresh = _mcp_first_seen.get(mid, now) > last_turn_at
+            entry = {
                 "id": mid, "kind": "mcp", "toolCount": 0,
-                "status": "error", "tools": [],
-            })
+                "status": "connected" if fresh else "error", "tools": [],
+            }
+            if fresh:
+                entry["pendingTurn"] = True
+            sources.append(entry)
     # Stable order: system first, then MCPs by tool count desc, then id.
     sources.sort(key=lambda s: (s["kind"] != "system", -s["toolCount"], s["id"]))
 
