@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.41.0"
+TNODE_SETUP_VERSION="1.42.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -2941,7 +2941,17 @@ from __future__ import annotations
 #          el email, que se consolidó en TOOLS.md Regla 4. Retirados:
 #          _ensure_subagents_sections + las 3 funciones de email-SOUL (himalaya/
 #          email-send/unlink). _regenerate_agents_index se queda (roster).
-__VERSION__ = "1.20.0"
+# 1.21.0 — MCP: (a) _build_mcp_remote_entry honra secretsSchema[].valuePrefix
+#          (prefijo EXACTO del header: "Bearer " o "" crudo para x-api-key /
+#          CONTEXT7_API_KEY); sin el campo cae al heurístico legacy → desbloquea
+#          exa/context7. (b) Reinicio del gateway coalescido server-side: el loop
+#          marca dirty tras mcp.install/remove + install/uninstall_subagent (done)
+#          y _restart_gateway_if_dirty SIGTERMa UNA vez al cierre del batch; el
+#          restart_gateway_* explícito del cliente queda dirty-gated (no-op si ya
+#          se aplicó). Quita la dependencia del dispose() del cliente (frágil, sin
+#          orderBy) — arregla el punto rojo en CTX al activar un MCP, y el gemelo
+#          de Sub-Agentes.
+__VERSION__ = "1.21.0"
 
 import hashlib
 import hmac
@@ -6089,10 +6099,32 @@ def handle_uninstall_subagent(token: dict, params: dict) -> dict:
     }
 
 
-def handle_restart_gateway_for_subagents(token: dict, params: dict) -> dict:
-    """Sends SIGTERM to openclaw-gateway. systemd Restart=always respawns
-    with the new agents.list[]. Coalesce: client should send this once
-    after a batch of install/uninstall commands."""
+# Gateway reload is coalesced via a process-local "dirty" flag: any command
+# that mutates openclaw.json (mcp.install/remove, install/uninstall_subagent)
+# marks it dirty, and the command loop SIGTERMs the gateway ONCE at the end of
+# a batch iff dirty (systemd Restart=always respawns with the new config).
+# This replaces the old reliance on the client posting a separate
+# restart_gateway_* command from a screen's dispose() — fragile because dispose
+# may never fire AND query_pending_commands has no orderBy, so that restart
+# could race ahead of the install in the same batch. The client's explicit
+# command is still accepted but is now dirty-gated, so it no-ops when the loop
+# already applied the change (no double restart during the +141 transition).
+_gateway_dirty = False
+
+# Command types that mutate openclaw.json and thus require a gateway reload.
+_GATEWAY_RESTART_TRIGGERS = frozenset(
+    {"mcp.install", "mcp.remove", "install_subagent", "uninstall_subagent"}
+)
+
+
+def _mark_gateway_dirty() -> None:
+    global _gateway_dirty
+    _gateway_dirty = True
+
+
+def _sigterm_gateway() -> dict:
+    """SIGTERM every running openclaw-gateway process. systemd Restart=always
+    respawns it with the current openclaw.json (mcp.servers + agents.list)."""
     pids: list[int] = []
     try:
         out = subprocess.check_output(
@@ -6109,6 +6141,28 @@ def handle_restart_gateway_for_subagents(token: dict, params: dict) -> dict:
         except ProcessLookupError:
             pass
     return {"status": "done", "result": {"pids": pids}}
+
+
+def _restart_gateway_if_dirty(reason: str = "") -> dict:
+    """Restart the gateway only if openclaw.json changed since the last restart;
+    clears the dirty flag. Coalesces the end-of-batch auto-restart and the
+    client's explicit restart command into a single SIGTERM."""
+    global _gateway_dirty
+    if not _gateway_dirty:
+        return {"status": "done", "result": {"note": "no_change"}}
+    _gateway_dirty = False
+    res = _sigterm_gateway()
+    _log(f"gateway restart ({reason}): {res.get('result')}")
+    return res
+
+
+def handle_restart_gateway_for_subagents(token: dict, params: dict) -> dict:
+    """Client-posted coalesced restart (sub-agents + MCP share this handler).
+    Now dirty-gated: it SIGTERMs only when an install/remove left the config
+    dirty — otherwise the end-of-batch auto-restart already handled it and this
+    is a no-op. Kept for backward-compat with shipped clients that still post it
+    on screen dispose()."""
+    return _restart_gateway_if_dirty("explicit command")
 
 
 # ── MCP servers (Direction A — node CONSUMES 3rd-party MCP servers) ──
@@ -6133,9 +6187,11 @@ _MCP_OPENCLAW_TRANSPORT = {"http": "streamable-http", "sse": "sse"}
 def _build_mcp_remote_entry(fields: dict, secrets: dict) -> dict:
     """Build an openclaw.json mcpServers[] entry for a REMOTE server.
     secretsSchema entries with target=='header' are injected into
-    `headers`; an Authorization header gets the `Bearer ` prefix unless
-    the value already carries one. Raises ValueError on bad config or a
-    missing required secret."""
+    `headers`; each value is prefixed per the spec's `valuePrefix`
+    ("Bearer " for bearer auth, "" for raw-key headers like x-api-key /
+    CONTEXT7_API_KEY). Specs without a `valuePrefix` (older catalog docs)
+    fall back to the legacy heuristic (Authorization → "Bearer ", else
+    raw). Raises ValueError on bad config or a missing required secret."""
     transport = (fields.get("transport") or "").strip()
     url = (fields.get("url") or "").strip()
     if transport not in _MCP_REMOTE_TRANSPORTS or not url:
@@ -6154,11 +6210,22 @@ def _build_mcp_remote_entry(fields: dict, secrets: dict) -> dict:
             if spec.get("required"):
                 raise ValueError(f"missing_secret: {key}")
             continue
+        value = str(value)
         header_name = spec.get("headerName") or "Authorization"
-        if header_name.lower() == "authorization" and not str(value).lower().startswith("bearer "):
+        # valuePrefix (catalog, config-sync >= 1.21): EXACTLY what to prepend
+        # to the secret — "Bearer " for bearer servers, "" for raw-key headers
+        # (x-api-key, CONTEXT7_API_KEY). Absent (older catalog docs) → legacy
+        # heuristic: Authorization gets "Bearer ", any other header stays raw.
+        if "valuePrefix" in spec:
+            prefix = spec.get("valuePrefix") or ""
+            if prefix and value.lower().startswith(prefix.lower()):
+                headers[header_name] = value
+            else:
+                headers[header_name] = f"{prefix}{value}"
+        elif header_name.lower() == "authorization" and not value.lower().startswith("bearer "):
             headers[header_name] = f"Bearer {value}"
         else:
-            headers[header_name] = str(value)
+            headers[header_name] = value
     if headers:
         entry["headers"] = headers
     return entry
@@ -7110,6 +7177,13 @@ def main() -> int:
                         }
                         update_command(token, cmd["id"], patch)
                         _log(f"cmd {cmd['id']} -> {patch['status']}")
+                        if (
+                            cmd["type"] in _GATEWAY_RESTART_TRIGGERS
+                            and patch["status"] == "done"
+                        ):
+                            # Config mutated → gateway needs a reload, coalesced
+                            # into one restart at the end of this batch.
+                            _mark_gateway_dirty()
                     except urllib.error.HTTPError as e:
                         if e.code == 401:
                             token = None
@@ -7141,6 +7215,11 @@ def main() -> int:
                             )
                         except Exception:
                             pass
+                # One coalesced gateway restart per batch that mutated the
+                # config — replaces the client's fragile per-screen dispose
+                # restart (which could be lost) and avoids the no-orderBy race
+                # of a separate restart command landing before the install.
+                _restart_gateway_if_dirty("end of batch")
             else:
                 empty_polls += 1
 
