@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.40.0"
+TNODE_SETUP_VERSION="1.41.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -2885,7 +2885,16 @@ from __future__ import annotations
 #          `channels`; _migrate_tools_v11 fuerza el compose, renderiza y limpia
 #          (una vez) las copias viejas que viven fuera de los markers;
 #          _ensure_tools_rules retirado; bootstrap-via-CF para nodos sin cache.
-__VERSION__ = "1.19.0"
+# 1.20.0 — SOUL.md / IDENTITY.md declarativos: el servidor compone sus zonas
+#          gestionadas ESTÁTICAS (operativa sub-agentes/archivos/entregables en
+#          SOUL; rol-coordinador en IDENTITY) vía la CF tnodeConfigSyncMd; el
+#          daemon las renderiza por hash entre markers tnode:soul/identity,
+#          appendeados al final (preservando la personalidad curada). _md_migrate
+#          limpia (una vez) las secciones legacy fuera de los markers — incluido
+#          el email, que se consolidó en TOOLS.md Regla 4. Retirados:
+#          _ensure_subagents_sections + las 3 funciones de email-SOUL (himalaya/
+#          email-send/unlink). _regenerate_agents_index se queda (roster).
+__VERSION__ = "1.20.0"
 
 import hashlib
 import hmac
@@ -4308,70 +4317,12 @@ def _regenerate_agents_index() -> None:
         _log(f"_regenerate_agents_index: write failed: {e}")
 
 
-_SUBAGENTS_SECTION_SOUL = """
-## Sub-agentes disponibles
-
-Lee `~/.openclaw/agency-agents/AGENTS_INDEX.md` al iniciar tu sesión para conocer el roster completo y sus especialidades. Úsalo para decidir cuándo invocar `sessions_spawn(runtime="subagent", agentId=<id>, task=...)`.
-"""
-
-_SUBAGENTS_SECTION_IDENTITY = """
-## Sub-agentes a tu disposición
-
-Eres el coordinador principal. Cuando una tarea encaja con la especialidad de un sub-agente del roster (ver `~/.openclaw/agency-agents/AGENTS_INDEX.md`), delégala con `sessions_spawn(runtime="subagent", agentId=<id>, task=...)` en lugar de hacerla tú mismo.
-"""
-
-_SEND_FILE_SECTION_SOUL = """
-## Envío de archivos al chat
-
-Cuando produzcas un archivo (PDF, imagen, código, etc.) que el usuario quiera abrir desde su app, NO le pases la ruta como texto. Incluye un marker exacto en tu respuesta así:
-
-    [adjunto: /ruta/absoluta/al/archivo.pdf]
-
-El sistema detecta el marker, sube el archivo a un canal seguro y lo reemplaza por un chip descargable en el chat (el usuario lo toca y se abre con su visor nativo).
-
-Reglas:
-- El archivo debe vivir bajo `~/.openclaw/workspace/`. Cualquier otra ruta es rechazada por seguridad.
-- Tamaño máximo: 50 MB.
-- Tipos comunes aceptados: PDF, imágenes, texto, código, ZIP/TAR/GZ, JSON/XML.
-- Puedes mezclar varios markers con texto normal: "Aquí tienes el reporte [adjunto: workspace/foo.pdf] y los datos [adjunto: workspace/bar.csv]".
-- NO uses `MEDIA:`, `file://`, ni rutas crudas — siempre el formato `[adjunto: <ruta>]`.
-"""
-
-_DOWNLOAD_FOLDER_SECTION_SOUL = """
-## Entregables descargables — workspace/download/
-
-Cuando produzcas un archivo que el usuario quiera consultar más tarde (no solo este turno del chat), guárdalo bajo:
-
-    ~/.openclaw/workspace/download/<nombre-descriptivo>.<ext>
-
-El usuario lo verá en la app → Almacenamiento → Local → tab "Descarga", ordenado por fecha de modificación. Desde ahí puede descargarlo a su dispositivo o borrarlo.
-
-Cuando lo anuncies en el chat, sigue usando el marker `[adjunto: workspace/download/<nombre>]` (ver sección "Envío de archivos al chat" para reglas del marker) — el chip clicable aparece en la conversación Y el archivo persiste en la pantalla Almacenamiento.
-
-Reglas adicionales para entregables:
-- Usa nombres descriptivos en kebab-case con fecha cuando aplique: `reporte-ventas-q1-2026.pdf`, no `out.pdf`.
-- Si reemplazas un archivo (e.g. nueva versión del mismo reporte), mantén el mismo nombre para no acumular duplicados.
-- Para archivos efímeros del turno actual (cálculos intermedios, screenshots de debug, etc.), usa `workspace/` raíz, no `workspace/download/`. La pantalla Almacenamiento solo lista `upload/` (lo que el user te mandó) y `download/` (tus entregables formales).
-"""
-
-
-_EMAIL_SEND_SECTION_SOUL = """
-
-## Envío de correos — vía skill email-send
-
-Para mandar correos electrónicos en este nodo usa el script:
-
-```bash
-~/.openclaw/workspace/skills/email-send/bin/send.py \\
-  --to destinatario@ejemplo.com \\
-  --subject "Asunto" \\
-  --body "Cuerpo en texto plano"
-```
-
-Este es el ÚNICO path de envío que funciona aquí. **NO uses** `smtplib`, `himalaya message send`, `mail`, `sendmail`, ni `curl smtp://...` — todos timeout porque el proveedor cloud bloquea SMTP outbound (puertos 465 y 587).
-
-Para detalles completos (HTML, CC, --from, manejo de errores) consulta `~/.openclaw/workspace/skills/email-send/SKILL.md`.
-"""
+# Las secciones operativas de SOUL.md (sub-agentes / envío de archivos /
+# entregables) y la de IDENTITY.md (rol-coordinador) ya NO se componen aquí:
+# el servidor (soul_identity_sync.ts) las compone como zonas gestionadas
+# declarativas y el daemon las renderiza por hash (ver "SOUL.md / IDENTITY.md
+# renderer" más abajo). La de email salió de SOUL del todo (v1.20.0):
+# TOOLS.md Regla 4 ya la cubre.
 
 
 # `_EMAIL_SEND_SKILL_MD` y `_EMAIL_SEND_SEND_PY` son el contenido canónico
@@ -5664,6 +5615,276 @@ def _migrate_tools_v11() -> None:
         _log(f"tools-migrate: {e}")
 
 
+# ── SOUL.md / IDENTITY.md renderer (zonas gestionadas estáticas) ──
+# Mismo patrón declarativo que TOOLS.md, pero el servidor compone zonas
+# ESTÁTICAS (operativa sub-agentes/archivos/entregables en SOUL; rol
+# coordinador en IDENTITY). El email NO va aquí (TOOLS.md Regla 4 lo cubre).
+# Sin triggers: el daemon compone vía el endpoint HMAC genérico
+# tnodeConfigSyncMd en la migración/bootstrap. Markers appendeados AL FINAL
+# (preservando la personalidad curada de arriba). A diferencia de TOOLS.md,
+# NO creamos el archivo si no existe: SOUL.md/IDENTITY.md son del agente
+# (OpenClaw los siembra) — solo renderizamos en archivos ya presentes.
+MD_SYNC_URL = os.environ.get(
+    "TNODE_MD_SYNC_URL",
+    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/tnodeConfigSyncMd",
+)
+
+_MD_TARGETS = {
+    "soul": {
+        "md_name": "SOUL.md",
+        "zone_start": "<!-- tnode:soul:start -->",
+        "zone_end": "<!-- tnode:soul:end -->",
+        "hash_path": OPENCLAW_DIR / ".tnode-soul-hash",
+        "hash_field": "soulHash",
+        "json_field": "soulJson",
+        "sentinel": OPENCLAW_DIR / ".tnode-soul-v2-migrated",
+        "backup_name": "SOUL.md.bak-pre-v2",
+        # Headers (lowercased) de las secciones que el daemon appendeaba antes y
+        # que la migración quita de FUERA de los markers. Incluye las 2 de email
+        # (himalaya / email-send): en v1.20.0 salieron de SOUL del todo —
+        # TOOLS.md Regla 4 las cubre.
+        "legacy_headers": (
+            "## sub-agentes disponibles",
+            "## envío de archivos al chat",
+            "## entregables descargables",
+            "## email del usuario",
+            "## envío de correos",
+        ),
+    },
+    "identity": {
+        "md_name": "IDENTITY.md",
+        "zone_start": "<!-- tnode:identity:start -->",
+        "zone_end": "<!-- tnode:identity:end -->",
+        "hash_path": OPENCLAW_DIR / ".tnode-identity-hash",
+        "hash_field": "identityHash",
+        "json_field": "identityJson",
+        "sentinel": OPENCLAW_DIR / ".tnode-identity-v2-migrated",
+        "backup_name": "IDENTITY.md.bak-pre-v2",
+        "legacy_headers": (
+            "## sub-agentes a tu disposición",
+        ),
+    },
+}
+
+_md_bootstrap_attempted: dict = {}
+
+
+def _md_read_local_hash(target: str) -> str:
+    try:
+        return _MD_TARGETS[target]["hash_path"].read_text(encoding="utf-8").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _md_write_local_hash(target: str, value: str) -> None:
+    try:
+        _MD_TARGETS[target]["hash_path"].write_text(value, encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        _log(f"md-sync[{target}]: hash write failed: {e}")
+
+
+def _md_apply_zone(target: str, zone_text: str) -> bool:
+    """Replace the content between the managed markers in workspace/<md>,
+    APPENDING the zone at the END (after the curated personality) when the
+    markers are absent. Returns False (and does nothing) when the file does
+    NOT exist — we never create SOUL/IDENTITY, they belong to the agent.
+    Atomic write."""
+    desc = _MD_TARGETS[target]
+    p = OPENCLAW_DIR / "workspace" / desc["md_name"]
+    if not p.is_file():
+        return False
+    start, end = desc["zone_start"], desc["zone_end"]
+    text = p.read_text(encoding="utf-8")
+    block = f"{start}\n{zone_text}\n{end}"
+    if start in text and end in text:
+        pre = text.split(start, 1)[0].rstrip()
+        post = text.split(end, 1)[1].lstrip("\n")
+        new = pre + "\n\n" + block + ("\n\n" + post if post.strip() else "\n")
+    else:
+        base = text.rstrip()
+        new = (base + "\n\n" + block + "\n") if base else (block + "\n")
+    if new != text:
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(new, encoding="utf-8")
+        os.replace(tmp, p)
+    return True
+
+
+def _md_compose_via_cf(target: str) -> dict | None:
+    """POST the generic HMAC endpoint to force the server to compose <md>.
+    Signs `${nodeId}:${ts}:${nonce}:md:${target}:refresh` with nodeSecret.
+    Returns the {ok, target, hash, doc} response, or None on failure."""
+    cfg = load_config()
+    node_id = cfg.get("nodeId")
+    node_secret = cfg.get("nodeSecret")
+    if not node_id or not node_secret:
+        return None
+    ts = str(int(time.time() * 1000))
+    nonce = os.urandom(16).hex()
+    action = "refresh"
+    sig = hmac.new(
+        node_secret.encode("utf-8"),
+        f"{node_id}:{ts}:{nonce}:md:{target}:{action}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    body = json.dumps({
+        "nodeId": node_id,
+        "timestamp": ts,
+        "nonce": nonce,
+        "signature": sig,
+        "target": target,
+        "action": action,
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            MD_SYNC_URL,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:  # noqa: BLE001
+        _log(f"md-sync[{target}]: CF compose failed: {e}")
+        return None
+
+
+def _md_render_from_resp(target: str, resp: dict) -> bool:
+    """Render the managed zone from a compose response + persist the local
+    hash. Returns False (without persisting) when the file is missing so the
+    caller retries on a later poll."""
+    doc = resp.get("doc") if isinstance(resp, dict) else None
+    if not isinstance(doc, dict):
+        return False
+    try:
+        if not _md_apply_zone(target, _render_tools_zone(doc.get("blocks") or [])):
+            return False  # file missing → not rendered yet
+        h = resp.get("hash") or ""
+        if h:
+            _md_write_local_hash(target, h)
+        _log(f"md-sync[{target}]: rendered {len(doc.get('blocks') or [])} blocks via CF")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _log(f"md-sync[{target}]: CF render failed: {e}")
+        return False
+
+
+def _md_sync_from_json(token: dict, target: str) -> None:
+    """Render the managed zone of <md> from the node's cached {target}Json.
+    Cheap hash check first; only rewrites on change. Resilient: any failure
+    leaves the file untouched. Bootstrap via CF when there is no cache yet."""
+    desc = _MD_TARGETS[target]
+    try:
+        remote_hash = _firestore_get_node_field(token, desc["hash_field"])
+    except Exception as e:  # noqa: BLE001
+        _log(f"md-sync[{target}]: hash read failed: {e}")
+        return
+    if not remote_hash:
+        # Bootstrap: nodo sin cache. Forzamos UNA composición vía la CF (una
+        # vez por proceso) para sembrar el hash; el render real ocurre aquí o
+        # en un poll posterior cuando el archivo ya exista.
+        if not _md_bootstrap_attempted.get(target):
+            _md_bootstrap_attempted[target] = True
+            resp = _md_compose_via_cf(target)
+            if isinstance(resp, dict) and resp.get("ok"):
+                _md_render_from_resp(target, resp)
+        return
+    md = OPENCLAW_DIR / "workspace" / desc["md_name"]
+    if remote_hash == _md_read_local_hash(target) and md.is_file():
+        return  # sin cambios → no reescribir
+    try:
+        raw = _firestore_get_node_field(token, desc["json_field"])
+        doc = json.loads(raw) if raw else None
+    except Exception as e:  # noqa: BLE001
+        _log(f"md-sync[{target}]: json read/parse failed: {e}")
+        return
+    if not isinstance(doc, dict):
+        return
+    blocks = doc.get("blocks") or []
+    try:
+        if _md_apply_zone(target, _render_tools_zone(blocks)):
+            _md_write_local_hash(target, remote_hash)
+            _log(f"md-sync[{target}]: rendered {len(blocks)} blocks (hash {remote_hash[:12]})")
+    except Exception as e:  # noqa: BLE001
+        _log(f"md-sync[{target}]: render failed: {e}")
+
+
+def _md_strip_legacy_sections(target: str, text: str) -> str:
+    """Drop the legacy `## …` sections the daemon used to append (now
+    server-composed inside the managed zone, or — for email — moved entirely
+    to TOOLS.md). Preserves the managed zone and any curated content."""
+    desc = _MD_TARGETS[target]
+    start, end = desc["zone_start"], desc["zone_end"]
+    headers = desc["legacy_headers"]
+    zone = ""
+    pre, post = text, ""
+    if start in text and end in text:
+        pre = text.split(start, 1)[0]
+        rest = text.split(start, 1)[1]
+        zone_body = rest.split(end, 1)[0]
+        post = rest.split(end, 1)[1]
+        zone = f"{start}{zone_body}{end}"
+
+    def _strip_chunk(chunk: str) -> str:
+        lines = chunk.split("\n")
+        out: list = []
+        i, n = 0, len(lines)
+        while i < n and not lines[i].startswith("## "):
+            out.append(lines[i])
+            i += 1
+        while i < n:
+            sec = [lines[i]]
+            i += 1
+            while i < n and not lines[i].startswith("## "):
+                sec.append(lines[i])
+                i += 1
+            header = sec[0].strip().lower()
+            drop = any(header.startswith(h) for h in headers)
+            if not drop:
+                out.extend(sec)
+        return "\n".join(out)
+
+    new_pre = _strip_chunk(pre).rstrip()
+    new_post = _strip_chunk(post).strip()
+    if zone:
+        parts = [p for p in (new_pre, zone, new_post) if p]
+        return "\n\n".join(parts) + "\n"
+    return (new_pre + "\n") if new_pre else ""
+
+
+def _md_migrate(target: str) -> None:
+    """One-time: force the server to compose <md>, render it into the managed
+    zone (appended at the end), then strip the legacy sections that lived
+    outside the markers. Backup once. Only strips after a successful
+    compose+render → no gap if the CF is unreachable (retries next boot).
+    No-op until the file exists (a fresh node before OpenClaw seeds it)."""
+    desc = _MD_TARGETS[target]
+    sentinel = desc["sentinel"]
+    if sentinel.exists():
+        return
+    resp = _md_compose_via_cf(target)
+    if not (isinstance(resp, dict) and resp.get("ok")):
+        return  # CF inalcanzable / no pareado → reintenta, no toca nada
+    if not _md_render_from_resp(target, resp):
+        return  # archivo aún no existe → reintenta en otro poll
+    p = OPENCLAW_DIR / "workspace" / desc["md_name"]
+    try:
+        text = p.read_text(encoding="utf-8") if p.is_file() else ""
+        if text:
+            new = _md_strip_legacy_sections(target, text)
+            if new != text:
+                bak = p.with_name(desc["backup_name"])
+                if not bak.exists():
+                    bak.write_text(text, encoding="utf-8")
+                tmp = p.with_name(p.name + ".tmp")
+                tmp.write_text(new, encoding="utf-8")
+                os.replace(tmp, p)
+                _log(f"md-migrate[{target}]: stripped legacy sections outside markers")
+        sentinel.write_text("done", encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        _log(f"md-migrate[{target}]: {e}")
+
+
 def _resolve_himalaya_path() -> str:
     """Path absoluto al binario himalaya (which() falla bajo el PATH no
     interactivo de launchd en macOS, así que probamos ubicaciones comunes)."""
@@ -5726,52 +5947,18 @@ def _sync_channels_to_firestore(token: dict) -> None:
         _log(f"channels-sync: {e}")
 
 
-def _ensure_subagents_sections() -> None:
-    """Idempotently append operative sections to workspace/SOUL.md +
-    workspace/IDENTITY.md. Each section carries its own header marker
-    so the function is safe to call repeatedly — install_subagent and
-    every config-sync boot run it as a guard against workspace drift.
-
-    Sections appended:
-      - `## Sub-agentes disponibles` (SOUL): how to use the roster.
-      - `## Sub-agentes a tu disposición` (IDENTITY): delegate, don't do.
-      - `## Envío de archivos al chat` (SOUL): `[adjunto: <path>]` marker
-        protocol so the agent knows how to surface files to the mobile
-        app — sidecar tnode-chat-sync v1.10.0+ rewrites the marker into
-        an `[archivo:{id}]` after uploading the file.
-      - `## Envío de correos — vía skill email-send` (SOUL): only appears
-        on nodes where Resend has been linked via `channels.email.link`
-        — appended by `_handle_email_link_resend` (NOT by the targets
-        tuple below) because it would mislead Mac/Pi agents that have
-        outbound SMTP available."""
+def _ensure_workspace_dirs() -> None:
+    """Ensure workspace/download + workspace/upload exist — the storage widget
+    surfaces entries from here and the agent puts deliverables in download/.
+    (Was a side effect of the retired _ensure_subagents_sections; the operative
+    SOUL/IDENTITY sections it appended are now server-composed and rendered by
+    _md_sync_from_json.)"""
     workspace = OPENCLAW_DIR / "workspace"
-    # Ensure download / upload folders exist — the storage widget surfaces
-    # entries from here, and the agent is expected to put deliverables in
-    # workspace/download/. Idempotent: existing dirs are left untouched.
     try:
         (workspace / "download").mkdir(parents=True, exist_ok=True)
         (workspace / "upload").mkdir(parents=True, exist_ok=True)
     except Exception as e:  # noqa: BLE001
-        _log(f"_ensure_subagents_sections: workspace dirs: {e}")
-    targets = (
-        ("SOUL.md", "## Sub-agentes disponibles", _SUBAGENTS_SECTION_SOUL),
-        ("IDENTITY.md", "## Sub-agentes a tu disposición",
-         _SUBAGENTS_SECTION_IDENTITY),
-        ("SOUL.md", "## Envío de archivos al chat", _SEND_FILE_SECTION_SOUL),
-        ("SOUL.md", "## Entregables descargables — workspace/download/",
-         _DOWNLOAD_FOLDER_SECTION_SOUL),
-    )
-    for fname, marker, section in targets:
-        p = workspace / fname
-        if not p.is_file():
-            continue
-        try:
-            text = p.read_text(encoding="utf-8")
-            if marker in text:
-                continue
-            p.write_text(text.rstrip() + "\n" + section, encoding="utf-8")
-        except Exception as e:  # noqa: BLE001
-            _log(f"_ensure_subagents_sections: skipping {fname}: {e}")
+        _log(f"_ensure_workspace_dirs: {e}")
 
 
 def handle_install_subagent(token: dict, params: dict) -> dict:
@@ -5815,7 +6002,6 @@ def handle_install_subagent(token: dict, params: dict) -> dict:
             },
         )
         _regenerate_agents_index()
-        _ensure_subagents_sections()
     except Exception as e:  # noqa: BLE001
         _log(f"install_subagent {agent_id} failed: {e}")
         return {"status": "error", "result": {"error": str(e)[:500]}}
@@ -6258,99 +6444,12 @@ def _ensure_himalaya_installed() -> tuple[str, str]:
         return "", f"himalaya_download_failed: {str(e)[:200]}"
 
 
-# ── Agent guidance for the linked mailbox (SOUL section) ──────
-# Without this the agent never learns the account exists: fire-tested on
-# the Mini (2026-06-11), where legacy instructions kept routing mail to
-# other skills while himalaya sat configured and unused. Replace-on-relink
-# (the address may change), removed on unlink.
-
-_HIMALAYA_SOUL_MARKER = "## Email del usuario — vía himalaya"
-
-_HIMALAYA_SECTION_SOUL = """
-
-## Email del usuario — vía himalaya
-
-Este nodo tiene vinculada la cuenta de correo **{address}** (canal Email
-de la app TNode). La operas con el CLI himalaya — usa SIEMPRE el path
-completo `{himalaya_bin}`. Las credenciales viven en `~/.config/himalaya/`
-con permisos 600; nunca las menciones ni las pidas.
-
-1. ¿Te piden LEER o REVISAR la bandeja o un correo?
-
-```bash
-{himalaya_bin} envelope list -f INBOX -p 1 -s 10
-{himalaya_bin} message read <ID>
-```
-
-2. ¿Te piden MANDAR un correo? Avisa primero ("Voy a mandar el correo,
-   dame un momento...") y ejecuta con el mensaje raw:
-
-```bash
-{himalaya_bin} message send <<'MAIL'
-From: {address}
-To: destinatario@dominio.com
-Subject: Asunto
-
-Cuerpo del mensaje.
-MAIL
-```
-
-3. ¿Te piden RESPONDER un correo? Localiza el ID y el remitente con
-   `envelope list` / `message read`, y manda con `message send` usando
-   `Subject: Re: <asunto original>` y `To: <remitente>`.
-
-Mandar/leer correos cuando el usuario lo pide NO es una operación
-"sensible" ni de "infraestructura": es rutina de tu trabajo. Procede sin
-pedir permiso adicional.
-"""
-
-
-def _strip_soul_section(text: str, marker: str) -> str:
-    """Remove a `## …` section (marker line through the next `## ` heading
-    or EOF). No-op when the marker is absent."""
-    idx = text.find(marker)
-    if idx < 0:
-        return text
-    end = text.find("\n## ", idx + len(marker))
-    if end < 0:
-        return text[:idx].rstrip() + "\n"
-    return text[:idx].rstrip() + "\n\n" + text[end + len("\n") :]
-
-
-def _append_himalaya_soul_section(address: str, himalaya_bin: str) -> None:
-    """Idempotent upsert of the himalaya guidance into workspace/SOUL.md —
-    re-linking with a different account rewrites the section in place."""
-    soul = OPENCLAW_DIR / "workspace" / "SOUL.md"
-    if not soul.is_file():
-        return
-    try:
-        text = _strip_soul_section(
-            soul.read_text(encoding="utf-8"), _HIMALAYA_SOUL_MARKER
-        )
-        section = _HIMALAYA_SECTION_SOUL.format(
-            address=address, himalaya_bin=himalaya_bin
-        )
-        soul.write_text(text.rstrip() + section, encoding="utf-8")
-    except Exception as e:  # noqa: BLE001
-        _log(f"_append_himalaya_soul_section: {e}")
-
-
-def _remove_email_soul_sections() -> None:
-    """Drop BOTH email guidance sections (himalaya + email-send) on unlink
-    so the agent stops believing it can mail after the channel is gone."""
-    soul = OPENCLAW_DIR / "workspace" / "SOUL.md"
-    if not soul.is_file():
-        return
-    try:
-        text = soul.read_text(encoding="utf-8")
-        for marker in (
-            _HIMALAYA_SOUL_MARKER,
-            "## Envío de correos — vía skill email-send",
-        ):
-            text = _strip_soul_section(text, marker)
-        soul.write_text(text, encoding="utf-8")
-    except Exception as e:  # noqa: BLE001
-        _log(f"_remove_email_soul_sections: {e}")
+# La guía de correo para el agente vive ahora EXCLUSIVAMENTE en TOOLS.md
+# (Regla 4, compuesta por el servidor desde la subcolección `channels` vía
+# _sync_channels_to_firestore). v1.20.0 retiró las secciones de email de
+# SOUL.md (himalaya + email-send) y sus upserts/strips on link/unlink —
+# eran redundantes con TOOLS.md Regla 4 (que además es más completa). El
+# link/unlink de email ya no toca SOUL.md.
 
 
 def _resend_smoke_test(api_key: str) -> tuple[bool, str]:
@@ -6427,10 +6526,10 @@ def _handle_email_link_resend(params: dict) -> dict:
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "result": {"error": f"write_creds: {e}"}}
 
-    # Materialize the skill files + append SOUL section so the on-node
-    # agent picks the HTTPS path over smtplib on the next bootstrap.
+    # Materialize the skill files; the agent's email guidance lives in
+    # TOOLS.md Regla 4 (server-composed from the `channels` subcollection),
+    # not in SOUL.md anymore (v1.20.0).
     _ensure_email_send_skill()
-    _append_email_send_soul_section()
 
     now_ms = int(time.time() * 1000)
     state = _read_channels_state()
@@ -6452,25 +6551,6 @@ def _handle_email_link_resend(params: dict) -> dict:
             "linkedAt": now_ms,
         },
     }
-
-
-def _append_email_send_soul_section() -> None:
-    """One-shot append of the email-send SOUL section. Kept separate from
-    `_ensure_subagents_sections` so Mac/Pi nodes (where outbound SMTP
-    works) don't get the misleading 'DO blocks SMTP' guidance."""
-    soul = OPENCLAW_DIR / "workspace" / "SOUL.md"
-    if not soul.is_file():
-        return
-    try:
-        text = soul.read_text(encoding="utf-8")
-        marker = "## Envío de correos — vía skill email-send"
-        if marker in text:
-            return
-        soul.write_text(
-            text.rstrip() + _EMAIL_SEND_SECTION_SOUL, encoding="utf-8"
-        )
-    except Exception as e:  # noqa: BLE001
-        _log(f"_append_email_send_soul_section: {e}")
 
 
 def handle_channels_email_link(token: dict, params: dict) -> dict:
@@ -6542,10 +6622,9 @@ def handle_channels_email_link(token: dict, params: dict) -> dict:
             "result": {"error": "smoke_test_failed", "detail": err},
         }
 
-    # Teach the agent the mailbox exists — without this section it keeps
-    # routing mail through whatever legacy skill its workspace mentions.
-    _append_himalaya_soul_section(address, himalaya_bin)
-
+    # El agente aprende del buzón por TOOLS.md Regla 4 (compuesta por el
+    # servidor desde la subcolección `channels` que _sync_channels_to_firestore
+    # refleja en el siguiente ciclo). Ya no se appendea nada a SOUL.md.
     now_ms = int(time.time() * 1000)
     state = _read_channels_state()
     state["email"] = {
@@ -6585,9 +6664,9 @@ def handle_channels_email_unlink(token: dict, params: dict) -> dict:
             pass
         except Exception as e:  # noqa: BLE001
             _log(f"channels.email.unlink: rm {label}: {e}")
-    # Drop the agent guidance too — a stale section leaves the agent
-    # convinced it can still mail (and leaking the old address).
-    _remove_email_soul_sections()
+    # La guía de correo del agente (TOOLS.md Regla 4) se cae sola en el
+    # siguiente ciclo cuando _sync_channels_to_firestore refleja el canal como
+    # unlinked y el servidor recompone TOOLS.md sin el bloque de email.
     state = _read_channels_state()
     state["email"] = {"status": "unlinked"}
     _write_channels_state(state)
@@ -6933,7 +7012,7 @@ def main() -> int:
     # — failures here are logged but don't prevent the daemon loop.
     try:
         _regenerate_agents_index()
-        _ensure_subagents_sections()
+        _ensure_workspace_dirs()
         _ensure_workspace_skills()
     except Exception as e:  # noqa: BLE001
         _log(f"startup self-heal failed: {e}")
@@ -7027,6 +7106,12 @@ def main() -> int:
             _sync_channels_to_firestore(token)
             _migrate_tools_v11()
             _sync_tools_md_from_json(token)
+            # SOUL.md / IDENTITY.md: misma mecánica declarativa (zonas estáticas
+            # compuestas por el servidor). Migración one-time (limpia secciones
+            # legacy fuera de los markers) + render por hash. Resiliente igual.
+            for _md_target in ("soul", "identity"):
+                _md_migrate(_md_target)
+                _md_sync_from_json(token, _md_target)
 
             interval = POLL_IDLE_S if empty_polls >= IDLE_AFTER else POLL_ACTIVE_S
             time.sleep(interval)
