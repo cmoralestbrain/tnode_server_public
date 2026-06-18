@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.43.1"
+TNODE_SETUP_VERSION="1.43.2"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -2282,6 +2282,28 @@ materialize_pathb_plugins() {
 }
 # <<< END PATH B PLUGINS
 
+# Path B: enable the materialized plugins on every provision. materialize_pathb_plugins
+# INSTALLS them into ~/.openclaw/extensions/ with provenance, but cleanup-pre-snapshot
+# deletes openclaw.json so the snapshot ships NO plugins.entries; phase_tunnel then
+# regenerates a minimal openclaw.json (device-pair only) on each fresh provision. Re-
+# enable here, after phase_tunnel, via the SDK (openclaw plugins enable) — the plugins
+# are already present in extensions/ from the snapshot, so no re-install is needed. The
+# gateway hot-reloads plugins.entries (or recover_failed_openclaw_gateway restarts it),
+# so it loads them. Idempotent: a no-op when already enabled (full-install path).
+enable_pathb_plugins() {
+    local ext_dir="$OPENCLAW_HOME/extensions"
+    local pid
+    for pid in tbrain-context-engine tnode tnode-transport; do
+        if [[ -d "$ext_dir/$pid" ]]; then
+            if run_as_tnode openclaw plugins enable "$pid" </dev/null >/dev/null 2>&1; then
+                info "Path B: $pid enabled (SDK)"
+            else
+                warn "Path B: enable de $pid falló"
+            fi
+        fi
+    done
+}
+
 # Configure OpenClaw and transfer ownership to tnode user
 openclaw_configure_as_tnode() {
     # Ensure OPENCLAW_HOME exists and is owned by tnode before plugin install
@@ -3796,7 +3818,7 @@ from __future__ import annotations
 #          turno). handle_restart_gateway_for_mcp/_subagents quedan como no-ops
 #          que ack-ean el comando del dispose() del cliente. Se conserva el
 #          valuePrefix de 1.21.0 (a).
-__VERSION__ = "1.21.1"
+__VERSION__ = "1.21.2"
 
 import hashlib
 import hmac
@@ -4729,6 +4751,19 @@ def handle_apply_openrouter_key(token: dict, params: dict) -> dict:
     if not api_key:
         return {"status": "error", "result": {"error": "no_api_key_returned"}}
 
+    # Idempotent restart (v1.21.2): the gateway hot-reloads openclaw.json in
+    # place, and a SIGTERM restart drops every live WS (the app flashes its
+    # "disconnected" banner during the ~5s window). _apply_provider_to_openclaw
+    # merges, so re-applying the SAME key/model yields a byte-identical file.
+    # Capture the digest before/after and only restart when the config actually
+    # changed — so re-loading saldo (same key) no longer churns the gateway.
+    def _oc_digest() -> str:
+        try:
+            return hashlib.sha256(OPENCLAW_JSON_PATH.read_bytes()).hexdigest()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    before_digest = _oc_digest()
     try:
         _apply_provider_to_openclaw(
             "openrouter", base_url, model, api_key=api_key,
@@ -4737,7 +4772,11 @@ def handle_apply_openrouter_key(token: dict, params: dict) -> dict:
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "result": {"error": f"write_failed: {e}"}}
 
-    restart = _restart_openclaw_with_verify()
+    if _oc_digest() != before_digest:
+        restart = _restart_openclaw_with_verify()
+    else:
+        _log("apply_openrouter_key: openclaw.json unchanged — skipping gateway restart")
+        restart = {"ok": True, "skipped": "unchanged"}
     try:
         new_state = push_openclaw_config(token)
     except Exception as e:  # noqa: BLE001
@@ -15391,6 +15430,8 @@ main() {
         phase_openclaw
         phase_tunnel
         phase_tailscale
+        # Path B: re-enable the materialized plugins after phase_tunnel.
+        enable_pathb_plugins
     else
         # Update-only path: skip ollama / openclaw kernel reinstall / tunnel
         # provisioning / tailscale. Kernel + cloudflared refresh is delegated
