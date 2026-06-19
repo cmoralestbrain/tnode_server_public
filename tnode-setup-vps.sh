@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.43.2"
+TNODE_SETUP_VERSION="1.43.3"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -8396,7 +8396,7 @@ Env/overrides:
   TNODE_CHAT_SYNC_GATEWAY_WS  Gateway WS url (default ws://127.0.0.1:18789)
 """
 from __future__ import annotations
-__VERSION__ = "1.21.0"
+__VERSION__ = "1.22.0"
 
 import hashlib
 import hmac
@@ -10245,6 +10245,21 @@ def assistant_turn_from(entry: dict):
     # assistant turns — they stream over WebSocket and would be lost if the
     # app closes mid-response.
     if role != "assistant":
+        return None
+    # Channel-delivery mirrors: OpenClaw records `message send` outbounds (and
+    # other channel deliveries) as an assistant message with
+    # `model="delivery-mirror"` and NO runId/sessionKey — distinct from a real
+    # agent turn (which carries the actual model + a runId, and on v2026.5.x
+    # arrives via `model.completed`). The channel already delivered the message
+    # to its real target; with no sessionKey, flush_turn can't route it and
+    # defaults it to the OWNER's space — leaking guest-/channel-targeted sends
+    # into the owner's chat. Incident 2026-06-18: `openclaw message send
+    # --channel tnode --target <guest>` showed up in the owner's chat on nodes
+    # where OpenClaw emits the send as a delivery-mirror instead of a
+    # model.completed turn (the VPS happened to emit model.completed and routed
+    # correctly; the Mini emitted delivery-mirror and leaked — same OpenClaw +
+    # chat-sync versions). Never mirror these to the app thread.
+    if msg.get("model") == "delivery-mirror":
         return None
     content = extract_content(msg.get("content") or entry.get("content"))
     if not content.strip():
