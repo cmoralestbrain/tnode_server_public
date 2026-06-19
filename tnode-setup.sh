@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.43.3"
+TNODE_SETUP_VERSION="1.43.4"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -3818,7 +3818,7 @@ from __future__ import annotations
 #          turno). handle_restart_gateway_for_mcp/_subagents quedan como no-ops
 #          que ack-ean el comando del dispose() del cliente. Se conserva el
 #          valuePrefix de 1.21.0 (a).
-__VERSION__ = "1.21.2"
+__VERSION__ = "1.21.3"
 
 import hashlib
 import hmac
@@ -6151,6 +6151,224 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 '''
+
+_POLL_SKILL_MD = r'''# poll — difundir encuestas a los invitados
+
+Crea o reparte encuestas a TODOS los miembros (invitados) del nodo. A cada uno
+le aparece en su chat y puede votar; el conteo se actualiza en vivo y el dueño
+lo ve desde su app.
+
+`create` arma una encuesta nueva desde el prompt; `broadcast` reparte de nuevo
+la última que el dueño creó en la app (botón + → Encuesta). Solo el dueño puede
+crear/difundir — la firma HMAC con el `nodeSecret` del nodo lo garantiza del
+lado del servidor; los invitados no pueden.
+
+## Uso
+
+Crear (y repartir) una encuesta nueva — pregunta + 2 a 12 opciones (agrega
+`--multi` si permites varias respuestas):
+
+    python3 ~/.openclaw/workspace/skills/poll/bin/poll.py create \
+      --question "¿Snack para el viernes?" \
+      --option "Pizza" --option "Sushi" --option "Tacos"
+
+Difundir de nuevo la última encuesta del dueño a todos los invitados:
+
+    python3 ~/.openclaw/workspace/skills/poll/bin/poll.py broadcast
+
+Respuesta (JSON a stdout):
+
+    { "ok": true, "pollId": "...", "question": "¿...?", "delivered": 3 }
+
+- `question` — la pregunta de la encuesta difundida.
+- `delivered` — a cuántos invitados llegó.
+
+Confírmalo en lenguaje natural: "Listo, mandé la encuesta '¿...?' a 3
+invitados."
+
+## Errores (JSON `{ "error": "..." }`, exit 1)
+
+- `missing_question` / `bad_options` — al crear faltó la pregunta o el número
+  de opciones no está entre 2 y 12. Pídele los datos al dueño.
+- `no_open_poll` — (solo en `broadcast`) el dueño no tiene una encuesta
+  reciente. Pídele que la cree o usa `create`.
+- `not_registered` / `not_paired` — el nodo aún no está vinculado.
+- `bad_signature` — el `nodeSecret` no coincide (no debería pasar en un nodo
+  sano).
+- `transport_error` / `curl_failed` — problema de red al llamar al servidor.
+
+## Detalles
+
+- Endpoint: `pollApi` (Cloud Function), firma HMAC-SHA256 sobre
+  `nodeId:timestamp:nonce:poll:broadcast` con el `nodeSecret` de
+  `~/.openclaw/tnode-chat-sync.json`.
+- El servidor resuelve al dueño del nodo, toma su encuesta más reciente y
+  escribe la burbuja `[poll:{id}]` en el chat de cada miembro (Admin SDK).
+- Difundir una encuesta NO es operación sensible ni de infraestructura:
+  procede sin pedir permiso adicional.
+'''
+
+_POLL_MANIFEST = r'''{
+  "name": "poll",
+  "version": "1.1.0",
+  "type": "openclaw-skill",
+  "entrypoint": "SKILL.md"
+}
+'''
+
+_POLL_PY = r'''#!/usr/bin/env python3
+"""poll — difunde una encuesta del dueño a todos los invitados del nodo.
+
+__VERSION__ = "1.1.0"
+
+Thin client del endpoint `pollApi` (Cloud Function, HMAC con el nodeSecret de
+tnode-chat-sync.json; la firma incluye namespace + action:
+`nodeId:ts:nonce:poll:<action>`). Transporte `curl` via subprocess: urllib
+falla TLS en el python de sistema de macOS (gotcha conocido) y curl existe en
+toda la flota (Mac/Linux).
+
+La encuesta puede crearse desde la app TNode (botón +) o por este skill
+(`create`); en ambos casos le aparece en el chat a todos los miembros del nodo
+y pueden votar (el conteo se actualiza en vivo). `broadcast` reparte de nuevo
+la última encuesta. Solo el dueño puede crear/difundir — la firma HMAC con el
+nodeSecret del nodo lo garantiza server-side.
+
+Salida: JSON a stdout. Exit 0 en ok, 1 en error (el JSON de error también va a
+stdout porque trae información accionable).
+
+Uso:
+  poll.py create --question "¿...?" --option A --option B [--multi]
+                               # crea y reparte una encuesta nueva (2-12 opciones)
+  poll.py broadcast            # difunde de nuevo la última encuesta del dueño
+"""
+
+import argparse
+import datetime as dt
+import hashlib
+import hmac
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import uuid
+
+POLL_URL = os.environ.get(
+    "TNODE_POLL_URL",
+    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/pollApi",
+)
+
+
+def _openclaw_home() -> pathlib.Path:
+    home = os.environ.get("OPENCLAW_HOME")
+    return pathlib.Path(home) if home else pathlib.Path.home() / ".openclaw"
+
+
+def _config_path() -> pathlib.Path:
+    return _openclaw_home() / "tnode-chat-sync.json"
+
+
+def _die(msg: str) -> None:
+    print(json.dumps({"error": msg}))
+    sys.exit(1)
+
+
+def _load_auth() -> tuple[str, str]:
+    path = _config_path()
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        _die(f"config_not_found: {path}")
+    except json.JSONDecodeError:
+        _die(f"config_invalid_json: {path}")
+    node_id = data.get("nodeId")
+    node_secret = data.get("nodeSecret")
+    if not node_id or not node_secret:
+        _die(f"config_missing_fields: {path}")
+    return node_id, node_secret
+
+
+def _signed_body(action: str, params: dict) -> str:
+    node_id, node_secret = _load_auth()
+    ts = str(int(dt.datetime.now().timestamp() * 1000))
+    nonce = uuid.uuid4().hex
+    signature = hmac.new(
+        node_secret.encode(),
+        f"{node_id}:{ts}:{nonce}:poll:{action}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return json.dumps({
+        "action": action,
+        "nodeId": node_id,
+        "timestamp": ts,
+        "nonce": nonce,
+        "signature": signature,
+        "params": params,
+    })
+
+
+def _call(action: str, params: dict) -> None:
+    body = _signed_body(action, params)
+    try:
+        proc = subprocess.run(
+            [
+                "curl", "-sS", "-X", "POST",
+                "-H", "Content-Type: application/json",
+                "--max-time", "30",
+                "-d", "@-",
+                POLL_URL,
+            ],
+            input=body.encode(),
+            capture_output=True,
+            timeout=40,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        _die(f"transport_error: {e}")
+    out = proc.stdout.decode().strip()
+    if proc.returncode != 0:
+        _die(f"curl_failed: {proc.stderr.decode().strip()[:200]}")
+    if not out:
+        _die("empty_response")
+    print(out)
+    try:
+        parsed = json.loads(out)
+    except json.JSONDecodeError:
+        sys.exit(1)
+    sys.exit(0 if parsed.get("ok") else 1)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="poll.py")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("broadcast", help="difunde la última encuesta del dueño")
+    p_create = sub.add_parser(
+        "create", help="crea y reparte una encuesta nueva (2-12 opciones)")
+    p_create.add_argument("--question", required=True, help="la pregunta")
+    p_create.add_argument(
+        "--option", action="append", default=[], dest="options",
+        help="una opción (repetir entre 2 y 12 veces)")
+    p_create.add_argument(
+        "--multi", action="store_true", help="permite seleccionar varias")
+    args = ap.parse_args()
+    if args.cmd == "broadcast":
+        _call("broadcast", {})
+    elif args.cmd == "create":
+        question = args.question.strip()
+        options = [o.strip() for o in args.options if o.strip()]
+        if not question:
+            _die("missing_question")
+        if len(options) < 2:
+            _die("need_2_options")
+        if len(options) > 12:
+            _die("too_many_options")
+        _call("create",
+              {"question": question, "options": options, "multi": args.multi})
+
+
+if __name__ == "__main__":
+    main()
+'''
+
 # <<< END EMBEDDED WORKSPACE SKILLS
 
 
@@ -6262,7 +6480,7 @@ def _ensure_workspace_skill(name: str, files: dict) -> None:
 
 
 def _ensure_workspace_skills() -> None:
-    """agenda + drive on every node (startup self-heal)."""
+    """agenda + drive + poll on every node (startup self-heal)."""
     _ensure_workspace_skill("agenda", {
         "SKILL.md": _AGENDA_SKILL_MD,
         "manifest.json": _AGENDA_MANIFEST,
@@ -6272,6 +6490,11 @@ def _ensure_workspace_skills() -> None:
         "SKILL.md": _DRIVE_SKILL_MD,
         "manifest.json": _DRIVE_MANIFEST,
         "bin/drive.py": _DRIVE_PY,
+    })
+    _ensure_workspace_skill("poll", {
+        "SKILL.md": _POLL_SKILL_MD,
+        "manifest.json": _POLL_MANIFEST,
+        "bin/poll.py": _POLL_PY,
     })
 
 
