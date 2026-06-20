@@ -3818,6 +3818,7 @@ from __future__ import annotations
 #          turno). handle_restart_gateway_for_mcp/_subagents quedan como no-ops
 #          que ack-ean el comando del dispose() del cliente. Se conserva el
 #          valuePrefix de 1.21.0 (a).
+# 1.21.3 — embed poll skill (create+broadcast) en _ensure_workspace_skills.
 __VERSION__ = "1.21.3"
 
 import hashlib
@@ -6368,7 +6369,6 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 '''
-
 # <<< END EMBEDDED WORKSPACE SKILLS
 
 
