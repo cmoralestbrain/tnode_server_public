@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.43.4"
+TNODE_SETUP_VERSION="1.44.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -3866,7 +3866,22 @@ from __future__ import annotations
 #          que ack-ean el comando del dispose() del cliente. Se conserva el
 #          valuePrefix de 1.21.0 (a).
 # 1.21.3 — embed poll skill (create+broadcast) en _ensure_workspace_skills.
-__VERSION__ = "1.21.3"
+# 1.22.0 — TEAM_INDEX.md declarativo (delegación entre TNodes): el servidor
+#          compone agency-agents/TEAM_INDEX.md (roster de peers: alias, rol,
+#          especialidad derivada del toolsJson de cada peer) + el bloque
+#          "equipo" de IDENTITY.md (condicional a peers), vía la CF
+#          tnodeConfigSyncMd target="team". El daemon lo renderiza como ARCHIVO
+#          DEDICADO completo (no entre markers, como AGENTS_INDEX.md) por hash:
+#          _team_index_sync_from_json + _render_team_index. Sin peers el roster
+#          se borra. Análogo a sub-agentes (IDENTITY→AGENTS_INDEX→sessions_spawn):
+#          aquí IDENTITY→TEAM_INDEX→tnode-delegate. Recompose vía trigger
+#          onWrite(peers/) (server-side, junto al de TOOLS.md de F4).
+# 1.23.0 — embed del skill tnode-delegate en _ensure_workspace_skills (+ FILES
+#          en embed_workspace_skills.py): el daemon materializa
+#          workspace/skills/tnode-delegate/ en cada boot (como agenda/drive/
+#          poll) para que el nodo pueda DELEGAR a sus peers sin SCP manual.
+#          Pareja del TEAM_INDEX de 1.22.0 (que ya renderiza el roster).
+__VERSION__ = "1.23.0"
 
 import hashlib
 import hmac
@@ -4858,6 +4873,11 @@ _AGENTS_DIR = OPENCLAW_DIR / "agents"
 _SUBAGENT_FILES = ("SOUL.md", "AGENTS.md", "IDENTITY.md")
 _SUBAGENT_DEFAULT_MODEL = "openrouter/qwen/qwen3.6-plus"
 _AGENTS_INDEX_PATH = OPENCLAW_DIR / "agency-agents" / "AGENTS_INDEX.md"
+# TEAM_INDEX.md = roster de TNodes-peer a los que delegar (skill tnode-delegate),
+# hermano dedicado de AGENTS_INDEX.md. Lo compone la CF (target="team", lee
+# peers/ + el toolsJson de cada peer) y el daemon lo renderiza como archivo
+# completo por hash (ver "TEAM_INDEX.md renderer"). Sin peers → se borra.
+_TEAM_INDEX_PATH = OPENCLAW_DIR / "agency-agents" / "TEAM_INDEX.md"
 
 
 def _firestore_get_agent_doc(token: dict, agent_id: str) -> dict | None:
@@ -6416,6 +6436,398 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 '''
+
+_TNODE_DELEGATE_SKILL_MD = r'''# tnode-delegate
+
+Delega una tarea al agente de **otro de tus nodos** (un "peer" que el dueño
+enlazó en el widget **Equipo** de la app) y usa su respuesta para continuar tu
+trabajo. El nodo destino resuelve la tarea con **sus** herramientas, skills y
+contexto — tú no necesitas tener lo que él tiene.
+
+## Cuándo usarlo
+
+Cuando una tarea necesita un **canal, skill, contexto o acceso que ESTE nodo
+no tiene pero otro de tus nodos SÍ**. En vez de intentar hacerla aquí o abrir
+el navegador, delégasela al nodo indicado y espera su respuesta. Trátalo como
+delegar a un colega especializado.
+
+## Cómo invocar
+
+```bash
+SKILL=~/.openclaw/workspace/skills/tnode-delegate/bin/tnode-delegate.py
+
+python3 $SKILL list                                    # a quién puedes delegar (alias + rol)
+python3 $SKILL delegate --alias <alias> --text "<instrucción clara>"
+python3 $SKILL delegate --alias investigador --text "Dame los 3 temas top de IA de hoy, con fuentes"
+```
+
+`delegate` imprime en stdout la **respuesta del agente del peer**. Úsala tal
+cual para continuar tu flujo. Por defecto espera hasta 120 s (`--timeout`).
+
+## Flujo típico
+
+1. Si no recuerdas los alias disponibles, corre `list` (te da cada nodo
+   enlazado con su **rol** — qué hace y cuándo conviene llamarlo).
+2. `delegate --alias <alias> --text "..."` con una **instrucción clara y
+   autocontenida**: el peer NO ve tu conversación, solo el texto que le mandas.
+   Dale todo el contexto que necesite en ese texto.
+3. Lee su respuesta (stdout) y **continúa tu tarea** con ella (resúmela,
+   intégrala a tu entregable, etc.).
+
+## Reglas duras
+
+- UNA instrucción clara por delegación. No reintentes en loop: el skill ya
+  reintenta una vez solo si el peer no respondió.
+- Espera la respuesta y úsala; no repitas la delegación si ya respondió.
+- NUNCA reenvíes secretos del usuario (contraseñas, tokens, API keys) por este
+  canal.
+- La **primera** delegación tras un rato de inactividad puede tardar ~1 minuto
+  (el nodo destino se "calienta"); las siguientes responden en segundos. Es
+  normal — no lo reportes como falla.
+
+## Errores que DEBES manejar
+
+- `unknown_peer_alias` → corre `list` para ver los alias válidos y usa uno de
+  esos.
+- `delegation_failed` → el peer no respondió (puede estar apagado o sin saldo
+  de su LLM). Dile al usuario que **ese nodo no está disponible ahora** y, si
+  aplica, intenta la tarea por otro medio.
+- `list` vacío → el dueño aún no enlaza ningún nodo. Avísale que puede hacerlo
+  en el widget **Equipo** de la app.
+'''
+
+_TNODE_DELEGATE_MANIFEST = r'''{
+  "name": "tnode-delegate",
+  "version": "1.0.0",
+  "type": "openclaw-skill",
+  "entrypoint": "SKILL.md"
+}
+'''
+
+_TNODE_DELEGATE_PY = r'''#!/usr/bin/env python3
+"""tnode-delegate — delega una tarea a OTRO de los TNodes del dueño.
+
+__VERSION__ = "1.0.0"
+
+El agente de ESTE nodo (A) le pasa una tarea al agente de otro nodo enlazado
+(B, un "peer" configurado en el widget Equipo de la app) y lee su respuesta.
+B la resuelve con SUS herramientas/skills/contexto.
+
+Transporte: el WebSocket `/transport` de B (`wss://<peer-domain>/transport`,
+plugin tnode-transport). Auth: un idToken de Firebase minteado con las
+credenciales de ESTE nodo — ambos nodos son del mismo dueño, así que el
+owner-gate de B lo acepta (NUNCA se copia un token de B). Los peers viven en
+`users/{uid}/nodes/{nodeId}/peers/` (los escribe la app); este skill resuelve
+alias→domain desde ahí.
+
+Transporte HTTP (mint + Firestore) por `curl` — urllib falla TLS en el python
+de sistema de macOS (mismo gotcha que el skill agenda). El WS necesita la lib
+`websockets`; si el python actual no la tiene, el skill se re-ejecuta con uno
+que sí (p.ej. el de Homebrew en Mac).
+
+Uso:
+  tnode-delegate.py list
+  tnode-delegate.py delegate --alias <alias> --text "<tarea>" [--timeout 120]
+
+`delegate` imprime la respuesta del agente del peer a stdout (exit 0); un
+error va a stderr (exit != 0).
+"""
+# PEP 563: lazy annotations so `str | None` etc. don't break on python <3.10
+# (the agent may launch the skill with an old system python).
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+__VERSION__ = "1.0.0"
+
+
+def _ensure_websockets() -> None:
+    """Re-exec with a python that has `websockets` if the current one lacks it.
+
+    The agent may launch the skill with macOS' system python (no pip libs).
+    chat-sync already runs `websockets` somewhere on every node, so a capable
+    interpreter exists; find it and hand off to it once."""
+    try:
+        import websockets.sync.client  # noqa: F401
+        return
+    except Exception:
+        pass
+    import shutil
+
+    seen = {os.path.realpath(sys.executable)}
+    candidates = [
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+        "/usr/bin/python3",
+        shutil.which("python3.13"),
+        shutil.which("python3.12"),
+        shutil.which("python3.11"),
+        shutil.which("python3"),
+    ]
+    for py in candidates:
+        if not py or not os.path.exists(py):
+            continue
+        rp = os.path.realpath(py)
+        if rp in seen:
+            continue
+        seen.add(rp)
+        try:
+            probe = subprocess.run(
+                [py, "-c", "import websockets.sync.client"],
+                capture_output=True,
+                timeout=10,
+            )
+        except Exception:
+            continue
+        if probe.returncode == 0:
+            os.execv(py, [py, os.path.abspath(__file__)] + sys.argv[1:])
+    print(
+        "tnode-delegate: no python with 'websockets' found "
+        "(pip install websockets)",
+        file=sys.stderr,
+    )
+    sys.exit(3)
+
+
+_ensure_websockets()
+
+import argparse  # noqa: E402
+import hashlib  # noqa: E402
+import hmac  # noqa: E402
+import json  # noqa: E402
+import pathlib  # noqa: E402
+import queue  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+import uuid  # noqa: E402
+
+from websockets.sync.client import connect as ws_connect  # noqa: E402
+
+PROJECT_ID = "tbrain-platform-7fc1f"
+FIREBASE_WEB_API_KEY = "AIzaSyCOybTP4r9J2bWXiJvXY0MQBFvaYDo_iWU"
+SCOPE = "sync_admin"
+
+
+def _die(msg: str, code: int = 1):
+    print(f"tnode-delegate: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def _config_path() -> pathlib.Path:
+    home = os.environ.get("OPENCLAW_HOME")
+    base = pathlib.Path(home) if home else pathlib.Path.home() / ".openclaw"
+    return base / "tnode-chat-sync.json"
+
+
+def _load_cfg() -> dict:
+    path = _config_path()
+    try:
+        cfg = json.loads(path.read_text())
+    except FileNotFoundError:
+        _die(f"config_not_found: {path}")
+    except json.JSONDecodeError:
+        _die(f"config_invalid_json: {path}")
+    for k in ("nodeId", "nodeSecret", "mintUrl"):
+        if not cfg.get(k):
+            _die(f"config_missing_{k}: {path}")
+    return cfg
+
+
+def _curl_post(url: str, body: dict, bearer: str | None = None) -> dict:
+    """POST JSON via curl (system-python-TLS safe). Returns the parsed JSON."""
+    cmd = ["curl", "-sS", "--max-time", "30", "-X", "POST", url,
+           "-H", "Content-Type: application/json"]
+    if bearer:
+        cmd += ["-H", f"Authorization: Bearer {bearer}"]
+    cmd += ["--data-binary", json.dumps(body)]
+    out = subprocess.run(cmd, capture_output=True, text=True)
+    if out.returncode != 0:
+        raise RuntimeError(f"curl_failed: {out.stderr.strip()[:200]}")
+    try:
+        return json.loads(out.stdout)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"non_json_response: {out.stdout[:200]}")
+
+
+def _mint(cfg: dict) -> dict:
+    """HMAC(nodeSecret) → mintUrl → customToken → idToken (clones chat-sync)."""
+    ts = str(int(time.time() * 1000))
+    nonce = os.urandom(16).hex()
+    signing = f'{cfg["nodeId"]}:{ts}:{nonce}:{SCOPE}'
+    mac = hmac.new(
+        cfg["nodeSecret"].encode("utf-8"),
+        signing.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    mint = _curl_post(cfg["mintUrl"], {
+        "nodeId": cfg["nodeId"],
+        "timestamp": ts,
+        "nonce": nonce,
+        "signature": mac,
+        "scope": SCOPE,
+    })
+    if "customToken" not in mint:
+        raise RuntimeError(f"mint_no_custom_token: {json.dumps(mint)[:200]}")
+    api_key = cfg.get("webApiKey") or FIREBASE_WEB_API_KEY
+    ex = _curl_post(
+        "https://identitytoolkit.googleapis.com/v1/accounts"
+        f":signInWithCustomToken?key={api_key}",
+        {"token": mint["customToken"], "returnSecureToken": True},
+    )
+    return {
+        "idToken": ex["idToken"],
+        "uid": mint["uid"],
+        "nodeId": mint["nodeId"],
+    }
+
+
+def _fs_str(field) -> str | None:
+    return field.get("stringValue") if isinstance(field, dict) else None
+
+
+def _fs_bool(field) -> bool:
+    return bool(field.get("booleanValue")) if isinstance(field, dict) else False
+
+
+def _list_peers(token: dict) -> dict:
+    """Read users/{uid}/nodes/{nodeId}/peers/ → {alias: {targetNodeId, domain,
+    role, enabled}}."""
+    parent = f"users/{token['uid']}/nodes/{token['nodeId']}"
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{PROJECT_ID}"
+        f"/databases/(default)/documents/{parent}:runQuery"
+    )
+    rows = _curl_post(
+        url,
+        {"structuredQuery": {"from": [{"collectionId": "peers"}]}},
+        bearer=token["idToken"],
+    )
+    if isinstance(rows, dict):
+        rows = [rows]
+    peers: dict = {}
+    for row in rows:
+        doc = row.get("document") if isinstance(row, dict) else None
+        if not doc:
+            continue
+        f = doc.get("fields", {})
+        tid = _fs_str(f.get("targetNodeId")) or doc.get("name", "").split("/")[-1]
+        domain = _fs_str(f.get("domain"))
+        if not domain:
+            continue
+        alias = _fs_str(f.get("alias")) or tid
+        peers[alias] = {
+            "targetNodeId": tid,
+            "domain": domain,
+            "role": _fs_str(f.get("role")) or "",
+            "enabled": _fs_bool(f.get("enabled")),
+        }
+    return peers
+
+
+def _delegate_once(token: dict, peer: dict, text: str, timeout_s: int) -> str:
+    """Open B's /transport WS, send the turn, return the agent's final reply.
+
+    Raises RuntimeError on transport error or an empty reply (a cold gateway
+    can ack a turn then close it with 0 deltas — the caller retries)."""
+    url = f"wss://{peer['domain']}/transport?token={token['idToken']}"
+    session_key = f"tnode-mobile-deleg-{token['nodeId']}"
+    ws = ws_connect(url, open_timeout=20)
+    q: "queue.Queue[str]" = queue.Queue()
+
+    def reader():
+        try:
+            for m in ws:
+                q.put(m)
+        except Exception as e:  # noqa: BLE001
+            q.put(json.dumps({"type": "__readerr__", "e": str(e)}))
+
+    threading.Thread(target=reader, daemon=True).start()
+    ws.send(json.dumps({
+        "type": "turn",
+        "text": text,
+        "sessionKey": session_key,
+        "clientMsgId": uuid.uuid4().hex,
+    }))
+
+    deadline = time.time() + timeout_s
+    final = None
+    err = None
+    while time.time() < deadline:
+        try:
+            m = q.get(timeout=max(0.2, deadline - time.time()))
+        except queue.Empty:
+            break
+        try:
+            fr = json.loads(m)
+        except Exception:  # noqa: BLE001
+            continue
+        t = fr.get("type")
+        if t == "done":
+            final = fr.get("text") or ""
+            break
+        if t == "error":
+            err = str(fr.get("message"))
+            break
+        if t == "__readerr__":
+            err = str(fr.get("e"))
+            break
+    try:
+        ws.close()
+    except Exception:  # noqa: BLE001
+        pass
+    if final:
+        return final
+    raise RuntimeError(err or "empty_reply (peer cold or no LLM credit?)")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="tnode-delegate")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list", help="Lista los nodos enlazados a los que puedes delegar.")
+    d = sub.add_parser("delegate", help="Delega una tarea a un peer e imprime su respuesta.")
+    d.add_argument("--alias", required=True)
+    d.add_argument("--text", required=True)
+    d.add_argument("--timeout", type=int, default=120)
+    args = ap.parse_args()
+
+    cfg = _load_cfg()
+    token = _mint(cfg)
+    peers = _list_peers(token)
+
+    if args.cmd == "list":
+        if not peers:
+            print("No hay nodos enlazados. Enlaza uno en el widget Equipo de la app.")
+            return 0
+        for alias, p in sorted(peers.items()):
+            state = "activo" if p.get("enabled") else "inactivo"
+            role = f" — {p['role']}" if p.get("role") else ""
+            print(f"{alias} ({state}){role}")
+        return 0
+
+    peer = peers.get(args.alias)
+    if peer is None:
+        known = ", ".join(sorted(peers)) or "(ninguno)"
+        _die(f"unknown_peer_alias: '{args.alias}'. Conocidos: {known}", 4)
+
+    # Cold-start retry: the first turn after a gateway plugin reload can come
+    # back with 0 deltas; a second attempt on the warmed gateway succeeds.
+    last_err = None
+    for attempt in (1, 2):
+        try:
+            print(_delegate_once(token, peer, args.text, args.timeout))
+            return 0
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            if attempt == 1:
+                time.sleep(2)
+    _die(f"delegation_failed alias='{args.alias}': {last_err}", 5)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
 # <<< END EMBEDDED WORKSPACE SKILLS
 
 
@@ -6527,7 +6939,7 @@ def _ensure_workspace_skill(name: str, files: dict) -> None:
 
 
 def _ensure_workspace_skills() -> None:
-    """agenda + drive + poll on every node (startup self-heal)."""
+    """agenda + drive + poll + tnode-delegate on every node (startup self-heal)."""
     _ensure_workspace_skill("agenda", {
         "SKILL.md": _AGENDA_SKILL_MD,
         "manifest.json": _AGENDA_MANIFEST,
@@ -6542,6 +6954,11 @@ def _ensure_workspace_skills() -> None:
         "SKILL.md": _POLL_SKILL_MD,
         "manifest.json": _POLL_MANIFEST,
         "bin/poll.py": _POLL_PY,
+    })
+    _ensure_workspace_skill("tnode-delegate", {
+        "SKILL.md": _TNODE_DELEGATE_SKILL_MD,
+        "manifest.json": _TNODE_DELEGATE_MANIFEST,
+        "bin/tnode-delegate.py": _TNODE_DELEGATE_PY,
     })
 
 
@@ -7094,6 +7511,91 @@ def _md_migrate(target: str) -> None:
         sentinel.write_text("done", encoding="utf-8")
     except Exception as e:  # noqa: BLE001
         _log(f"md-migrate[{target}]: {e}")
+
+
+# ── TEAM_INDEX.md renderer (roster de TNodes-peer, archivo dedicado) ──
+# A diferencia de SOUL/IDENTITY (zonas entre markers en archivos del agente),
+# TEAM_INDEX.md es un archivo COMPLETO que generamos nosotros — hermano de
+# AGENTS_INDEX.md. Lo compone la CF (target="team", leyendo peers/ + el
+# toolsJson de cada peer para derivar la especialidad) y aquí lo escribimos por
+# hash. Sin peers (blocks vacío) → se borra (y el bloque "equipo" de IDENTITY
+# tampoco se compone), evitando un apuntador a un roster inexistente.
+_TEAM_HASH_PATH = OPENCLAW_DIR / ".tnode-team-index-hash"
+_team_bootstrap_attempted = {"done": False}
+
+
+def _team_read_local_hash() -> str:
+    try:
+        return _TEAM_HASH_PATH.read_text(encoding="utf-8").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _team_write_local_hash(value: str) -> None:
+    try:
+        _TEAM_HASH_PATH.write_text(value, encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        _log(f"team-index: hash write failed: {e}")
+
+
+def _render_team_index(doc: dict) -> bool:
+    """Write (or delete) agency-agents/TEAM_INDEX.md from a compose doc.
+    Empty body (no peers) → remove the file. Atomic write. Returns True on
+    success (incl. the delete/no-op case)."""
+    body = _render_tools_zone(doc.get("blocks") or []) if isinstance(doc, dict) else ""
+    try:
+        if not body.strip():
+            if _TEAM_INDEX_PATH.exists():
+                _TEAM_INDEX_PATH.unlink()
+            return True
+        _TEAM_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _TEAM_INDEX_PATH.with_name(_TEAM_INDEX_PATH.name + ".tmp")
+        tmp.write_text(body.rstrip() + "\n", encoding="utf-8")
+        os.replace(tmp, _TEAM_INDEX_PATH)
+        return True
+    except Exception as e:  # noqa: BLE001
+        _log(f"team-index: render failed: {e}")
+        return False
+
+
+def _team_index_sync_from_json(token: dict) -> None:
+    """Render agency-agents/TEAM_INDEX.md from the node's cached teamIndexJson.
+    Cheap hash check first; only rewrites on change. Bootstrap via the CF
+    (target=team) when there is no cache yet. Resilient: any failure leaves the
+    file untouched."""
+    try:
+        remote_hash = _firestore_get_node_field(token, "teamIndexHash")
+    except Exception as e:  # noqa: BLE001
+        _log(f"team-index: hash read failed: {e}")
+        return
+    if not remote_hash:
+        # Nodo sin cache aún (nunca tuvo peers, o golden mínimo): fuerza UNA
+        # composición vía la CF (una vez por proceso) para sembrar el hash; el
+        # render real ocurre aquí (sin peers el doc viene vacío → no-op).
+        if not _team_bootstrap_attempted["done"]:
+            _team_bootstrap_attempted["done"] = True
+            resp = _md_compose_via_cf("team")
+            if isinstance(resp, dict) and resp.get("ok"):
+                doc = resp.get("doc")
+                if isinstance(doc, dict) and _render_team_index(doc):
+                    h = resp.get("hash") or ""
+                    if h:
+                        _team_write_local_hash(h)
+        return
+    if remote_hash == _team_read_local_hash():
+        return  # sin cambios → no reescribir (el hash captura "con/sin peers")
+    try:
+        raw = _firestore_get_node_field(token, "teamIndexJson")
+        doc = json.loads(raw) if raw else None
+    except Exception as e:  # noqa: BLE001
+        _log(f"team-index: json read/parse failed: {e}")
+        return
+    if not isinstance(doc, dict):
+        return
+    if _render_team_index(doc):
+        _team_write_local_hash(remote_hash)
+        n = len(doc.get("blocks") or [])
+        _log(f"team-index: rendered (hash {remote_hash[:12]}, {n} block(s))")
 
 
 def _resolve_himalaya_path() -> str:
@@ -8333,6 +8835,10 @@ def main() -> int:
             for _md_target in ("soul", "identity"):
                 _md_migrate(_md_target)
                 _md_sync_from_json(token, _md_target)
+            # TEAM_INDEX.md: roster de TNodes-peer (delegación). Archivo dedicado
+            # completo (no entre markers), compuesto por la CF; render por hash.
+            # Sin peers se borra. Análogo a AGENTS_INDEX.md para sub-agentes.
+            _team_index_sync_from_json(token)
 
             interval = POLL_IDLE_S if empty_polls >= IDLE_AFTER else POLL_ACTIVE_S
             time.sleep(interval)
