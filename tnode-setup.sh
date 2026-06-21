@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.44.0"
+TNODE_SETUP_VERSION="1.45.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -3834,7 +3834,13 @@ from __future__ import annotations
 #          workspace/skills/tnode-delegate/ en cada boot (como agenda/drive/
 #          poll) para que el nodo pueda DELEGAR a sus peers sin SCP manual.
 #          Pareja del TEAM_INDEX de 1.22.0 (que ya renderiza el roster).
-__VERSION__ = "1.23.0"
+# 1.24.0 — USER.md declarativo: nuevo target md "user" en _MD_TARGETS. La CF
+#          (soul_identity_sync.ts target=user) compone el perfil del DUEÑO
+#          (users/{uid}.profile, capturado en la app) y el daemon lo renderiza
+#          AL INICIO del USER.md (position=start, markers tnode:user),
+#          preservando el contenido curado de abajo. Render por hash vía
+#          _md_sync_from_json (sin migrate). Base del perfilamiento North Star.
+__VERSION__ = "1.24.0"
 
 import hashlib
 import hmac
@@ -7245,6 +7251,21 @@ _MD_TARGETS = {
             "## sub-agentes a tu disposición",
         ),
     },
+    "user": {
+        # Perfil del DUEÑO (capturado en la app → users/{uid}.profile, compuesto
+        # por la CF). A diferencia de soul/identity va AL INICIO del USER.md
+        # (position=start), preservando el contenido curado de abajo.
+        "md_name": "USER.md",
+        "zone_start": "<!-- tnode:user:start -->",
+        "zone_end": "<!-- tnode:user:end -->",
+        "hash_path": OPENCLAW_DIR / ".tnode-user-hash",
+        "hash_field": "userHash",
+        "json_field": "userJson",
+        "sentinel": OPENCLAW_DIR / ".tnode-user-v2-migrated",
+        "backup_name": "USER.md.bak-pre-profile",
+        "legacy_headers": (),
+        "position": "start",
+    },
 }
 
 _md_bootstrap_attempted: dict = {}
@@ -7281,6 +7302,15 @@ def _md_apply_zone(target: str, zone_text: str) -> bool:
         pre = text.split(start, 1)[0].rstrip()
         post = text.split(end, 1)[1].lstrip("\n")
         new = pre + "\n\n" + block + ("\n\n" + post if post.strip() else "\n")
+    elif desc.get("position") == "start":
+        # Insertar AL INICIO: justo después del primer encabezado H1 (# …) si
+        # existe, preservando el contenido curado debajo (USER.md).
+        if text.lstrip().startswith("# "):
+            nl = text.index("\n") if "\n" in text else len(text)
+            head, rest = text[:nl], text[nl + 1:].lstrip("\n")
+            new = head + "\n\n" + block + ("\n\n" + rest if rest.strip() else "\n")
+        else:
+            new = block + ("\n\n" + text.lstrip("\n") if text.strip() else "\n")
     else:
         base = text.rstrip()
         new = (base + "\n\n" + block + "\n") if base else (block + "\n")
@@ -8788,6 +8818,10 @@ def main() -> int:
             for _md_target in ("soul", "identity"):
                 _md_migrate(_md_target)
                 _md_sync_from_json(token, _md_target)
+            # USER.md: perfil del dueño (capturado en la app). Render por hash,
+            # SIN migrate (no hay secciones legacy; el contenido curado se
+            # preserva debajo del bloque gestionado, que va al INICIO).
+            _md_sync_from_json(token, "user")
             # TEAM_INDEX.md: roster de TNodes-peer (delegación). Archivo dedicado
             # completo (no entre markers), compuesto por la CF; render por hash.
             # Sin peers se borra. Análogo a AGENTS_INDEX.md para sub-agentes.
