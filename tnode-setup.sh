@@ -9204,7 +9204,7 @@ from __future__ import annotations
 #          live session, spawn tnode-config-sync DECL_ONESHOT to refresh the
 #          workspace .md (throttled, fire-and-forget). Replaces config-sync's
 #          Firestore poll → Document reads scale with sessions, not the clock.
-__VERSION__ = "1.23.0"
+__VERSION__ = "1.24.0"
 
 import hashlib
 import hmac
@@ -11888,6 +11888,14 @@ def _gateway_send_pending(items: list) -> tuple[list, str | None]:
                     and frame.get("id") == send_id
                 ):
                     if frame.get("ok"):
+                        # Observabilidad #4: si el gateway echa el runId en el
+                        # res, logueamos aquí el puente cid↔runId del inject
+                        # (best-effort; el empate autoritativo lo hace el
+                        # cliente). cid del outbox = idempotencyKey.
+                        _res = frame.get("result")
+                        _rid = _res.get("runId") if isinstance(_res, dict) else None
+                        if _rid:
+                            _log(f"inject-join cid={it['idempotencyKey']} runId={_rid}")
                         results.append((it["id"], True, ""))
                     else:
                         err = frame.get("error") or {}
@@ -12035,6 +12043,9 @@ def process_outbox(token: dict, project_id: str, state: dict) -> bool:
         uid = it.get("uid", owner_uid)
         if ok:
             delivered += 1
+            # Observabilidad #4: traza por-cid del inject (el path de fallback
+            # outbox es el más difícil de depurar — guest pipeline). cid = idem.
+            _log(f"inject ok cid={it.get('idempotencyKey', '?')} doc={doc_id}")
             update_chat_outbox_doc(
                 token, project_id, uid, doc_id,
                 fields={
@@ -12140,6 +12151,12 @@ def main() -> int:
         }
         if t.get("turnId"):
             body["turnId"] = t["turnId"]
+            # correlationId uniforme (#4): en el doc assistant = runId. En Path A
+            # (gateway chat.send) el gateway REUSA el idempotencyKey del cliente
+            # como runId (verificado E2E 2026-06-22) → correlationId = cid y casa
+            # con el doc u_. En Path B (transport) el runId es random y el PLUGIN
+            # estampa el cid directo en su propio write.
+            body["correlationId"] = t["turnId"]
         if t.get("originatingChannel"):
             body["originatingChannel"] = t["originatingChannel"]
         if t.get("noReply"):
