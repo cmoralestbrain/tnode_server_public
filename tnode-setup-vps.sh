@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.45.0"
+TNODE_SETUP_VERSION="1.46.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -3725,6 +3725,8 @@ Env/overrides:
   TNODE_CONFIG_SYNC_IDLE_AFTER    Empty polls before switching to idle cadence (default 5)
   TNODE_CONFIG_SYNC_ONESHOT       If set, run a single push_openclaw_config and exit
                            (used by the file-watcher trigger).
+  TNODE_CONFIG_SYNC_DECL_ONESHOT  If set, refresh the declarative .md files once and
+                           exit (spawned by tnode-chat-sync when a session starts).
 """
 from __future__ import annotations
 # 1.17.0 — MCP servers (Direction A, remote-only): mcp.install /
@@ -3887,7 +3889,16 @@ from __future__ import annotations
 #          AL INICIO del USER.md (position=start, markers tnode:user),
 #          preservando el contenido curado de abajo. Render por hash vía
 #          _md_sync_from_json (sin migrate). Base del perfilamiento North Star.
-__VERSION__ = "1.24.0"
+# 1.25.0 — Lecturas Firestore: el sync declarativo (TOOLS/SOUL/IDENTITY/USER/
+#          TEAM) ya NO se pollea. Era la fuente dominante de Document reads
+#          (LOOKUP) — 5 hash-reads × cada poll de comandos (3s) × cada nodo — y
+#          escalaba con cada target declarativo. Ahora es EVENT-DRIVEN:
+#          (1) un refresco one-time al arrancar el daemon (freshness post-boot);
+#          (2) modo DECL_ONESHOT que tnode-chat-sync spawnea al detectar una
+#          sesión nueva (run_decl_oneshot, siempre exit 0, nunca bloquea);
+#          (3) los 5 hashes en UN GET enmascarado (_prime_node_fields) en vez de
+#          5. Lecturas ∝ uso real (nodo en reposo = 0). Sin poll periódico.
+__VERSION__ = "1.25.0"
 
 import hashlib
 import hmac
@@ -3935,6 +3946,9 @@ POLL_ACTIVE_S = float(os.environ.get("TNODE_CONFIG_SYNC_POLL_ACTIVE_S", "3"))
 POLL_IDLE_S = float(os.environ.get("TNODE_CONFIG_SYNC_POLL_IDLE_S", "15"))
 IDLE_AFTER = int(os.environ.get("TNODE_CONFIG_SYNC_IDLE_AFTER", "5"))
 ONESHOT = bool(os.environ.get("TNODE_CONFIG_SYNC_ONESHOT"))
+# Declarative refresh oneshot — wired as an OpenClaw SessionStart hook so the
+# .md files are current at session bootstrap (replaces the background poll).
+DECL_ONESHOT = bool(os.environ.get("TNODE_CONFIG_SYNC_DECL_ONESHOT"))
 
 
 # ── Logging ────────────────────────────────────────────────────
@@ -7014,8 +7028,45 @@ def _write_local_tools_hash(value: str) -> None:
         _log(f"tools-sync: hash write failed: {e}")
 
 
+# Pass-scoped cache of node-doc fields. The declarative sync block reads five
+# hash fields per pass; priming them in ONE masked GET turns 5+ reads into 1.
+# None = not primed → _firestore_get_node_field falls back to its own per-field
+# GET (callers outside the declarative pass are unaffected).
+_NODE_FIELD_CACHE: dict | None = None
+
+
+def _prime_node_fields(token: dict, fields: list) -> None:
+    """One masked GET of all `fields` at once → cache for the current pass."""
+    global _NODE_FIELD_CACHE
+    try:
+        mask = "&".join(f"mask.fieldPaths={f}" for f in fields)
+        url = (
+            f"{_firestore_base()}/users/{token['uid']}/nodes/{token['nodeId']}"
+            f"?{mask}"
+        )
+        doc = _http_request(
+            "GET", url, headers={"Authorization": f"Bearer {token['idToken']}"}
+        )
+        raw = doc.get("fields") or {}
+        _NODE_FIELD_CACHE = {
+            f: (_fs_unwrap(raw[f]) if f in raw else None) for f in fields
+        }
+    except Exception as e:  # noqa: BLE001
+        _NODE_FIELD_CACHE = None  # priming failed → safe per-field fallback
+        _log(f"prime-node-fields failed: {e}")
+
+
+def _clear_node_fields_cache() -> None:
+    global _NODE_FIELD_CACHE
+    _NODE_FIELD_CACHE = None
+
+
 def _firestore_get_node_field(token: dict, field: str):
-    """GET a single masked field of the node doc (cheap)."""
+    """GET a single masked field of the node doc (cheap). Served from the pass
+    cache when primed (see _prime_node_fields) so the declarative sync block
+    costs ONE read instead of one-per-field."""
+    if _NODE_FIELD_CACHE is not None and field in _NODE_FIELD_CACHE:
+        return _NODE_FIELD_CACHE[field]
     url = (
         f"{_firestore_base()}/users/{token['uid']}/nodes/{token['nodeId']}"
         f"?mask.fieldPaths={field}"
@@ -8730,6 +8781,54 @@ def handle_command(token: dict, cmd: dict) -> dict:
 
 # ── Main loop ──────────────────────────────────────────────────
 
+def _run_declarative_sync(token: dict) -> None:
+    """Prime the five hash fields in ONE masked GET, then render every
+    declarative file (TOOLS/SOUL/IDENTITY/USER/TEAM) whose hash changed.
+    Shared by the slow safety-timer in the main loop and the SessionStart
+    DECL_ONESHOT hook. Each step is individually resilient (swallows its own
+    errors), so one bad target never aborts the rest."""
+    _prime_node_fields(
+        token,
+        ["toolsHash", "soulHash", "identityHash", "userHash", "teamIndexHash"],
+    )
+    # Reflect channel state to Firestore + the one-time v1.1 migration, then
+    # render the managed zone of TOOLS.md (cheap hash check; only rewrites on
+    # change; failures swallowed so the file is never left half-written).
+    _sync_channels_to_firestore(token)
+    _migrate_tools_v11()
+    _sync_tools_md_from_json(token)
+    # SOUL.md / IDENTITY.md: same declarative mechanic (one-time migrate +
+    # hash-rendered managed zone).
+    for _md_target in ("soul", "identity"):
+        _md_migrate(_md_target)
+        _md_sync_from_json(token, _md_target)
+    # USER.md: owner profile (no migrate; curated content preserved below).
+    _md_sync_from_json(token, "user")
+    # TEAM_INDEX.md: peer roster (dedicated file, hash-rendered; gone if no peers).
+    _team_index_sync_from_json(token)
+    _clear_node_fields_cache()
+
+
+def run_decl_oneshot() -> int:
+    """Refresh the declarative files from Firestore once, then exit. Wired as an
+    OpenClaw SessionStart hook so the workspace is current the moment a user
+    opens a session — replacing the background poll, so reads scale with real
+    usage (an idle node reads nothing). Primes all five hashes in ONE read; only
+    rewrites the files whose hash changed.
+
+    ALWAYS returns 0: a SessionStart hook must never block the session. Any
+    failure (token mint, network) just leaves the existing files in place — the
+    slow safety-timer and the next session-start catch up."""
+    try:
+        cfg = load_config()
+        token = mint_token(cfg)
+        _run_declarative_sync(token)
+        _log("decl-oneshot: declarative refresh complete")
+    except Exception as e:  # noqa: BLE001
+        _log(f"decl-oneshot failed (non-fatal): {e}")
+    return 0
+
+
 def run_oneshot() -> int:
     """Push a single openclaw.json snapshot and exit.
 
@@ -8749,6 +8848,8 @@ def run_oneshot() -> int:
 
 
 def main() -> int:
+    if DECL_ONESHOT:
+        return run_decl_oneshot()
     if ONESHOT:
         return run_oneshot()
 
@@ -8775,6 +8876,7 @@ def main() -> int:
     token: dict | None = None
     backoff = 1.0
     empty_polls = 0
+    decl_bootstrap_done = False  # one-time declarative refresh on daemon startup
 
     # Push initial state on startup so Firestore reflects current openclaw.json
     # even if the file hasn't changed since last boot.
@@ -8850,29 +8952,14 @@ def main() -> int:
             else:
                 empty_polls += 1
 
-            # Reflect channel state to Firestore (email variant/account/path)
-            # so the server can compose the email block; run the one-time v1.1
-            # migration (force compose + strip legacy sections); then render the
-            # managed zone of TOOLS.md from the server-built JSON (cheap hash
-            # check; only rewrites on change; failures swallowed so the file is
-            # never left half-written).
-            _sync_channels_to_firestore(token)
-            _migrate_tools_v11()
-            _sync_tools_md_from_json(token)
-            # SOUL.md / IDENTITY.md: misma mecánica declarativa (zonas estáticas
-            # compuestas por el servidor). Migración one-time (limpia secciones
-            # legacy fuera de los markers) + render por hash. Resiliente igual.
-            for _md_target in ("soul", "identity"):
-                _md_migrate(_md_target)
-                _md_sync_from_json(token, _md_target)
-            # USER.md: perfil del dueño (capturado en la app). Render por hash,
-            # SIN migrate (no hay secciones legacy; el contenido curado se
-            # preserva debajo del bloque gestionado, que va al INICIO).
-            _md_sync_from_json(token, "user")
-            # TEAM_INDEX.md: roster de TNodes-peer (delegación). Archivo dedicado
-            # completo (no entre markers), compuesto por la CF; render por hash.
-            # Sin peers se borra. Análogo a AGENTS_INDEX.md para sub-agentes.
-            _team_index_sync_from_json(token)
+            # Declarative .md refresh is event-driven (NO periodic poll): on a
+            # new session, tnode-chat-sync spawns this daemon with
+            # DECL_ONESHOT=1. We only refresh ONCE here, on startup, so the
+            # files are current right after a reboot/restart even before the
+            # first session arrives.
+            if not decl_bootstrap_done:
+                _run_declarative_sync(token)
+                decl_bootstrap_done = True
 
             interval = POLL_IDLE_S if empty_polls >= IDLE_AFTER else POLL_ACTIVE_S
             time.sleep(interval)
@@ -9157,9 +9244,14 @@ Env/overrides:
   TNODE_CHAT_SYNC_POLL_MS   Polling interval ms (default 500)
   TNODE_CHAT_SYNC_OUTBOX_HOT_S / _OUTBOX_IDLE_S  Outbox poll cadence
   TNODE_CHAT_SYNC_GATEWAY_WS  Gateway WS url (default ws://127.0.0.1:18789)
+  TNODE_CHAT_SYNC_DECL_THROTTLE_S  Min seconds between declarative-refresh spawns (default 5)
 """
 from __future__ import annotations
-__VERSION__ = "1.22.0"
+# 1.23.0 — Declarative refresh trigger: when the session tailer sees a brand-new
+#          live session, spawn tnode-config-sync DECL_ONESHOT to refresh the
+#          workspace .md (throttled, fire-and-forget). Replaces config-sync's
+#          Firestore poll → Document reads scale with sessions, not the clock.
+__VERSION__ = "1.23.0"
 
 import hashlib
 import hmac
@@ -11315,6 +11407,46 @@ def message_id_for(turn: dict) -> str:
     return f"{prefix}{h}"
 
 
+# ── Declarative config refresh trigger ─────────────────────────
+# A new session means OpenClaw is about to bootstrap from the workspace .md
+# files (SOUL/IDENTITY/TOOLS/USER/TEAM), composed server-side and rendered by
+# tnode-config-sync. Instead of config-sync POLLING Firestore for changes every
+# few seconds (the old dominant source of Document reads), we refresh on demand:
+# when the tailer first sees a brand-new live session, spawn config-sync's
+# DECL_ONESHOT. Reads now scale with real usage — an idle node reads nothing.
+
+DECL_TRIGGER_THROTTLE_S = float(
+    os.environ.get("TNODE_CHAT_SYNC_DECL_THROTTLE_S", "5.0")
+)
+_last_decl_trigger = 0.0
+
+
+def _trigger_declarative_refresh() -> None:
+    """Spawn tnode-config-sync in DECL_ONESHOT mode to refresh the workspace
+    .md files. Fire-and-forget, best-effort, throttled: a burst of sessions
+    coalesces into one refresh (config changes are rare), and any failure is
+    swallowed so chat mirroring is never affected."""
+    global _last_decl_trigger
+    now = time.time()
+    if now - _last_decl_trigger < DECL_TRIGGER_THROTTLE_S:
+        return
+    _last_decl_trigger = now
+    try:
+        script = Path(__file__).resolve().parent / "tnode_config_sync.py"
+        if not script.is_file():
+            return
+        subprocess.Popen(
+            [sys.executable, str(script)],
+            env={**os.environ, "TNODE_CONFIG_SYNC_DECL_ONESHOT": "1"},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        _log("decl-refresh: spawned config-sync DECL_ONESHOT (new session)")
+    except Exception as e:  # noqa: BLE001
+        _log(f"decl-refresh trigger failed (non-fatal): {e}")
+
+
 # ── File tailer ────────────────────────────────────────────────
 
 class SessionTailer:
@@ -11385,6 +11517,10 @@ class SessionTailer:
                 #     same flush, so we'd otherwise lose the whole thing).
                 if st.st_mtime > self.start_time:
                     offset = 0
+                    # Brand-new live session → refresh the declarative .md so
+                    # the NEXT bootstrap reads current config (replaces the
+                    # config-sync poll). Throttled + non-blocking inside.
+                    _trigger_declarative_refresh()
                 else:
                     self.offsets[key] = st.st_size
                     continue
