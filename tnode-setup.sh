@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.49.0"
+TNODE_SETUP_VERSION="1.50.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -3893,7 +3893,18 @@ from __future__ import annotations
 #          image_generate/tts/hf (público). _ensure_guest_agent ahora también
 #          ENFORZA el deny en un entry guest existente (idempotente). La capa 2
 #          (refinamiento per-link) la aplica el hook before_tool_call del plugin.
-__VERSION__ = "1.27.0"
+# 1.28.0 — Fix boot-race del startup self-heal (nodos nacidos de snapshot DO):
+#          el daemon arranca como `tnode` ANTES de que el installer haga chown
+#          del openclaw.json a `tnode` → el write de agents.list fallaba con
+#          PermissionError y el agente `guest` NO se materializaba hasta un
+#          restart manual de config-sync (la Opción B no quedaba lista de
+#          fábrica). Ahora el self-heal se REINTENTA en el loop (flag
+#          self_heal_done) manteniendo cadencia activa (3s) hasta confirmar que
+#          el guest entry existe → queda listo segundos después del chown, sin
+#          intervención. _run_startup_self_heal() distingue race (retry) de
+#          error real (loguea 1x y se rinde, sin spam ni cadencia activa
+#          perpetua). Idempotente (las _ensure_* ya lo eran).
+__VERSION__ = "1.28.0"
 
 import hashlib
 import hmac
@@ -9019,6 +9030,48 @@ def run_oneshot() -> int:
         return 1
 
 
+def _guest_agent_present() -> bool:
+    """True if the `guest` agent entry is already in openclaw.json."""
+    try:
+        cfg = json.loads(OPENCLAW_JSON_PATH.read_text())
+    except Exception:  # noqa: BLE001
+        return False
+    agents_list = cfg.get("agents", {}).get("list", [])
+    return isinstance(agents_list, list) and any(
+        isinstance(a, dict) and a.get("id") == "guest" for a in agents_list
+    )
+
+
+def _run_startup_self_heal() -> bool:
+    """Run the idempotent startup self-heal (agents index, workspace dirs,
+    skills, guest agent).
+
+    Returns True when nothing more should be attempted (success, or a
+    non-retryable error already logged). Returns False ONLY on the snapshot
+    boot race: the daemon (user `tnode`) started before the installer chowned
+    openclaw.json to `tnode`, so the agents.list write isn't possible yet —
+    signalling main() to retry on the next loop tick until it lands, so a
+    freshly-provisioned node materializes the `guest` agent (Opción B) without
+    a manual config-sync restart."""
+    try:
+        _regenerate_agents_index()
+        _ensure_workspace_dirs()
+        _ensure_workspace_skills()
+        _ensure_guest_agent()
+    except PermissionError as e:
+        _log(f"self-heal deferred (boot race, will retry): {e}")
+        return False
+    except Exception as e:  # noqa: BLE001
+        _log(f"startup self-heal failed: {e}")
+        return True
+    # Confirm the guest entry actually landed. If openclaw.json wasn't readable
+    # or present yet (boot race), the ensure was a silent no-op — keep retrying.
+    if _guest_agent_present():
+        return True
+    _log("self-heal: guest agent not present yet (openclaw.json not ready) — will retry")
+    return False
+
+
 def main() -> int:
     if DECL_ONESHOT:
         return run_decl_oneshot()
@@ -9035,14 +9088,11 @@ def main() -> int:
     # Self-heal: regenerate AGENTS_INDEX.md and ensure the workspace
     # references survive workspace drift (e.g. user wiped SOUL.md
     # manually, or the node was provisioned before v1.4.0). Best-effort
-    # — failures here are logged but don't prevent the daemon loop.
-    try:
-        _regenerate_agents_index()
-        _ensure_workspace_dirs()
-        _ensure_workspace_skills()
-        _ensure_guest_agent()
-    except Exception as e:  # noqa: BLE001
-        _log(f"startup self-heal failed: {e}")
+    # — failures here are logged but don't prevent the daemon loop. On a
+    # snapshot-provisioned node this races the installer's chown of
+    # openclaw.json (see _run_startup_self_heal); main() retries in the loop
+    # below until the guest agent (Opción B) materializes — no manual restart.
+    self_heal_done = _run_startup_self_heal()
     # Reflect a hand-configured Telegram channel (openclaw.json) into
     # channels-state.json so the mobile widget shows it without a re-link.
     _derive_telegram_state_if_missing()
@@ -9058,6 +9108,13 @@ def main() -> int:
     while True:
         try:
             now = int(time.time())
+            # Boot-race backstop: if the startup self-heal couldn't write
+            # openclaw.json yet (daemon started before the installer's chown),
+            # keep retrying every tick until the guest agent lands.
+            if not self_heal_done:
+                self_heal_done = _run_startup_self_heal()
+                if self_heal_done:
+                    _log("startup self-heal completed on loop retry (boot race cleared)")
             if token is None or now >= token["expiresAt"]:
                 token = mint_token(cfg)
                 _log(f"minted token for uid={token['uid']} node={token['nodeId']}")
@@ -9134,7 +9191,14 @@ def main() -> int:
                 _run_declarative_sync(token)
                 decl_bootstrap_done = True
 
-            interval = POLL_IDLE_S if empty_polls >= IDLE_AFTER else POLL_ACTIVE_S
+            # Stay on the active cadence while the self-heal is still pending
+            # so a snapshot-provisioned node materializes the guest agent
+            # quickly once openclaw.json becomes writable (boot-race fix).
+            interval = (
+                POLL_IDLE_S
+                if (self_heal_done and empty_polls >= IDLE_AFTER)
+                else POLL_ACTIVE_S
+            )
             time.sleep(interval)
         except KeyboardInterrupt:
             return 0
