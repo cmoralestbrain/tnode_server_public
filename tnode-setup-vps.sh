@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.46.0"
+TNODE_SETUP_VERSION="1.48.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -3889,6 +3889,14 @@ from __future__ import annotations
 #          AL INICIO del USER.md (position=start, markers tnode:user),
 #          preservando el contenido curado de abajo. Render por hash vía
 #          _md_sync_from_json (sin migrate). Base del perfilamiento North Star.
+# 1.26.0 — Agente `guest` dedicado (Opción B, aislamiento por-invitado):
+#          _ensure_guest_agent() en el startup self-heal inserta el entry
+#          `guest` en agents.list (workspace-guest neutro, modelo heredado del
+#          nodo, sandbox off) y materializa el workspace de atención comercial
+#          neutra (USER/SOUL/IDENTITY/AGENTS, SIN PII del dueño). chat-sync
+#          1.25.0 rutea `tnode-guest-*` aquí vía prefijo `agent:guest:`. El
+#          guest queda FUERA de main.subagents.allowAgents (no es target de
+#          delegación, es un agente ruteado por sesión).
 # 1.25.0 — Lecturas Firestore: el sync declarativo (TOOLS/SOUL/IDENTITY/USER/
 #          TEAM) ya NO se pollea. Era la fuente dominante de Document reads
 #          (LOOKUP) — 5 hash-reads × cada poll de comandos (3s) × cada nodo — y
@@ -3898,7 +3906,15 @@ from __future__ import annotations
 #          sesión nueva (run_decl_oneshot, siempre exit 0, nunca bloquea);
 #          (3) los 5 hashes en UN GET enmascarado (_prime_node_fields) en vez de
 #          5. Lecturas ∝ uso real (nodo en reposo = 0). Sin poll periódico.
-__VERSION__ = "1.25.0"
+# 1.27.0 — Guard-rails Capa 1 (#2.2): piso `tools.deny` en el agente `guest`.
+#          Bloquea para TODOS los invitados los tools de sistema/datos del
+#          dueño: shell (exec/process), filesystem (read/write/edit/dir/file),
+#          sesiones/subagentes (sessions_*/subagents/agents_list), mensajería a
+#          canales (message), canvas y browser. Deja web_search/web_fetch/
+#          image_generate/tts/hf (público). _ensure_guest_agent ahora también
+#          ENFORZA el deny en un entry guest existente (idempotente). La capa 2
+#          (refinamiento per-link) la aplica el hook before_tool_call del plugin.
+__VERSION__ = "1.27.0"
 
 import hashlib
 import hmac
@@ -5248,9 +5264,13 @@ def _update_openclaw_config_for_subagent(
             if isinstance(a, dict) and a.get("id") == "main"
         )
     ]
+    # NB: `guest` (Opción B session-routed agent) is NOT a delegation target —
+    # keep it out of main.subagents.allowAgents so main never spawns it as a
+    # sub-agent (it's reached only via the `agent:guest:` sessionKey prefix).
     main_entry.setdefault("subagents", {})["allowAgents"] = sorted(
         a["id"] for a in agents_list
-        if isinstance(a, dict) and a.get("id") and a.get("id") != "main"
+        if isinstance(a, dict) and a.get("id")
+        and a.get("id") not in ("main", "guest")
     )
 
     serialized = json.dumps(cfg, indent=2) + "\n"
@@ -6980,6 +7000,179 @@ def _ensure_workspace_skills() -> None:
         "manifest.json": _TNODE_DELEGATE_MANIFEST,
         "bin/tnode-delegate.py": _TNODE_DELEGATE_PY,
     })
+
+
+# ── Guest agent (Opción B: per-guest isolation) ──────────────────────────
+# Invite-link visitors ("guests") run on a DEDICATED `guest` agent with its
+# own NEUTRAL workspace, so they never load the owner's main workspace
+# (USER.md/MEMORY.md/memory) — the root cause of the owner-identity leak.
+# tnode-chat-sync routes `tnode-guest-*` sessions to this agent via the
+# `agent:guest:` sessionKey prefix (the gateway honors it). The workspace is
+# STATIC + neutral (warm business-attention, NO owner PII); the per-node /
+# per-guest identity is injected at runtime by the tbrain-context-engine
+# plugin (before_prompt_build). Model inherits the node default (no override).
+_GUEST_WS_DIR = OPENCLAW_DIR / "workspace-guest"
+_GUEST_AGENT_DIR = _AGENTS_DIR / "guest" / "agent"
+
+# Guard-rails Layer 1 (#2.2): per-agent deny floor for ALL guests. Blocks the
+# tools that could reach the OWNER's system/data (the guest runs with the node's
+# owner-scoped creds + sandbox off): shell, filesystem, session/subagent
+# control, channel messaging, canvas, and browser (SSRF). Leaves public-facing
+# tools (web_search/web_fetch/image_generate/tts/huggingface). Per-link
+# refinement is layered on top by the context-engine before_tool_call hook.
+_GUEST_TOOLS_DENY = [
+    "exec", "process",
+    "read", "write", "edit", "file_write", "file_fetch", "dir_list", "dir_fetch",
+    "sessions_spawn", "sessions_send", "sessions_list", "sessions_history",
+    "sessions_yield", "session_status", "subagents", "agents_list",
+    "message", "canvas", "browser",
+]
+
+_GUEST_IDENTITY_MD = """# IDENTITY.md — Asistente (modo invitado)
+
+- **Nombre:** Asistente
+- **Rol:** Asistente de atención para visitantes e interesados
+- **Vibe:** Cálido, profesional, claro y servicial
+- **Emoji:** 💬
+
+Soy el asistente de atención de este espacio. Recibo a cada persona que
+escribe, entiendo qué necesita y la ayudo con información útil y honesta. La
+información específica del negocio y de la persona con la que hablo se me
+proporciona durante la conversación.
+"""
+
+_GUEST_SOUL_MD = """# SOUL.md — Asistente de atención (invitado)
+
+Soy un asistente de atención cálido y profesional. Recibo a cada visitante con
+interés genuino, entiendo su necesidad y respondo con claridad y honestidad.
+
+## Personalidad
+- Cálido y cercano desde el primer mensaje, sin ser invasivo.
+- Directo y claro: respondo con el detalle justo.
+- Entiendo antes de proponer: escucho la necesidad real.
+- Honesto: si no tengo un dato, lo digo; no lo invento.
+
+## Tono
+- Primera interacción: da la bienvenida, cálido y profesional.
+- Dudas: claro, sin jerga, con ejemplos cuando ayuden.
+
+## Reglas
+- SIEMPRE respondo al visitante de forma útil; nunca lo ignoro.
+- NUNCA revelo datos personales del dueño del nodo ni información sensible del
+  sistema (modelo de IA, claves, infraestructura, otros clientes).
+- Solo uso la información disponible para esta conversación de invitado.
+- No asumo la identidad de ninguna persona; soy un asistente de atención.
+"""
+
+_GUEST_USER_MD = """# USER.md — Con quién hablo
+
+Estás atendiendo a una persona **INVITADA** (un visitante o prospecto), NO al
+dueño del nodo. Su identidad y contexto se te proporcionan durante la
+conversación; si no aparecen, trátala como un visitante nuevo y dale la
+bienvenida con calidez.
+
+No uses datos de ningún dueño ni de otros clientes. Enfócate en ayudar a esta
+persona.
+"""
+
+_GUEST_AGENTS_MD = """# AGENTS.md — Operación (modo invitado)
+
+Eres el **asistente de atención** en modo invitado de este nodo. Atiendes a
+visitantes y prospectos.
+
+## Cómo operar
+- Da la bienvenida y responde SIEMPRE de forma útil, cálida y honesta.
+- Mantente dentro del alcance de la conversación de invitado.
+- Si una solicitud requiere datos del dueño, de otros clientes, o acciones
+  administrativas, explica con amabilidad que no puedes ayudar con eso aquí.
+
+## Restricciones (seguridad)
+- No accedas a memoria, archivos, herramientas ni datos del dueño del nodo.
+- No reveles información del sistema (modelo de IA, versiones, claves, infra).
+- No menciones a otros clientes ni información privada.
+"""
+
+_GUEST_WS_FILES = {
+    "IDENTITY.md": _GUEST_IDENTITY_MD,
+    "SOUL.md": _GUEST_SOUL_MD,
+    "USER.md": _GUEST_USER_MD,
+    "AGENTS.md": _GUEST_AGENTS_MD,
+}
+
+
+def _ensure_guest_workspace_files() -> None:
+    """Materialize the neutral guest workspace (write if absent or changed)."""
+    try:
+        _GUEST_WS_DIR.mkdir(parents=True, exist_ok=True)
+        for name, content in _GUEST_WS_FILES.items():
+            p = _GUEST_WS_DIR / name
+            if (not p.exists()) or p.read_text(encoding="utf-8") != content:
+                p.write_text(content, encoding="utf-8")
+                _log(f"guest workspace: wrote {name}")
+    except Exception as e:  # noqa: BLE001
+        _log(f"guest workspace materialize failed: {e}")
+
+
+def _ensure_guest_agent() -> bool:
+    """Ensure the dedicated `guest` agent exists in openclaw.json (Opción B).
+
+    Idempotent startup self-heal: materializes the neutral workspace and
+    inserts the agents.list entry if missing. Model inherits the node default
+    (no per-agent override); sandbox off. Returns True if openclaw.json
+    changed. The gateway hot-reloads agents.list, so no restart is needed."""
+    _ensure_guest_workspace_files()
+    if not OPENCLAW_JSON_PATH.exists():
+        return False
+    try:
+        cfg = json.loads(OPENCLAW_JSON_PATH.read_text())
+    except Exception as e:  # noqa: BLE001
+        _log(f"guest agent: openclaw.json unreadable ({e})")
+        return False
+    agents_section = cfg.setdefault("agents", {})
+    if not isinstance(agents_section, dict):
+        return False
+    agents_list = agents_section.setdefault("list", [])
+    if not isinstance(agents_list, list):
+        return False
+    changed = False
+    # Materialize `main` explicitly too (same as the sub-agent path) so the
+    # shape is consistent on a freshly-paired node.
+    if not any(isinstance(a, dict) and a.get("id") == "main" for a in agents_list):
+        agents_list.insert(0, {
+            "id": "main",
+            "default": True,
+            "workspace": str(OPENCLAW_DIR / "workspace"),
+            "agentDir": str(OPENCLAW_DIR / "agents" / "main" / "agent"),
+        })
+        changed = True
+    guest_tools = {"deny": _GUEST_TOOLS_DENY}
+    guest_idx = next(
+        (i for i, a in enumerate(agents_list)
+         if isinstance(a, dict) and a.get("id") == "guest"),
+        None,
+    )
+    if guest_idx is None:
+        agents_list.append({
+            "id": "guest",
+            "name": "Guest",
+            "workspace": str(_GUEST_WS_DIR),
+            "agentDir": str(_GUEST_AGENT_DIR),
+            "sandbox": {"mode": "off"},
+            "tools": guest_tools,
+        })
+        changed = True
+    elif agents_list[guest_idx].get("tools") != guest_tools:
+        # Enforce the guard-rails Layer-1 deny floor on an existing guest entry.
+        agents_list[guest_idx]["tools"] = guest_tools
+        changed = True
+    if not changed:
+        return False
+    serialized = json.dumps(cfg, indent=2) + "\n"
+    if OPENCLAW_JSON_PATH.read_text() == serialized:
+        return False
+    OPENCLAW_JSON_PATH.write_text(serialized)
+    _log("guest agent: ensured agents.list entry (Opción B)")
+    return True
 
 
 # _ensure_tools_rules() retirado en v1.1 — las reglas (agenda/drive/anti-loop/
@@ -8868,6 +9061,7 @@ def main() -> int:
         _regenerate_agents_index()
         _ensure_workspace_dirs()
         _ensure_workspace_skills()
+        _ensure_guest_agent()
     except Exception as e:  # noqa: BLE001
         _log(f"startup self-heal failed: {e}")
     # Reflect a hand-configured Telegram channel (openclaw.json) into
@@ -9247,11 +9441,19 @@ Env/overrides:
   TNODE_CHAT_SYNC_DECL_THROTTLE_S  Min seconds between declarative-refresh spawns (default 5)
 """
 from __future__ import annotations
+# 1.25.0 — Per-guest agent routing (Opción B): inject guest sessions under the
+#          dedicated `guest` agent by prefixing the injected sessionKey with
+#          `agent:guest:` (the gateway honors the prefix, verified E2E
+#          2026-06-22) so guests never load the owner's main workspace
+#          (USER.md/MEMORY.md/memory). The tailer now watches ALL
+#          `agents/*/sessions` dirs (flush_turn already filters to
+#          tnode-mobile/tnode-guest), so the guest agent's replies get mirrored
+#          to each guest's own space.
 # 1.23.0 — Declarative refresh trigger: when the session tailer sees a brand-new
 #          live session, spawn tnode-config-sync DECL_ONESHOT to refresh the
 #          workspace .md (throttled, fire-and-forget). Replaces config-sync's
 #          Firestore poll → Document reads scale with sessions, not the clock.
-__VERSION__ = "1.24.0"
+__VERSION__ = "1.25.0"
 
 import hashlib
 import hmac
@@ -11198,6 +11400,21 @@ def _guest_uid_from_session(session_key) -> str | None:
     return uid or None
 
 
+def _route_session_key(session_key: str) -> str:
+    """Route guest sessions to the dedicated `guest` agent (Opción B).
+
+    The gateway honors an `agent:<id>:` prefix on the injected sessionKey
+    (verified E2E 2026-06-22) and strips it for routing/storage. Guests
+    (`tnode-guest-*`) get their OWN agent + neutral workspace so they never
+    load the owner's main workspace (USER.md/MEMORY.md/memory). Owner sessions
+    (`tnode-mobile-*`) and channel sessions are left untouched → default
+    `main` agent. Idempotent: a key already carrying an `agent:` prefix is
+    returned as-is (we only prefix raw `tnode-guest-*` keys)."""
+    if isinstance(session_key, str) and session_key.startswith("tnode-guest-"):
+        return "agent:guest:" + session_key
+    return session_key
+
+
 def _session_key_for_media_file(filename: str) -> str | None:
     """Best-effort: find which session generated a tool media file by scanning
     the most recently active agent trajectories for the filename, returning
@@ -11450,9 +11667,16 @@ def _trigger_declarative_refresh() -> None:
 # ── File tailer ────────────────────────────────────────────────
 
 class SessionTailer:
-    def __init__(self, sessions_dir: Path):
-        self.sessions_dir = sessions_dir
-        # (dev, inode) -> offset
+    def __init__(self, sessions_dirs):
+        # Accept a single Path (back-compat) or a list of Paths. Opción B:
+        # we watch ALL agent session dirs (main + guest + any others) so the
+        # dedicated `guest` agent's replies get mirrored too. flush_turn
+        # filters to tnode-mobile/tnode-guest sessions, so other agents'
+        # turns (channels, catalog sub-agents) are ignored downstream.
+        if isinstance(sessions_dirs, (str, Path)):
+            sessions_dirs = [sessions_dirs]
+        self.sessions_dirs: list[Path] = [Path(d) for d in sessions_dirs]
+        # (dev, inode) -> offset  (inode-keyed, so multiple dirs never collide)
         self.offsets: dict[tuple, int] = {}
         # Watcher start time (monotonic file mtime). Files with mtime newer
         # than this are "born after the watcher started" — i.e. live sessions
@@ -11460,16 +11684,21 @@ class SessionTailer:
         self.start_time = time.time()
 
     def _iter_files(self):
-        if not self.sessions_dir.is_dir():
+        dirs = [d for d in self.sessions_dirs if d.is_dir()]
+        if not dirs:
             # When systemd starts the daemon immediately after install, the
-            # OpenClaw agent dir (~/.openclaw/agents/main/) doesn't exist yet
-            # — it's only created when the user completes the first pair.
+            # OpenClaw agent dirs (~/.openclaw/agents/<id>/) don't exist yet
+            # — they're only created when the user completes the first pair.
             # Re-resolve on every miss so the watcher self-heals without
             # needing a manual restart.
-            new_dir = resolve_sessions_dir()
-            if new_dir.is_dir() and new_dir != self.sessions_dir:
-                _log(f"sessions dir appeared — now watching {new_dir}")
-                self.sessions_dir = new_dir
+            fresh = [d for d in resolve_all_sessions_dirs() if d.is_dir()]
+            if fresh and fresh != self.sessions_dirs:
+                _log(
+                    "sessions dirs appeared — now watching "
+                    + ", ".join(str(d) for d in fresh)
+                )
+                self.sessions_dirs = fresh
+                dirs = fresh
             else:
                 return []
         # OpenClaw v2026.5.x writes a sibling `<sessionId>.trajectory.jsonl`
@@ -11481,7 +11710,7 @@ class SessionTailer:
         # `bootstrap-context:full` correlation event the watcher used to
         # rely on, so it would always time out and write hash-based ids
         # — duplicating against the live-WS message in the client).
-        all_files = sorted(self.sessions_dir.glob("*.jsonl"))
+        all_files = sorted(f for d in dirs for f in d.glob("*.jsonl"))
         traj_sessions = {
             p.name[: -len(".trajectory.jsonl")]
             for p in all_files
@@ -11557,6 +11786,30 @@ def resolve_sessions_dir() -> Path:
         if s.is_dir():
             return s
     return agents_dir / "main" / "sessions"
+
+
+def resolve_all_sessions_dirs() -> list[Path]:
+    """All agent session dirs to watch (main first, then the rest). Opción B:
+    guests run on the dedicated `guest` agent, so we tail every
+    `~/.openclaw/agents/*/sessions` dir. flush_turn only mirrors
+    tnode-mobile/tnode-guest sessions downstream, so non-app agents (channels,
+    catalog sub-agents) are ignored. The TNODE_CHAT_SYNC_SESSIONS override
+    pins a single dir (tests)."""
+    override = os.environ.get("TNODE_CHAT_SYNC_SESSIONS")
+    if override:
+        return [Path(override)]
+    agents_dir = OPENCLAW_DIR / "agents"
+    if not agents_dir.is_dir():
+        return [OPENCLAW_DIR / "sessions"]  # fallback, won't exist
+    dirs: list[Path] = []
+    main_s = agents_dir / "main" / "sessions"
+    if main_s.is_dir():
+        dirs.append(main_s)
+    for sub in sorted(agents_dir.iterdir()):
+        s = sub / "sessions"
+        if s.is_dir() and s != main_s:
+            dirs.append(s)
+    return dirs or [main_s]
 
 
 # ── Chat outbox consumer (v1.17.0+) ────────────────────────────
@@ -11915,7 +12168,7 @@ def _gateway_send_pending(items: list) -> tuple[list, str | None]:
                     "id": send_id,
                     "method": "chat.send",
                     "params": {
-                        "sessionKey": it["sessionKey"],
+                        "sessionKey": _route_session_key(it["sessionKey"]),
                         "message": it["content"],
                         "idempotencyKey": it["idempotencyKey"],
                     },
@@ -12152,10 +12405,10 @@ def main() -> int:
     # Project id is derived from the mintUrl hostname.
     project_id = "tbrain-platform-7fc1f"
 
-    sessions_dir = resolve_sessions_dir()
-    _log(f"watching {sessions_dir}")
+    sessions_dirs = resolve_all_sessions_dirs()
+    _log("watching " + ", ".join(str(d) for d in sessions_dirs))
 
-    tailer = SessionTailer(sessions_dir)
+    tailer = SessionTailer(sessions_dirs)
     token: dict | None = None
     backoff = 1.0
 
