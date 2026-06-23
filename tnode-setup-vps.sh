@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.50.0"
+TNODE_SETUP_VERSION="1.51.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -9531,6 +9531,17 @@ Env/overrides:
   TNODE_CHAT_SYNC_DECL_THROTTLE_S  Min seconds between declarative-refresh spawns (default 5)
 """
 from __future__ import annotations
+# 1.26.0 — Fresh-node guest DELIVERY fix: the session tailer now re-resolves
+#          `agents/*/sessions` on EVERY pass and ADDS new dirs, instead of only
+#          re-resolving while the watched set was empty. On a snapshot-
+#          provisioned node `agents/guest/sessions` is created only on the FIRST
+#          guest turn — after the daemon started AND after `agents/main/sessions`
+#          already appeared — so the one-shot resolution never watched it and the
+#          guest's replies were never mirrored to Firestore (guest stuck on
+#          "escribiendo" until a manual chat-sync restart). Additive + inode-keyed
+#          offsets mean a dir is never dropped or re-read once seen. Pairs with
+#          config-sync 1.28.0 (guest agent materializes through the boot race) to
+#          make Opción B born-ready for guests on fresh nodes.
 # 1.25.0 — Per-guest agent routing (Opción B): inject guest sessions under the
 #          dedicated `guest` agent by prefixing the injected sessionKey with
 #          `agent:guest:` (the gateway honors the prefix, verified E2E
@@ -9543,7 +9554,7 @@ from __future__ import annotations
 #          live session, spawn tnode-config-sync DECL_ONESHOT to refresh the
 #          workspace .md (throttled, fire-and-forget). Replaces config-sync's
 #          Firestore poll → Document reads scale with sessions, not the clock.
-__VERSION__ = "1.25.0"
+__VERSION__ = "1.26.0"
 
 import hashlib
 import hmac
@@ -11774,23 +11785,29 @@ class SessionTailer:
         self.start_time = time.time()
 
     def _iter_files(self):
+        # Re-resolve agent session dirs on EVERY pass and ADD any new ones, so
+        # dirs created AFTER startup are picked up without a manual restart.
+        # When systemd starts the daemon right after install the OpenClaw agent
+        # dirs (~/.openclaw/agents/<id>/sessions) don't exist yet, and — crucial
+        # for Opción B on a snapshot-provisioned node — `agents/guest/sessions`
+        # is created only on the FIRST guest turn, long after the daemon started
+        # and after `agents/main/sessions` already appeared. A resolution that
+        # only re-ran while the watched set was empty never watched it, so the
+        # guest's replies were never mirrored. Additive + inode-keyed offsets
+        # mean a dir is never dropped or re-read once seen.
+        added = [
+            d for d in resolve_all_sessions_dirs()
+            if d.is_dir() and d not in self.sessions_dirs
+        ]
+        if added:
+            self.sessions_dirs = self.sessions_dirs + added
+            _log(
+                "sessions dirs appeared — now watching "
+                + ", ".join(str(d) for d in self.sessions_dirs)
+            )
         dirs = [d for d in self.sessions_dirs if d.is_dir()]
         if not dirs:
-            # When systemd starts the daemon immediately after install, the
-            # OpenClaw agent dirs (~/.openclaw/agents/<id>/) don't exist yet
-            # — they're only created when the user completes the first pair.
-            # Re-resolve on every miss so the watcher self-heals without
-            # needing a manual restart.
-            fresh = [d for d in resolve_all_sessions_dirs() if d.is_dir()]
-            if fresh and fresh != self.sessions_dirs:
-                _log(
-                    "sessions dirs appeared — now watching "
-                    + ", ".join(str(d) for d in fresh)
-                )
-                self.sessions_dirs = fresh
-                dirs = fresh
-            else:
-                return []
+            return []
         # OpenClaw v2026.5.x writes a sibling `<sessionId>.trajectory.jsonl`
         # next to each `<sessionId>.jsonl`. The trajectory file is canonical
         # and includes `type:"model.completed"` events with the runId we
