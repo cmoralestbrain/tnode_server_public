@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.56.0"
+TNODE_SETUP_VERSION="1.57.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -6445,7 +6445,20 @@ from __future__ import annotations
 #          roster completo del equipo (todo agente salvo main/guest) en
 #          _ensure_guest_agent + el rebuild de subagentes; el hook hace la
 #          restricción real per-invitado. Idempotente.
-__VERSION__ = "1.35.0"
+# 1.36.0 — MCP OAuth (Notion/Linear/Asana/…) + migración a CLI. (a) Handlers
+#          nuevos mcp.oauth.begin / mcp.oauth.complete: OpenClaw 2026.6.10 trae
+#          OAuth nativo para MCP remotos (DCR + token store/refresh); NO lo
+#          construimos. begin = `openclaw mcp add --auth oauth
+#          --oauth-redirect-url https://go.tbrain.app/mcp/callback --no-probe` +
+#          `mcp login` → parsea la authorize URL del stdout → la devuelve al app;
+#          complete = `mcp login --code <code>` + `mcp reload`. Flujo headless
+#          (el app transporta URL ida + code vuelta; el verifier PKCE se guarda
+#          en el nodo). (b) handle_mcp_install/remove dejan de editar
+#          openclaw.json directo y usan el CLI (`mcp set` / `mcp unset`+`logout`)
+#          — principio SDK: el CLI es el contrato estable, el shape del JSON
+#          deriva entre versiones. install rechaza authType=oauth (va por begin).
+#          Mirror Firestore añade authType (header|oauth) + status oauth_pending.
+__VERSION__ = "1.36.0"
 
 import hashlib
 import hmac
@@ -10707,6 +10720,27 @@ _MCP_REMOTE_TRANSPORTS = ("http", "sse")
 # "http"/"sse" names; translate to OpenClaw's vocabulary on write.
 _MCP_OPENCLAW_TRANSPORT = {"http": "streamable-http", "sse": "sse"}
 
+# Public OAuth redirect (Firebase Hosting, go.tbrain.app). The page captures
+# `?code=` and surfaces it to the app (Fase 0: copy-paste; Fase 1+: deep link).
+# The same value is registered with the provider via DCR by `openclaw mcp add
+# --oauth-redirect-url`, so it MUST match what the callback page serves.
+MCP_OAUTH_REDIRECT_URL = "https://go.tbrain.app/mcp/callback"
+
+
+def _extract_oauth_authorize_url(text: str) -> str | None:
+    """Pull the provider authorize URL out of `openclaw mcp login` stdout.
+    The CLI prints a banner + the URL on its own line + a follow-up hint;
+    the authorize URL is the line carrying the OAuth query (response_type /
+    code_challenge). Doctor-warning noise and the embedded redirect_uri (which
+    lives inside the query, not on its own line) are skipped."""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("http") and (
+            "response_type=" in line or "code_challenge=" in line or "/authorize" in line
+        ):
+            return line
+    return None
+
 
 def _build_mcp_remote_entry(fields: dict, secrets: dict) -> dict:
     """Build an openclaw.json mcpServers[] entry for a REMOTE server.
@@ -10776,24 +10810,39 @@ def handle_mcp_install(token: dict, params: dict) -> dict:
             },
         }
 
+    # OAuth catalog entries go through mcp.oauth.begin/complete (browser
+    # consent), not the static-secret path here.
+    auth_type = (fields.get("authType") or "header").strip().lower()
+    if auth_type == "oauth":
+        return {
+            "status": "error",
+            "result": {"error": "oauth_server_use_begin: call mcp.oauth.begin"},
+        }
+
     try:
         entry = _build_mcp_remote_entry(fields, secrets)
     except ValueError as e:
         return {"status": "error", "result": {"error": str(e)}}
 
-    try:
-        cfg = read_openclaw_json() or {}
-        mcp = cfg.get("mcp")
-        if not isinstance(mcp, dict):
-            mcp = {}
-            cfg["mcp"] = mcp
-        servers = mcp.get("servers")
-        if not isinstance(servers, dict):
-            servers = {}
-            mcp["servers"] = servers
-        servers[server_id] = entry
-        _write_openclaw_json(cfg)
+    # Write via the CLI (openclaw mcp set), NOT by editing openclaw.json
+    # directly: the CLI is the stable contract; the on-disk shape drifts
+    # between versions. `set` is an idempotent upsert (clean re-enable). The
+    # secret transits argv for the duration of the call — acceptable on a
+    # single-tenant node; at rest it lands in openclaw.json headers exactly as
+    # before. The gateway hot-reloads mcp.servers, so no restart is needed.
+    res = _run_openclaw("mcp", "set", server_id, json.dumps(entry), timeout=45)
+    if not res.get("ok"):
+        err = (res.get("stderr") or res.get("error") or "mcp_set_failed").strip()[:500]
+        _log(f"mcp_install {server_id} failed: {err}")
+        try:
+            _firestore_upsert_mcp_server(
+                token, server_id, {"status": "error", "error": err}
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return {"status": "error", "result": {"error": err}}
 
+    try:
         # Mirror WITHOUT secrets: drop headers before persisting config.
         safe_config = {k: v for k, v in entry.items() if k != "headers"}
         _firestore_upsert_mcp_server(
@@ -10801,6 +10850,7 @@ def handle_mcp_install(token: dict, params: dict) -> dict:
             server_id,
             {
                 "catalogId": server_id,
+                "authType": "header",
                 "enabled": True,
                 "status": "enabled",
                 "config": json.dumps(safe_config),
@@ -10808,18 +10858,8 @@ def handle_mcp_install(token: dict, params: dict) -> dict:
             },
         )
     except Exception as e:  # noqa: BLE001
-        _log(f"mcp_install {server_id} failed: {e}")
-        try:
-            _firestore_upsert_mcp_server(
-                token, server_id, {"status": "error", "error": str(e)[:500]}
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        return {"status": "error", "result": {"error": str(e)[:500]}}
+        _log(f"mcp_install {server_id} mirror failed: {e}")
 
-    # Goes live on the next restart_gateway_for_mcp (the client coalesces a
-    # batch of toggles into one restart on screen close). Connect health /
-    # toolCount reconciliation is F4 (telemetry via `openclaw mcp list`).
     return {"status": "done", "result": {"serverId": server_id, "transport": transport}}
 
 
@@ -10827,14 +10867,17 @@ def handle_mcp_remove(token: dict, params: dict) -> dict:
     server_id = (params.get("serverId") or params.get("catalogId") or "").strip()
     if not server_id:
         return {"status": "error", "result": {"error": "missing_serverId"}}
+    # Remove via the CLI: `unset` drops the mcp.servers entry; `logout` clears
+    # any stored OAuth token (no-op / harmless for header servers). Treat a
+    # missing entry as success (idempotent disable).
+    res = _run_openclaw("mcp", "unset", server_id, timeout=30)
+    _run_openclaw("mcp", "logout", server_id, timeout=30)  # best-effort
+    if not res.get("ok"):
+        err = (res.get("stderr") or res.get("error") or "").lower()
+        if "not found" not in err and "unknown" not in err and "no such" not in err:
+            _log(f"mcp_remove {server_id} failed: {err[:300]}")
+            return {"status": "error", "result": {"error": err[:500] or "mcp_unset_failed"}}
     try:
-        cfg = read_openclaw_json() or {}
-        mcp = cfg.get("mcp")
-        servers = mcp.get("servers") if isinstance(mcp, dict) else None
-        removed = isinstance(servers, dict) and server_id in servers
-        if removed:
-            del servers[server_id]
-            _write_openclaw_json(cfg)
         # Keep `config` (omit from the mask) so re-enabling only needs the
         # secret again; flip enabled/status and clear any prior error.
         _firestore_upsert_mcp_server(
@@ -10843,9 +10886,137 @@ def handle_mcp_remove(token: dict, params: dict) -> dict:
             {"enabled": False, "status": "disabled", "error": None},
         )
     except Exception as e:  # noqa: BLE001
-        _log(f"mcp_remove {server_id} failed: {e}")
-        return {"status": "error", "result": {"error": str(e)[:500]}}
-    return {"status": "done", "result": {"serverId": server_id, "removed": removed}}
+        _log(f"mcp_remove {server_id} mirror failed: {e}")
+    return {"status": "done", "result": {"serverId": server_id, "removed": True}}
+
+
+# ── MCP OAuth (Notion / Linear / Asana / Atlassian-oauth / …) ──
+#
+# OpenClaw 2026.6.10 ships native OAuth for remote MCP servers (MCP SDK
+# authProvider over StreamableHTTP/SSE). We DON'T build OAuth ourselves — we
+# drive the CLI in two steps so a headless node can be authorized from the
+# phone (no local browser needed):
+#
+#   begin:    `openclaw mcp add <id> --auth oauth --oauth-redirect-url <pub>
+#              --no-probe` (DCR registers a client on the fly; no per-provider
+#              app to pre-register) → `openclaw mcp login <id>` prints the
+#              provider authorize URL → we return it to the app.
+#   (user)    opens the URL, consents in their own account → provider redirects
+#              to go.tbrain.app/mcp/callback?code=… → the app gets the code.
+#   complete: `openclaw mcp login <id> --code <code>` exchanges + stores the
+#              token (PKCE verifier was saved on this node at begin), then
+#              `openclaw mcp reload` so the next turn picks it up.
+#
+# Verified on the Mini 2026-06-28: login (no --code) prints the URL and exits
+# 0 — it does not hang waiting on a local browser.
+
+def handle_mcp_oauth_begin(token: dict, params: dict) -> dict:
+    server_id = (params.get("serverId") or params.get("catalogId") or "").strip()
+    if not server_id:
+        return {"status": "error", "result": {"error": "missing_serverId"}}
+
+    doc = _firestore_get_mcp_catalog_doc(token, server_id)
+    if doc is None:
+        return {"status": "error", "result": {"error": f"mcp_not_found: {server_id}"}}
+    fields = {k: _fs_unwrap(v) for k, v in doc.get("fields", {}).items()}
+
+    transport = (fields.get("transport") or "").strip()
+    if transport not in _MCP_REMOTE_TRANSPORTS:
+        return {
+            "status": "error",
+            "result": {"error": f"unsupported_transport: {transport or 'none'}"},
+        }
+    url = (fields.get("url") or "").strip()
+    if not url:
+        return {"status": "error", "result": {"error": "missing_url"}}
+    ot = _MCP_OPENCLAW_TRANSPORT.get(transport, transport)
+    scope = (fields.get("oauthScope") or "").strip()
+    meta_url = (fields.get("oauthClientMetadataUrl") or "").strip()
+
+    # Clear any prior half-finished attempt so re-begin is idempotent
+    # (mcp add fails if the server already exists).
+    _run_openclaw("mcp", "unset", server_id, timeout=30)
+    _run_openclaw("mcp", "logout", server_id, timeout=30)
+
+    add = [
+        "mcp", "add", server_id,
+        "--url", url, "--transport", ot,
+        "--auth", "oauth",
+        "--oauth-redirect-url", MCP_OAUTH_REDIRECT_URL,
+        "--no-probe",
+    ]
+    if scope:
+        add += ["--oauth-scope", scope]
+    if meta_url:
+        add += ["--oauth-client-metadata-url", meta_url]
+    res = _run_openclaw(*add, timeout=60)
+    if not res.get("ok"):
+        err = (res.get("stderr") or res.get("error") or "mcp_add_failed").strip()[:500]
+        _log(f"mcp_oauth_begin {server_id} add failed: {err}")
+        return {"status": "error", "result": {"error": err}}
+
+    login = _run_openclaw("mcp", "login", server_id, timeout=45)
+    auth_url = _extract_oauth_authorize_url(login.get("stdout", ""))
+    if not auth_url:
+        # Couldn't parse the URL — roll back the half-added server.
+        _run_openclaw("mcp", "unset", server_id, timeout=30)
+        tail = (login.get("stdout", "") + login.get("stderr", ""))[-400:]
+        _log(f"mcp_oauth_begin {server_id} no auth url; tail={tail}")
+        return {"status": "error", "result": {"error": "no_auth_url", "detail": tail}}
+
+    try:
+        _firestore_upsert_mcp_server(
+            token,
+            server_id,
+            {
+                "catalogId": server_id,
+                "authType": "oauth",
+                "enabled": False,
+                "status": "oauth_pending",
+                "config": json.dumps({"transport": ot, "url": url, "auth": "oauth"}),
+                "error": None,
+            },
+        )
+    except Exception as e:  # noqa: BLE001
+        _log(f"mcp_oauth_begin {server_id} mirror failed: {e}")
+
+    return {"status": "done", "result": {"serverId": server_id, "authUrl": auth_url}}
+
+
+def handle_mcp_oauth_complete(token: dict, params: dict) -> dict:
+    server_id = (params.get("serverId") or params.get("catalogId") or "").strip()
+    code = (params.get("code") or "").strip()
+    if not server_id:
+        return {"status": "error", "result": {"error": "missing_serverId"}}
+    if not code:
+        return {"status": "error", "result": {"error": "missing_code"}}
+
+    res = _run_openclaw("mcp", "login", server_id, "--code", code, timeout=60)
+    if not res.get("ok"):
+        err = (res.get("stderr") or res.get("error") or "mcp_login_failed").strip()[:500]
+        _log(f"mcp_oauth_complete {server_id} failed: {err}")
+        try:
+            _firestore_upsert_mcp_server(
+                token, server_id, {"status": "error", "error": err}
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return {"status": "error", "result": {"error": err}}
+
+    # Token stored; dispose cached MCP runtimes so the next turn reconnects
+    # with the new credentials.
+    _run_openclaw("mcp", "reload", timeout=30)
+
+    try:
+        _firestore_upsert_mcp_server(
+            token,
+            server_id,
+            {"enabled": True, "status": "enabled", "error": None},
+        )
+    except Exception as e:  # noqa: BLE001
+        _log(f"mcp_oauth_complete {server_id} mirror failed: {e}")
+
+    return {"status": "done", "result": {"serverId": server_id, "connected": True}}
 
 
 def handle_restart_gateway_for_mcp(token: dict, params: dict) -> dict:
@@ -11786,6 +11957,8 @@ _HANDLERS = {
     "restart_gateway_for_subagents": handle_restart_gateway_for_subagents,
     "mcp.install": handle_mcp_install,
     "mcp.remove": handle_mcp_remove,
+    "mcp.oauth.begin": handle_mcp_oauth_begin,
+    "mcp.oauth.complete": handle_mcp_oauth_complete,
     "restart_gateway_for_mcp": handle_restart_gateway_for_mcp,
     "channels.email.link": handle_channels_email_link,
     "channels.email.unlink": handle_channels_email_unlink,
