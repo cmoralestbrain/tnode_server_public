@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.57.0"
+TNODE_SETUP_VERSION="1.58.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -6458,7 +6458,7 @@ from __future__ import annotations
 #          — principio SDK: el CLI es el contrato estable, el shape del JSON
 #          deriva entre versiones. install rechaza authType=oauth (va por begin).
 #          Mirror Firestore añade authType (header|oauth) + status oauth_pending.
-__VERSION__ = "1.36.0"
+__VERSION__ = "1.37.0"
 
 import hashlib
 import hmac
@@ -9665,6 +9665,14 @@ _GUEST_TOOLS_DENY = [
     # P5: raw wiki tools blocked for all guests; kb_search (context-engine) is
     # the gated replacement — only available when allowedDocRefs is non-empty.
     "wiki_search", "wiki_get", "wiki_lint", "wiki_apply",
+    # Hardening (2026-07-01): a guest must NEVER reach the owner's memory or the
+    # node's control plane. These are hard-denied in the FLOOR (defense in depth
+    # even if the context-engine hook fails to load) and are NOT togglable per
+    # link — no legitimate guest use. `memory_*` = owner's private memory;
+    # `gateway` = restart/config the running process; `cron` = schedule wake
+    # events. (sessions_spawn/send stay OUT of the floor by design — delegation
+    # is gated per-link by the hook via allowedAgents.)
+    "memory_search", "memory_get", "gateway", "cron",
 ]
 
 _GUEST_IDENTITY_MD = """# IDENTITY.md — Asistente (modo invitado)
