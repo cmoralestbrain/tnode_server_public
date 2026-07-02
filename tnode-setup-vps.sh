@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.60.0"
+TNODE_SETUP_VERSION="1.61.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -5076,14 +5076,22 @@ phase_tunnel() {
             return 0
         fi
 
-        # 2. Call the Worker with the HMAC headers.
-        local provision_response
+        # 2. Call the Worker with the HMAC headers. With TNODE_AUTO_PAIR (cloud
+        # provisioning) we pin the tunnel to TNODE_NODE_ID via desiredNodeId so
+        # droplet name, node doc, tunnel and domain all share ONE id (the
+        # worker replaces any stale tunnel with that name). BYO installs omit
+        # it and keep getting a worker-minted random id.
+        local provision_body provision_response
+        provision_body="{\"label\": \"$(hostname -s 2>/dev/null || echo 'tnode')\"}"
+        if [[ -n "${TNODE_NODE_ID:-}" ]]; then
+            provision_body="{\"label\": \"$(hostname -s 2>/dev/null || echo 'tnode')\", \"desiredNodeId\": \"${TNODE_NODE_ID}\"}"
+        fi
         provision_response="$(curl -fsSL -X POST "$TUNNEL_API_URL" \
             -H "Authorization: Bearer $ptoken_sig" \
             -H "X-Provision-Timestamp: $ptoken_ts" \
             -H "X-Provision-Nonce: $ptoken_nonce" \
             -H "Content-Type: application/json" \
-            -d "{\"label\": \"$(hostname -s 2>/dev/null || echo 'tnode')\"}" \
+            -d "$provision_body" \
             --max-time 30 2>/dev/null || true)"
 
         if [[ -z "$provision_response" ]]; then
