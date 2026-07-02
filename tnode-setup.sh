@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.58.0"
+TNODE_SETUP_VERSION="1.59.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -6411,7 +6411,7 @@ from __future__ import annotations
 #          — principio SDK: el CLI es el contrato estable, el shape del JSON
 #          deriva entre versiones. install rechaza authType=oauth (va por begin).
 #          Mirror Firestore añade authType (header|oauth) + status oauth_pending.
-__VERSION__ = "1.37.0"
+__VERSION__ = "1.38.0"
 
 import hashlib
 import hmac
@@ -9692,16 +9692,24 @@ visitantes y prospectos.
 - No menciones a otros clientes ni información privada.
 """
 
+_GUEST_BIZ_START = "<!-- tnode:business:start -->"
+_GUEST_BIZ_END = "<!-- tnode:business:end -->"
+
+# IDENTITY/USER/AGENTS are static (content-compare). SOUL.md is OWNED by
+# _ensure_guest_business_section in the token-bearing declarative pass — it
+# appends the owner's Business Profile below the neutral persona so the guest
+# knows the business it represents — so here it is only SEEDED when absent, to
+# keep the two writers from fighting over the file.
 _GUEST_WS_FILES = {
     "IDENTITY.md": _GUEST_IDENTITY_MD,
-    "SOUL.md": _GUEST_SOUL_MD,
     "USER.md": _GUEST_USER_MD,
     "AGENTS.md": _GUEST_AGENTS_MD,
 }
 
 
 def _ensure_guest_workspace_files() -> None:
-    """Materialize the neutral guest workspace (write if absent or changed)."""
+    """Materialize the neutral guest workspace (write if absent or changed).
+    SOUL.md is only SEEDED when absent — the token pass owns its content."""
     try:
         _GUEST_WS_DIR.mkdir(parents=True, exist_ok=True)
         for name, content in _GUEST_WS_FILES.items():
@@ -9709,8 +9717,105 @@ def _ensure_guest_workspace_files() -> None:
             if (not p.exists()) or p.read_text(encoding="utf-8") != content:
                 p.write_text(content, encoding="utf-8")
                 _log(f"guest workspace: wrote {name}")
+        soul = _GUEST_WS_DIR / "SOUL.md"
+        if not soul.exists():
+            soul.write_text(_GUEST_SOUL_MD, encoding="utf-8")
+            _log("guest workspace: seeded SOUL.md")
     except Exception as e:  # noqa: BLE001
         _log(f"guest workspace materialize failed: {e}")
+
+
+def _firestore_get_business_profile(token: dict) -> dict | None:
+    """GET users/{uid}/nodes/{nodeId}/config/businessProfile (node-scoped).
+    Returns the unwrapped fields, or None when the doc is absent/unreadable."""
+    try:
+        url = (
+            f"{_firestore_base()}/users/{token['uid']}/nodes/{token['nodeId']}"
+            f"/config/businessProfile"
+        )
+        doc = _http_request(
+            "GET", url, headers={"Authorization": f"Bearer {token['idToken']}"}
+        )
+    except Exception:  # noqa: BLE001 — a 404 (no profile yet) lands here too
+        return None
+    fields = doc.get("fields") if isinstance(doc, dict) else None
+    if not fields:
+        return None
+    return {k: _fs_unwrap(v) for k, v in fields.items()}
+
+
+def _render_guest_business_block(profile: dict | None) -> str:
+    """'## Sobre el negocio' markdown from the non-empty (NON-PII) fields. Empty
+    string when there is no meaningful profile (no name/type). Mirrors the CF
+    buildUserDoc block so the guest and the owner agent describe the business
+    the same way."""
+    if not profile:
+        return ""
+
+    def _s(key: str) -> str:
+        v = profile.get(key)
+        return v.strip() if isinstance(v, str) else ""
+
+    name = _s("name")
+    typ = _s("type")
+    if not name and not typ:
+        return ""
+    lines = [
+        "## Sobre el negocio",
+        "",
+        "Atiendes a clientes de este negocio. Úsalo para responder y orientar; "
+        "si te falta un dato, dilo con honestidad.",
+        "",
+    ]
+    if name:
+        lines.append(f"- Nombre: {name}")
+    if typ:
+        lines.append(f"- Giro: {typ}")
+    if _s("description"):
+        lines.append(f"- Descripción: {_s('description')}")
+    if _s("city"):
+        lines.append(f"- Ciudad: {_s('city')}")
+    services = profile.get("services")
+    if isinstance(services, list):
+        svc = [s.strip() for s in services if isinstance(s, str) and s.strip()]
+        if svc:
+            lines.append(f"- Servicios: {', '.join(svc)}")
+    if _s("hoursSummary"):
+        lines.append(f"- Horario: {_s('hoursSummary')}")
+    contact = " · ".join(x for x in (_s("publicPhone"), _s("publicEmail")) if x)
+    if contact:
+        lines.append(f"- Contacto: {contact}")
+    if _s("publicAddress"):
+        lines.append(f"- Dirección: {_s('publicAddress')}")
+    return "\n".join(lines)
+
+
+def _ensure_guest_business_section(token: dict) -> None:
+    """Render the owner's Business Profile into the guest workspace SOUL.md so
+    the GUEST agent knows the business it represents (e.g. a taller mecánico)
+    instead of confabulating. Writes the '## Sobre el negocio' block between
+    markers, appended to the neutral persona. Idempotent (content-compare);
+    empty markers when no profile. Token-bearing (the read needs a mint)."""
+    try:
+        block = _render_guest_business_block(
+            _firestore_get_business_profile(token)
+        )
+        zone = (
+            f"{_GUEST_BIZ_START}\n{block}\n{_GUEST_BIZ_END}"
+            if block
+            else f"{_GUEST_BIZ_START}\n{_GUEST_BIZ_END}"
+        )
+        expected = _GUEST_SOUL_MD.rstrip() + "\n\n" + zone + "\n"
+        _GUEST_WS_DIR.mkdir(parents=True, exist_ok=True)
+        p = _GUEST_WS_DIR / "SOUL.md"
+        if (not p.exists()) or p.read_text(encoding="utf-8") != expected:
+            p.write_text(expected, encoding="utf-8")
+            _log(
+                "guest workspace: business section "
+                f"{'set' if block else 'cleared'} in SOUL.md"
+            )
+    except Exception as e:  # noqa: BLE001
+        _log(f"guest business section failed: {e}")
 
 
 def _ensure_guest_agent() -> bool:
@@ -11975,6 +12080,10 @@ def _run_declarative_sync(token: dict) -> None:
     _md_sync_from_json(token, "user")
     # TEAM_INDEX.md: peer roster (dedicated file, hash-rendered; gone if no peers).
     _team_index_sync_from_json(token)
+    # Guest workspace SOUL.md: render the owner's Business Profile so the guest
+    # agent knows the business it represents (needs the token to read the
+    # node-scoped config/businessProfile doc).
+    _ensure_guest_business_section(token)
     _clear_node_fields_cache()
 
 
