@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.64.0"
+TNODE_SETUP_VERSION="1.65.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -6872,7 +6872,15 @@ from __future__ import annotations
 #          — principio SDK: el CLI es el contrato estable, el shape del JSON
 #          deriva entre versiones. install rechaza authType=oauth (va por begin).
 #          Mirror Firestore añade authType (header|oauth) + status oauth_pending.
-__VERSION__ = "1.40.0"
+# 1.41.0 — Cron declarativo del resurtido (P3 supplier_restock): la CF
+#          syncInventoryFlowOnWrite compone inventoryCronJson/inventoryCronHash
+#          en el node doc al tocar config/inventoryFlow; _sync_inventory_cron
+#          (dentro del pase declarativo, hash-gated con stamp local
+#          .tnode-inventory-cron-hash) materializa el job "tnode-inventario"
+#          vía CLI del core: rm de los jobs con ese nombre + add fresco si
+#          enabled (agent main, sesión isolated, sin --announce — la entrega
+#          es la ApprovalCard). Motor 100% agente; el daemon solo declara.
+__VERSION__ = "1.41.0"
 
 import hashlib
 import hmac
@@ -7343,7 +7351,10 @@ def _cli_env() -> dict:
     return env
 
 
-def _run_openclaw(*args: str, timeout: int = 60) -> dict:
+def _run_openclaw(*args: str, timeout: int = 60, stdout_limit: int = 2000) -> dict:
+    """stdout_limit trunca al TAIL (default 2000, como siempre); 0 = sin
+    truncar — necesario cuando el caller parsea JSON del stdout (un JSON
+    truncado por la cabeza parece parsear y truena con 'Extra data')."""
     bin_path = _openclaw_binary()
     if not bin_path:
         return {"ok": False, "error": "openclaw_not_found"}
@@ -7359,7 +7370,7 @@ def _run_openclaw(*args: str, timeout: int = 60) -> dict:
         result = {
             "ok": proc.returncode == 0,
             "code": proc.returncode,
-            "stdout": proc.stdout[-2000:],
+            "stdout": proc.stdout[-stdout_limit:] if stdout_limit else proc.stdout,
             "stderr": proc.stderr[-2000:],
         }
     except subprocess.TimeoutExpired:
@@ -12605,15 +12616,129 @@ def handle_command(token: dict, cmd: dict) -> dict:
 
 # ── Main loop ──────────────────────────────────────────────────
 
+# ── Cron declarativo del resurtido (v1.41.0) ─────────────────────
+# La CF syncInventoryFlowOnWrite (inventory_flow.ts) compone
+# inventoryCronJson/inventoryCronHash en el node doc cuando el dueño toca
+# config/inventoryFlow; aquí lo materializamos con el CLI del core (mismo
+# patrón declarativo por hash que TOOLS.md). El motor del flujo es 100%
+# agente (cron nativo OpenClaw, sesión aislada); este daemon SOLO garantiza
+# que el job exista/desaparezca según lo declarado — no orquesta nada.
+_INVENTORY_CRON_HASH_PATH = OPENCLAW_DIR / ".tnode-inventory-cron-hash"
+
+
+def _read_inventory_cron_hash() -> str:
+    try:
+        return _INVENTORY_CRON_HASH_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _write_inventory_cron_hash(value: str) -> None:
+    try:
+        _INVENTORY_CRON_HASH_PATH.write_text(value, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _find_cron_job_ids(name: str) -> list:
+    """Ids de los cron jobs del gateway con ese nombre (incluye disabled)."""
+    res = _run_openclaw(
+        "cron", "list", "--all", "--json", timeout=30, stdout_limit=0
+    )
+    if not res.get("ok"):
+        raise RuntimeError(
+            f"cron list failed: {res.get('stderr') or res.get('error')}"
+        )
+    try:
+        jobs = (json.loads(res.get("stdout") or "{}").get("jobs")) or []
+    except ValueError as e:
+        raise RuntimeError(f"cron list unparseable: {e}")
+    return [j.get("id") for j in jobs if j.get("name") == name and j.get("id")]
+
+
+def _sync_inventory_cron(token: dict) -> None:
+    """Materializa el cron declarado en inventoryCronJson (hash-gated).
+
+    Estrategia rm+add (sin diffear campos): en cambio de hash se quitan los
+    jobs con el nombre gestionado y, si enabled, se crea uno fresco. El add va
+    SIN --announce: la entrega al dueño es la ApprovalCard (server-write de
+    approvalApi), y announce truena con multi-canal (visto en P2: "Channel is
+    required when multiple channels are configured"). El hash local solo se
+    estampa en éxito — gateway caído reintenta al próximo pase."""
+    try:
+        remote_hash = _firestore_get_node_field(token, "inventoryCronHash")
+    except Exception as e:  # noqa: BLE001
+        _log(f"inventory-cron: hash read failed: {e}")
+        return
+    if not remote_hash or remote_hash == _read_inventory_cron_hash():
+        return
+    try:
+        raw = _firestore_get_node_field(token, "inventoryCronJson")
+        doc = json.loads(raw) if raw else None
+    except Exception as e:  # noqa: BLE001
+        _log(f"inventory-cron: json read/parse failed: {e}")
+        return
+    if not isinstance(doc, dict):
+        return
+    name = str(doc.get("name") or "tnode-inventario")
+    try:
+        for jid in _find_cron_job_ids(name):
+            res = _run_openclaw("cron", "rm", jid, timeout=30)
+            if not res.get("ok"):
+                raise RuntimeError(
+                    f"cron rm {jid}: {res.get('stderr') or res.get('error')}"
+                )
+        if doc.get("enabled") is True and doc.get("message"):
+            every = int(doc.get("everyMinutes") or 15)
+            res = _run_openclaw(
+                "cron", "add",
+                "--name", name,
+                "--every", f"{every}m",
+                "--agent", str(doc.get("agent") or "main"),
+                "--session", str(doc.get("session") or "isolated"),
+                "--thinking", str(doc.get("thinking") or "low"),
+                "--timeout-seconds", str(int(doc.get("timeoutSeconds") or 480)),
+                "--message", str(doc.get("message")),
+                # Entrega explícita al canal del app: "last" truena en nodos
+                # multi-canal ("Channel is required…", visto en P2 con
+                # telegram+tnode) y best-effort evita que un fallo de entrega
+                # marque el job en error (la ApprovalCard va por server-write,
+                # no depende de esto; esto solo acarrea reportes del agente).
+                "--channel", "tnode",
+                "--best-effort-deliver",
+                "--json",
+                timeout=60,
+            )
+            if not res.get("ok"):
+                raise RuntimeError(
+                    f"cron add: {res.get('stderr') or res.get('error')}"
+                )
+            _log(
+                f"inventory-cron: materialized '{name}' every {every}m "
+                f"(hash {remote_hash[:12]})"
+            )
+        else:
+            _log(
+                f"inventory-cron: disabled — removed '{name}' "
+                f"(hash {remote_hash[:12]})"
+            )
+        _write_inventory_cron_hash(remote_hash)
+    except Exception as e:  # noqa: BLE001
+        _log(f"inventory-cron: sync failed (will retry): {e}")
+
+
 def _run_declarative_sync(token: dict) -> None:
-    """Prime the five hash fields in ONE masked GET, then render every
+    """Prime the hash fields in ONE masked GET, then render every
     declarative file (TOOLS/SOUL/IDENTITY/USER/TEAM) whose hash changed.
     Shared by the slow safety-timer in the main loop and the SessionStart
     DECL_ONESHOT hook. Each step is individually resilient (swallows its own
     errors), so one bad target never aborts the rest."""
     _prime_node_fields(
         token,
-        ["toolsHash", "soulHash", "identityHash", "userHash", "teamIndexHash"],
+        [
+            "toolsHash", "soulHash", "identityHash", "userHash",
+            "teamIndexHash", "inventoryCronHash",
+        ],
     )
     # Reflect channel state to Firestore + the one-time v1.1 migration, then
     # render the managed zone of TOOLS.md (cheap hash check; only rewrites on
@@ -12630,6 +12755,8 @@ def _run_declarative_sync(token: dict) -> None:
     _md_sync_from_json(token, "user")
     # TEAM_INDEX.md: peer roster (dedicated file, hash-rendered; gone if no peers).
     _team_index_sync_from_json(token)
+    # Cron declarativo del resurtido (hash-gated; rm+add vía CLI del core).
+    _sync_inventory_cron(token)
     # Guest workspace SOUL.md: render the owner's Business Profile so the guest
     # agent knows the business it represents (needs the token to read the
     # node-scoped config/businessProfile doc).
@@ -13211,7 +13338,7 @@ from __future__ import annotations
 #          live session, spawn tnode-config-sync DECL_ONESHOT to refresh the
 #          workspace .md (throttled, fire-and-forget). Replaces config-sync's
 #          Firestore poll → Document reads scale with sessions, not the clock.
-__VERSION__ = "1.26.0"
+__VERSION__ = "1.27.0"
 
 import hashlib
 import hmac
@@ -15977,6 +16104,79 @@ def _gateway_send_pending(items: list) -> tuple[list, str | None]:
             pass
 
 
+def _outbox_gate(session_key: str, idem_key: str) -> str:
+    """Decide what to do with a pending outbox doc BEFORE injecting it —
+    dedupe against the gateway's own ground truth (v1.27.0, double-delivery
+    fix: device-check +191 saw approval decisions duplicated/aborted when the
+    app's pending→ws flip didn't land by sweep time).
+
+    Returns one of:
+      "delivered" — the gateway already received this idempotencyKey on that
+          session: the user entry lands in the legacy `<sessionId>.jsonl` as
+          `"idempotencyKey":"<key>:user"` when the turn completes (the
+          gateway also reuses the raw key as the turn's runId). Injecting
+          again would START A SECOND TURN — the gateway only dedupes an
+          idempotencyKey while its run is in flight, NOT after completion
+          (both verified live on the Mini gateway, 2026-07-03). Flip the
+          doc, don't send.
+      "inflight" — the session has a live `<sessionId>.jsonl.lock` (created
+          at accept, removed at turn end — the session jsonl itself is only
+          written at completion, so during the turn the lock is the ONLY
+          local signal). A turn is running right now: defer to the next
+          sweep — by then the key shows up in the jsonl ("delivered") or the
+          lock clears ("send"). Deferring also stops an outbox inject from
+          aborting an unrelated in-flight turn. Locks older than 10 min are
+          treated as orphans (gateway crash) and ignored.
+      "send" — no evidence the gateway got it: inject as usual.
+
+    Fail-open: any error → "send" (today's behavior)."""
+    try:
+        if not idem_key or not session_key:
+            return "send"
+        routed = _route_session_key(session_key)
+        # sessions.json keys carry the agent prefix: raw app keys land in the
+        # index as `agent:main:<key>` (observed live on the Mini).
+        if routed.startswith("agent:"):
+            keys = (routed,)
+        else:
+            keys = (f"agent:main:{routed}", routed)
+        # Prefix-match (no closing quote): the stored value is `<key>:user`.
+        needles = tuple(
+            f'"idempotencyKey":{sp}"{idem_key}'.encode() for sp in ("", " ")
+        )
+        for d in resolve_all_sessions_dirs():
+            idx = d / "sessions.json"
+            if not idx.is_file():
+                continue
+            try:
+                index = json.loads(idx.read_text())
+            except (OSError, ValueError):
+                continue
+            for k in keys:
+                sid = (index.get(k) or {}).get("sessionId")
+                if not sid:
+                    continue
+                f = d / f"{sid}.jsonl"
+                if f.is_file():
+                    try:
+                        blob = f.read_bytes()
+                    except OSError:
+                        blob = b""
+                    if any(n in blob for n in needles):
+                        return "delivered"
+                lock = d / f"{sid}.jsonl.lock"
+                if lock.exists():
+                    try:
+                        age = time.time() - lock.stat().st_mtime
+                    except OSError:
+                        age = 0.0
+                    if age < 600:
+                        return "inflight"
+        return "send"
+    except Exception:  # noqa: BLE001
+        return "send"
+
+
 def process_outbox(token: dict, project_id: str, state: dict) -> bool:
     """One outbox sweep: query pendings, inject eligible ones, flip
     delivery. Returns True when pendings were seen (feeds hot mode)."""
@@ -16083,7 +16283,34 @@ def process_outbox(token: dict, project_id: str, state: dict) -> bool:
                 mask=["delivery", "deliveryError", "updatedAt"],
             )
         else:
-            sendable.append(it)
+            gate = _outbox_gate(it["sessionKey"], it["idempotencyKey"])
+            if gate == "delivered":
+                # El gateway ya recibió este key por el WS directo — el flip
+                # pending→ws del app no aterrizó. Re-inyectar arrancaría un
+                # SEGUNDO turno; solo cerramos el doc.
+                _log(
+                    f"outbox: {it['id']} already in session jsonl — "
+                    "skip inject (double-delivery dedupe)"
+                )
+                update_chat_outbox_doc(
+                    token, project_id, it["uid"], it["id"],
+                    fields={
+                        "delivery": {"stringValue": "node"},
+                        "updatedAt": _now_ts_value(),
+                    },
+                    mask=["delivery", "updatedAt"],
+                )
+            elif gate == "inflight":
+                # Turno en vuelo en esa sesión: diferir al próximo sweep (no
+                # quema attempts). Log una vez por doc para no spamear.
+                logged = state.setdefault("outbox_inflight_logged", set())
+                if it["id"] not in logged:
+                    logged.add(it["id"])
+                    _log(
+                        f"outbox: {it['id']} session turn in flight — deferred"
+                    )
+            else:
+                sendable.append(it)
     if not sendable:
         return True
 
