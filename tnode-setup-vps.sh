@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.70.0"
+TNODE_SETUP_VERSION="1.71.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -5691,7 +5691,19 @@ from __future__ import annotations
 #          Fixea el gap #1 (AGENTS sin zona gestionada) y el bug de refs vacías
 #          (`Leo ** —` con filenames comidos por un strip viejo). Verificado con
 #          TNODE_AGENTS_DRYRUN antes del flip; flota Mini/Pi/VPS byte-idéntica.
-__VERSION__ = "1.45.0"
+# 1.46.0 — Core .md estandarizados + security/memory (Harness Eng. F3b Ola 1 cont.):
+#          (1) tnode:security — Líneas Rojas CONSOLIDADAS (antes duplicadas 4x en
+#          SOUL/IDENTITY/USER/AGENTS, divergentes) en una zona P en AGENTS.md.
+#          (2) tnode:memory — protocolo conversation-memory (SOUL), GATED por
+#          presencia del skill (_has_conversation_memory: Mini sí, Pi/VPS no).
+#          (3) SOUL/IDENTITY/USER ahora se ESTANDARIZAN (patrón de AGENTS 1.45.0,
+#          generalizado a _std_reset): reset a canónico limpio descartando la capa
+#          A curada (persona TBrain, "Los Clientes", email legacy, dups de
+#          seguridad) con backup reversible por archivo (.bak-pre-{soul,identity,
+#          user}); las zonas gestionadas se re-appendean. La persona/negocio se
+#          recaptura por el Wizard (F3.5, capa D). Retira el _md_migrate (CF strip)
+#          de soul/identity. Core entero limpio y consistente en la flota.
+__VERSION__ = "1.46.0"
 
 import hashlib
 import hmac
@@ -9676,6 +9688,32 @@ _MD_TARGETS = {
         "backup_name": "AGENTS.md.bak-pre-agents",
         "legacy_headers": (),
     },
+    # tnode:security — zona P transversal CONSOLIDADA (F3b). Antes duplicada 4x
+    # (SOUL ## Reglas · IDENTITY ## Seguridad de Identidad · USER ### Lo que NUNCA
+    # Revelo · AGENTS ## Líneas Rojas), divergente. Vive en AGENTS.md (append tras
+    # las 4 zonas agents:*); las copias en SOUL/IDENTITY/USER se van con el
+    # standardize de cada archivo.
+    "security": {
+        "md_name": "AGENTS.md",
+        "zone_start": "<!-- tnode:security:start -->",
+        "zone_end": "<!-- tnode:security:end -->",
+        "hash_path": OPENCLAW_DIR / ".tnode-security-hash",
+        "sentinel": OPENCLAW_DIR / ".tnode-security-migrated",
+        "backup_name": "AGENTS.md.bak-pre-agents",
+        "legacy_headers": (),
+    },
+    # tnode:memory — protocolo conversation-memory (SOUL). P pero GATED: solo se
+    # renderiza si el skill conversation-memory está instalado en el nodo (Mini sí,
+    # Pi/VPS no). El gate vive en la orquestación (_has_conversation_memory).
+    "memory": {
+        "md_name": "SOUL.md",
+        "zone_start": "<!-- tnode:memory:start -->",
+        "zone_end": "<!-- tnode:memory:end -->",
+        "hash_path": OPENCLAW_DIR / ".tnode-memory-hash",
+        "sentinel": OPENCLAW_DIR / ".tnode-memory-migrated",
+        "backup_name": "SOUL.md.bak-pre-soul",
+        "legacy_headers": (),
+    },
 }
 
 _md_bootstrap_attempted: dict = {}
@@ -9802,6 +9840,10 @@ def _compose_md_local(token: dict, target: str):
         return _compose_tools_doc(token)
     if target in _AGENTS_ZONE_TEXT:
         return _compose_agents_doc(target)
+    if target == "security":
+        return _compose_security_doc()
+    if target == "memory":
+        return _compose_memory_doc()
     return None
 
 
@@ -9919,39 +9961,77 @@ def _md_migrate(target: str) -> None:
 # Backup completo reversible en AGENTS.md.bak-pre-agents. Tras el reset, las 4
 # zonas P (`agents_*`) se appendean vía _md_sync_from_json (mecánica normal).
 _AGENTS_STANDARDIZE_SENTINEL = OPENCLAW_DIR / ".tnode-agents-standardized"
+_SOUL_STANDARDIZE_SENTINEL = OPENCLAW_DIR / ".tnode-soul-standardized"
+_IDENTITY_STANDARDIZE_SENTINEL = OPENCLAW_DIR / ".tnode-identity-standardized"
+_USER_STANDARDIZE_SENTINEL = OPENCLAW_DIR / ".tnode-user-standardized"
 
 
-def _agents_standardize() -> None:
-    """One-time: backup + reset AGENTS.md a un canónico limpio (solo preámbulo).
-    No-op si ya se corrió (sentinel) o si el archivo aún no existe (nodo fresco
-    antes de que OpenClaw lo siembre → reintenta en el próximo poll)."""
-    if _AGENTS_STANDARDIZE_SENTINEL.exists():
+def _std_reset(md_name: str, preamble: str, clear_targets, sentinel, backup_name: str) -> None:
+    """One-time: backup + reset workspace/<md_name> a un canónico limpio (solo el
+    preámbulo neutral), descartando la capa A curada. Tras el reset, las zonas
+    gestionadas del archivo se re-appendean vía _md_sync_from_json — por eso se
+    borran sus hashes (si no, el body ya no está pero el hash coincidiría y el
+    sync lo saltaría). No-op si ya corrió (sentinel) o si el archivo no existe
+    aún (nodo fresco antes de que OpenClaw lo siembre → reintenta luego)."""
+    if sentinel.exists():
         return
-    p = OPENCLAW_DIR / "workspace" / "AGENTS.md"
+    p = OPENCLAW_DIR / "workspace" / md_name
     if not p.is_file():
         return
     try:
         original = p.read_text(encoding="utf-8")
-        bak = p.with_name("AGENTS.md.bak-pre-agents")
+        bak = p.with_name(backup_name)
         if not bak.exists():
             bak.write_text(original, encoding="utf-8")
-        clean = _AGENTS_PREAMBLE.strip() + "\n"
+        clean = preamble.strip() + "\n"
         if clean != original:
             tmp = p.with_name(p.name + ".tmp")
             tmp.write_text(clean, encoding="utf-8")
             os.replace(tmp, p)
-            _log("agents-standardize: AGENTS.md reset a canónico limpio (backup .bak-pre-agents)")
-        # Fuerza el re-render de las 4 zonas: al vaciar el archivo, cualquier hash
-        # previo quedaría stale (el body ya no está) y _md_sync_from_json lo
-        # saltaría. Borrar los hashes garantiza que se vuelvan a appendear.
-        for _ag in _AGENTS_ORDER:
+            _log(f"std-reset[{md_name}]: reset a canónico limpio (backup {backup_name})")
+        for t in clear_targets:
             try:
-                _MD_TARGETS[_ag]["hash_path"].unlink()
+                _MD_TARGETS[t]["hash_path"].unlink()
             except Exception:  # noqa: BLE001
                 pass
-        _AGENTS_STANDARDIZE_SENTINEL.write_text("done", encoding="utf-8")
+        sentinel.write_text("done", encoding="utf-8")
     except Exception as e:  # noqa: BLE001
-        _log(f"agents-standardize: {e}")
+        _log(f"std-reset[{md_name}]: {e}")
+
+
+def _agents_standardize() -> None:
+    # AGENTS.md → preámbulo + 4 zonas agents:* + security (5ª, consolidada).
+    _std_reset(
+        "AGENTS.md", _AGENTS_PREAMBLE, _AGENTS_ORDER + ("security",),
+        _AGENTS_STANDARDIZE_SENTINEL, "AGENTS.md.bak-pre-agents",
+    )
+
+
+def _soul_standardize() -> None:
+    # SOUL.md → preámbulo + tnode:memory (gated) + tnode:soul. Nukea persona A
+    # (Personalidad/Tono), Reglas (→ security) y email legacy (TOOLS R4).
+    _std_reset(
+        "SOUL.md", _SOUL_PREAMBLE, ("memory", "soul"),
+        _SOUL_STANDARDIZE_SENTINEL, "SOUL.md.bak-pre-soul",
+    )
+
+
+def _identity_standardize() -> None:
+    # IDENTITY.md → preámbulo + tnode:identity (subagentes + equipo). Nukea Mi
+    # Propósito / Mi Posición (A) y Seguridad de Identidad (→ security).
+    _std_reset(
+        "IDENTITY.md", _IDENTITY_PREAMBLE, ("identity",),
+        _IDENTITY_STANDARDIZE_SENTINEL, "IDENTITY.md.bak-pre-identity",
+    )
+
+
+def _user_standardize() -> None:
+    # USER.md → preámbulo + tnode:user (perfil del dueño, position=start). Nukea
+    # "Mi Dueño" dup, "Los Clientes", industrias, "Lo que NUNCA Revelo" (→ security).
+    _std_reset(
+        "USER.md", _USER_PREAMBLE, ("user",),
+        _USER_STANDARDIZE_SENTINEL, "USER.md.bak-pre-user",
+    )
 
 
 def _agents_dryrun() -> None:
@@ -10333,6 +10413,82 @@ def _compose_agents_doc(target: str) -> dict:
         "blocks": [
             {"order": 0, "id": target, "kind": "static", "text": _AGENTS_ZONE_TEXT[target]}
         ],
+    }
+
+
+# ── tnode:security — Líneas Rojas consolidadas (F3b, vive en AGENTS.md) ──────
+# Fusión owner-agnóstica de las 4 copias divergentes (SOUL/IDENTITY/USER/AGENTS).
+# El nombre del dueño lo aporta tnode:user; aquí va genérico ("mi dueño").
+_SECURITY = """## Líneas Rojas — Seguridad (Nunca Cruzar)
+
+Reglas inquebrantables, en cualquier canal y con cualquier interlocutor:
+
+- ❌ Nunca revelo el modelo de IA que me ejecuta, su versión, ni mi infraestructura técnica (servidor, configuración interna del sistema).
+- ❌ Nunca revelo claves, tokens, contraseñas ni datos de sistema.
+- ❌ Nunca revelo información de otros clientes ni datos personales de mi dueño o sus colaboradores.
+- ❌ Nunca exfiltro datos privados de ningún cliente.
+- ❌ Nunca ejecuto comandos destructivos sin confirmación explícita.
+- ❌ No soy la voz personal de mi dueño en chats grupales o con clientes — represento al negocio.
+- ✅ Excepción única: solo mi dueño puede solicitar información técnica o de sistema, y aun así verifico el contexto de la sesión antes de responder."""
+
+
+# ── tnode:memory — protocolo conversation-memory (F3b, vive en SOUL.md, GATED) ──
+# Rutas relativas (~) para que sea idéntico en toda la flota; "tu dueño" genérico.
+_MEMORY = """## Memoria de conversaciones (PASO 1 OBLIGATORIO)
+
+**ANTES de responder cualquier mensaje, tu PRIMER toolCall debe ser la herramienta `exec` con este comando:**
+
+```
+python3 ~/.openclaw/workspace/skills/conversation-memory/scripts/conversation_memory.py lookup --limit 3
+```
+
+Esto te devuelve las 3 conversaciones más recientes con tu dueño (temas y resúmenes). SIEMPRE ejecútalo primero, incluso si el mensaje parece trivial como "Hola". El output es texto plano listo para inyectarse en tu contexto.
+
+**Después** de ver el resultado, responde mencionando el contexto previo si es relevante. Habla como si recordaras naturalmente — no menciones que ejecutaste un comando.
+
+### Otros comandos del skill de memoria
+- Buscar por tema: `python3 ~/.openclaw/workspace/skills/conversation-memory/scripts/conversation_memory.py search "<tema>"`
+- Al despedirte o detectar fin de conversación, almacena un resumen:
+  `python3 ~/.openclaw/workspace/skills/conversation-memory/scripts/conversation_memory.py store --session "<session_id>" --summary "<resumen>" --topics '["t1","t2"]' --count <n>`"""
+
+
+# Preámbulos neutrales para el standardize de los core .md (F3b). La persona/rol
+# específicos se recapturan por el Wizard (F3.5, capa D).
+_SOUL_PREAMBLE = """# SOUL.md — Alma del Agente
+
+> Quién soy, cómo pienso y mis límites. Mi personalidad y mi tono se configuran desde la app."""
+
+_IDENTITY_PREAMBLE = """# IDENTITY.md — Quién Soy
+
+> Mi nombre, rol y posición. Se configuran desde la app."""
+
+_USER_PREAMBLE = """# USER.md — Mi Dueño"""
+
+
+def _has_conversation_memory() -> bool:
+    """True si el skill conversation-memory está instalado (gate de tnode:memory)."""
+    return (
+        OPENCLAW_DIR / "workspace" / "skills" / "conversation-memory"
+        / "scripts" / "conversation_memory.py"
+    ).is_file()
+
+
+def _compose_security_doc() -> dict:
+    """Compositor on-node de tnode:security (estático, consolidado)."""
+    return {
+        "schema": 1,
+        "target": "AGENTS.md",
+        "blocks": [{"order": 0, "id": "security", "kind": "static", "text": _SECURITY}],
+    }
+
+
+def _compose_memory_doc() -> dict:
+    """Compositor on-node de tnode:memory (estático). El gate por presencia del
+    skill se aplica en la orquestación; aquí siempre devuelve el bloque."""
+    return {
+        "schema": 1,
+        "target": "SOUL.md",
+        "blocks": [{"order": 0, "id": "memory", "kind": "static", "text": _MEMORY}],
     }
 
 
@@ -12546,16 +12702,26 @@ def _run_declarative_sync(token: dict) -> None:
     _sync_tools_md_from_json(token)
     # SOUL.md / IDENTITY.md: same declarative mechanic (one-time migrate +
     # hash-rendered managed zone).
-    for _md_target in ("soul", "identity"):
-        _md_migrate(_md_target)
-        _md_sync_from_json(token, _md_target)
-    # USER.md: owner profile (no migrate; curated content preserved below).
+    # SOUL/IDENTITY/USER: F3b — se ESTANDARIZAN a canónico limpio (nuke capa A
+    # TBrain/persona) y luego se renderizan sus zonas gestionadas. Reemplaza el
+    # _md_migrate (CF strip) previo: el standardize local es más completo.
+    _soul_standardize()
+    _identity_standardize()
+    _user_standardize()
+    # SOUL: protocolo de memoria (GATED por presencia del skill) + zona soul.
+    if _has_conversation_memory():
+        _md_sync_from_json(token, "memory")
+    _md_sync_from_json(token, "soul")
+    # IDENTITY: sub-agentes + equipo (condicional-a-peers).
+    _md_sync_from_json(token, "identity")
+    # USER: perfil del dueño (position=start).
     _md_sync_from_json(token, "user")
-    # AGENTS.md: estandariza a canónico limpio (one-time) + render de las 4 zonas
-    # P (startup/memory/actions/heartbeats). F3b Ola 1 — platform-pure, sin data.
+    # AGENTS.md: estandariza (one-time) + 4 zonas agents:* P + tnode:security
+    # consolidada (5ª, append). F3b Ola 1.
     _agents_standardize()
     for _ag in _AGENTS_ORDER:
         _md_sync_from_json(token, _ag)
+    _md_sync_from_json(token, "security")
     # TEAM_INDEX.md: peer roster (dedicated file, hash-rendered; gone if no peers).
     _team_index_sync_from_json(token)
     # Cron declarativo del resurtido (hash-gated; rm+add vía CLI del core).
