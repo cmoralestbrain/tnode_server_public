@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.67.0"
+TNODE_SETUP_VERSION="1.68.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -5661,7 +5661,16 @@ from __future__ import annotations
 #          del token, patchear paired.json no dura) — el cron jamás
 #          materializaba (E2E VPS 167.71.81.30, 2026-07-04). El token maestro
 #          autentica full-operator, igual que el inject de chat-sync.
-__VERSION__ = "1.42.0"
+# 1.43.0 — TEAM_INDEX.md ON-NODE (Harness Eng. F1): _team_index_sync_from_json
+#          deja de leer teamIndexJson/teamIndexHash de la CF y compone el roster
+#          LOCALMENTE (_compose_team_index_doc: puerto byte-idéntico de la CF
+#          buildTeamIndexDoc; peers/ + toolsJson de cada peer → _derive_peer_
+#          specialty). Hash-gate local (sha256 del body). Primer índice migrado
+#          del patrón CF→SKILL (motor=plantilla local, datos=Firestore hot).
+#          Paridad byte-a-byte verificada en shadow (TNODE_TEAM_SHADOW_ONLY)
+#          antes del flip. La CF buildTeamIndexDoc+trigger quedan como no-op
+#          hasta retirarse cuando toda la flota esté en >=1.43.0.
+__VERSION__ = "1.43.0"
 
 import hashlib
 import hmac
@@ -9893,44 +9902,207 @@ def _render_team_index(doc: dict) -> bool:
         return False
 
 
-def _team_index_sync_from_json(token: dict) -> None:
-    """Render agency-agents/TEAM_INDEX.md from the node's cached teamIndexJson.
-    Cheap hash check first; only rewrites on change. Bootstrap via the CF
-    (target=team) when there is no cache yet. Resilient: any failure leaves the
-    file untouched."""
+# ── TEAM_INDEX.md compositor ON-NODE (F1: reemplaza la CF buildTeamIndexDoc) ──
+# Puerto byte-idéntico de tnode_client/functions/src/soul_identity_sync.ts:
+# buildTeamIndexDoc + derivePeerSpecialty. Compone el roster localmente desde
+# peers/ (+ el toolsJson de cada peer) en vez de recibir teamIndexJson de la CF.
+# El renderer/hash-gate (_render_team_index) NO cambia — solo el origen del doc.
+_TEAM_FEATURE_LABELS = {
+    "feature:agenda": "agendar citas",
+    "feature:drive": "leer Drive",
+    "feature:email": "correo",
+    "feature:poll": "encuestas",
+}
+
+
+def _tv_str(field):
+    """String de un valor Firestore REST (helper local del compositor — los
+    _fs_str/_fs_bool viven en la región embebida del skill delegate, fuera de
+    este namespace)."""
+    return field.get("stringValue") if isinstance(field, dict) else None
+
+
+def _tv_bool(field):
+    return bool(field.get("booleanValue")) if isinstance(field, dict) else False
+
+
+def _derive_peer_specialty(tools_json: str | None) -> str:
+    """Deriva la 'especialidad' de un peer desde su toolsJson compuesto:
+    mapea ids de bloque (feature:* / mcp:*) a etiquetas legibles."""
+    if not tools_json:
+        return ""
     try:
-        remote_hash = _firestore_get_node_field(token, "teamIndexHash")
-    except Exception as e:  # noqa: BLE001
-        _log(f"team-index: hash read failed: {e}")
-        return
-    if not remote_hash:
-        # Nodo sin cache aún (nunca tuvo peers, o golden mínimo): fuerza UNA
-        # composición vía la CF (una vez por proceso) para sembrar el hash; el
-        # render real ocurre aquí (sin peers el doc viene vacío → no-op).
-        if not _team_bootstrap_attempted["done"]:
-            _team_bootstrap_attempted["done"] = True
-            resp = _md_compose_via_cf("team")
-            if isinstance(resp, dict) and resp.get("ok"):
-                doc = resp.get("doc")
-                if isinstance(doc, dict) and _render_team_index(doc):
-                    h = resp.get("hash") or ""
-                    if h:
-                        _team_write_local_hash(h)
-        return
-    if remote_hash == _team_read_local_hash():
-        return  # sin cambios → no reescribir (el hash captura "con/sin peers")
+        doc = json.loads(tools_json)
+    except Exception:  # noqa: BLE001
+        return ""
+    blocks = doc.get("blocks") if isinstance(doc, dict) else None
+    if not isinstance(blocks, list):
+        blocks = []
+    feats: list[str] = []
+    mcps: list[str] = []
+    for b in blocks:
+        bid = b.get("id") if isinstance(b, dict) else None
+        if not isinstance(bid, str):
+            continue
+        if bid in _TEAM_FEATURE_LABELS:
+            feats.append(_TEAM_FEATURE_LABELS[bid])
+        elif bid.startswith("mcp:"):
+            mcps.append(bid[4:])
+    parts: list[str] = []
+    if feats:
+        parts.append(", ".join(feats))
+    if mcps:
+        parts.append("MCP: " + ", ".join(mcps))
+    return " · ".join(parts)
+
+
+def _md_cell(s: str) -> str:
+    """Celda de tabla Markdown segura: escapa `|`, colapsa saltos, fallback."""
+    v = re.sub(r"\s*\n+\s*", " ", (s or "").replace("|", "\\|")).strip()
+    return v or "—"
+
+
+def _read_node_tools_json(token: dict, node_id: str) -> str | None:
+    """Cross-read del toolsJson de OTRO nodo (para derivar su especialidad)."""
+    url = (
+        f"{_firestore_base()}/users/{token['uid']}/nodes/{node_id}"
+        f"?mask.fieldPaths=toolsJson"
+    )
     try:
+        doc = _http_request(
+            "GET", url,
+            headers={"Authorization": f"Bearer {token['idToken']}"},
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    fields = (doc or {}).get("fields") or {}
+    return _fs_unwrap(fields["toolsJson"]) if "toolsJson" in fields else None
+
+
+def _team_read_peers(token: dict) -> list:
+    """Peers enabled (domain OPCIONAL — espeja la CF, no _list_peers que exige
+    domain), ordenados por alias. Cada uno: {id, tid, alias, role}."""
+    parent = f"users/{token['uid']}/nodes/{token['nodeId']}"
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{PROJECT_ID}"
+        f"/databases/(default)/documents/{parent}:runQuery"
+    )
+    rows = _http_request(
+        "POST", url,
+        payload={"structuredQuery": {"from": [{"collectionId": "peers"}]}},
+        headers={"Authorization": f"Bearer {token['idToken']}"},
+    )
+    if isinstance(rows, dict):
+        rows = [rows]
+    peers: list = []
+    for row in rows:
+        doc = row.get("document") if isinstance(row, dict) else None
+        if not doc:
+            continue
+        f = doc.get("fields", {})
+        if not _tv_bool(f.get("enabled")):
+            continue
+        did = doc.get("name", "").split("/")[-1]
+        tid = (_tv_str(f.get("targetNodeId")) or did).strip()
+        alias = (_tv_str(f.get("alias")) or tid).strip()
+        role = (_tv_str(f.get("role")) or "").strip()
+        peers.append({"id": did, "tid": tid, "alias": alias, "role": role})
+    peers.sort(key=lambda p: (p["alias"] or p["id"]).lower())
+    return peers
+
+
+def _compose_team_index_doc(token: dict) -> dict:
+    """Puerto on-node de la CF buildTeamIndexDoc. Devuelve el mismo doc
+    {schema,target,blocks:[{order,id,kind,text}]} — texto byte-idéntico."""
+    peers = _team_read_peers(token)
+    if not peers:
+        return {"schema": 1, "target": "TEAM_INDEX.md", "blocks": []}
+    rows = [
+        f"| `{p['alias']}` | {_md_cell(p['role'])} | "
+        f"{_md_cell(_derive_peer_specialty(_read_node_tools_json(token, p['tid'])))} | "
+        f"`{p['tid']}` |"
+        for p in peers
+    ]
+    body = "\n".join(
+        [
+            "# Equipo de TNodes",
+            "",
+            "Otros nodos del dueño a los que puedes **delegar** tareas con "
+            '`tnode-delegate delegate --alias <alias> --text "..."`. Cada uno '
+            "resuelve con SUS canales, skills y contexto.",
+            "Generado automáticamente desde el widget Equipo de la app; cambia "
+            "al enlazar/desenlazar nodos. La columna *especialidad* se deriva de "
+            "las herramientas reales de cada nodo.",
+            "",
+            "| alias | rol | especialidad | nodeId |",
+            "|---|---|---|---|",
+            *rows,
+            "",
+            f"_{len(peers)} nodo(s) en tu equipo._",
+        ]
+    )
+    return {
+        "schema": 1,
+        "target": "TEAM_INDEX.md",
+        "blocks": [{"order": 0, "id": "team-index", "kind": "static", "text": body}],
+    }
+
+
+def _team_shadow_check(token: dict) -> None:
+    """MODO SOMBRA (F1 cutover): compone el TEAM_INDEX localmente y lo compara,
+    byte-a-byte, contra el teamIndexJson que la CF sigue produciendo. NO renderiza
+    nada. Si difiere, escribe un diff a .tnode-team-shadow.diff. Gate de paridad
+    antes de retirar la CF."""
+    try:
+        local = _compose_team_index_doc(token)
+        local_body = _render_tools_zone(local.get("blocks") or [])
         raw = _firestore_get_node_field(token, "teamIndexJson")
-        doc = json.loads(raw) if raw else None
+        cf = json.loads(raw) if raw else {"blocks": []}
+        cf_body = _render_tools_zone(cf.get("blocks") or [])
+        if local_body == cf_body:
+            _log(
+                f"team-shadow: PARITY ok "
+                f"({len(local.get('blocks') or [])} block(s), {len(local_body)} chars)"
+            )
+            return
+        import difflib
+        d = "\n".join(
+            difflib.unified_diff(
+                cf_body.splitlines(), local_body.splitlines(),
+                fromfile="cf", tofile="local", lineterm="",
+            )
+        )
+        (OPENCLAW_DIR / ".tnode-team-shadow.diff").write_text(
+            d[:6000], encoding="utf-8"
+        )
+        _log(
+            f"team-shadow: DIFF local={len(local_body)} cf={len(cf_body)} "
+            f"→ .tnode-team-shadow.diff"
+        )
     except Exception as e:  # noqa: BLE001
-        _log(f"team-index: json read/parse failed: {e}")
+        _log(f"team-shadow: error {e}")
+
+
+def _team_index_sync_from_json(token: dict) -> None:
+    """Render agency-agents/TEAM_INDEX.md desde el COMPOSITOR ON-NODE (F1).
+    Compone el roster localmente (peers/ + toolsJson de cada peer) en vez de leer
+    el teamIndexJson de la CF. Hash-gate local (sha256 del body renderizado, que
+    captura con/sin peers). Sin peers → body vacío → _render_team_index borra el
+    archivo. Resiliente: cualquier fallo deja el archivo intacto. El nombre de la
+    función se conserva por el call-site en _run_declarative_sync."""
+    try:
+        doc = _compose_team_index_doc(token)
+        body = _render_tools_zone(doc.get("blocks") or [])
+    except Exception as e:  # noqa: BLE001
+        _log(f"team-index: compose failed: {e}")
         return
-    if not isinstance(doc, dict):
-        return
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    if digest == _team_read_local_hash():
+        return  # sin cambios → no reescribir
     if _render_team_index(doc):
-        _team_write_local_hash(remote_hash)
+        _team_write_local_hash(digest)
         n = len(doc.get("blocks") or [])
-        _log(f"team-index: rendered (hash {remote_hash[:12]}, {n} block(s))")
+        _log(f"team-index: rendered LOCAL (hash {digest[:12]}, {n} block(s))")
 
 
 def _resolve_himalaya_path() -> str:
@@ -11642,6 +11814,11 @@ def run_decl_oneshot() -> int:
     try:
         cfg = load_config()
         token = mint_token(cfg)
+        if os.environ.get("TNODE_TEAM_SHADOW_ONLY"):
+            # F1 cutover: solo corre el gate de paridad del compositor on-node
+            # contra la CF. No renderiza ni toca ningún archivo.
+            _team_shadow_check(token)
+            return 0
         _run_declarative_sync(token)
         _log("decl-oneshot: declarative refresh complete")
     except Exception as e:  # noqa: BLE001
