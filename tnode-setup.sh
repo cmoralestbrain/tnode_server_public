@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.68.0"
+TNODE_SETUP_VERSION="1.69.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -5623,7 +5623,17 @@ from __future__ import annotations
 #          Paridad byte-a-byte verificada en shadow (TNODE_TEAM_SHADOW_ONLY)
 #          antes del flip. La CF buildTeamIndexDoc+trigger quedan como no-op
 #          hasta retirarse cuando toda la flota esté en >=1.43.0.
-__VERSION__ = "1.43.0"
+# 1.44.0 — Zonas gestionadas SOUL/IDENTITY/USER/TOOLS ON-NODE (Harness Eng. F3a):
+#          _md_sync_from_json y _sync_tools_md_from_json dejan de leer
+#          {soul,identity,user,tools}Json de la CF y componen LOCAL (_compose_*_doc,
+#          plantillas _SOUL_*/_IDENTITY_*/_T_* portadas byte-idénticas de
+#          soul_identity_sync.ts + tools_sync.ts; email/mcp/delegate/inventory con
+#          la misma lógica de gating). Hash-gate local (sha256 del body). Paridad
+#          byte-a-byte verificada en shadow (TNODE_MD_SHADOW_ONLY) para las 4
+#          zonas antes del flip. La CF build{Tools,Soul,Identity,User}Json queda
+#          no-op hasta retirarse (aún alimenta el toolsJson que TEAM_INDEX lee de
+#          cada peer para derivar especialidad — retirar SOLO tras resolver eso).
+__VERSION__ = "1.44.0"
 
 import hashlib
 import hmac
@@ -9323,40 +9333,27 @@ def _apply_tools_zone(zone_text: str) -> None:
 
 
 def _sync_tools_md_from_json(token: dict) -> None:
-    """Render the managed zone of TOOLS.md from the node's cached toolsJson.
-    Cheap hash check first; only rewrites on change. Resilient: any failure
-    leaves the current TOOLS.md untouched. (v1.1: CF bootstrap for nodes that
-    have no cache yet — today the golden ships Regla 0 inside the markers.)"""
+    """Render la zona gestionada de TOOLS.md desde el COMPOSITOR ON-NODE (F3a).
+    Compone local (`_compose_tools_doc`) en vez de leer toolsJson de la CF.
+    Hash-gate local (sha256 del body). Resiliente: cualquier fallo deja el
+    TOOLS.md intacto. Nombre conservado por el call-site en _run_declarative_sync."""
     try:
-        remote_hash = _firestore_get_node_field(token, "toolsHash")
+        doc = _compose_tools_doc(token)
+        body = _render_tools_zone(doc.get("blocks") or [])
     except Exception as e:  # noqa: BLE001
-        _log(f"tools-sync: hash read failed: {e}")
+        _log(f"tools-sync: compose failed: {e}")
         return
-    if not remote_hash:
-        # Bootstrap: nodo sin cache (golden recién nacido, sin MCPs/canales que
-        # disparen el trigger). Forzamos UNA composición vía la CF para que el
-        # agente nazca con todas las reglas estándar. Si falla, conservamos el
-        # golden (Regla 0) y reintentamos al próximo arranque.
-        resp = _bootstrap_tools_via_cf()
-        if isinstance(resp, dict) and resp.get("ok"):
-            _render_tools_from_resp(resp)
-        return
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
     md = OPENCLAW_DIR / "workspace" / "TOOLS.md"
-    if remote_hash == _read_local_tools_hash() and md.is_file():
+    if digest == _read_local_tools_hash() and md.is_file():
         return  # sin cambios → no reescribir
     try:
-        raw = _firestore_get_node_field(token, "toolsJson")
-        doc = json.loads(raw) if raw else None
-    except Exception as e:  # noqa: BLE001
-        _log(f"tools-sync: json read/parse failed: {e}")
-        return
-    if not isinstance(doc, dict):
-        return
-    blocks = doc.get("blocks") or []
-    try:
-        _apply_tools_zone(_render_tools_zone(blocks))
-        _write_local_tools_hash(remote_hash)
-        _log(f"tools-sync: rendered {len(blocks)} blocks (hash {remote_hash[:12]})")
+        _apply_tools_zone(body)
+        _write_local_tools_hash(digest)
+        _log(
+            f"tools-sync: rendered LOCAL {len(doc.get('blocks') or [])} blocks "
+            f"(hash {digest[:12]})"
+        )
     except Exception as e:  # noqa: BLE001
         _log(f"tools-sync: render failed: {e}")
 
@@ -9694,42 +9691,43 @@ def _md_render_from_resp(target: str, resp: dict) -> bool:
         return False
 
 
+def _compose_md_local(token: dict, target: str):
+    """Dispatch al compositor on-node por target (F3). Devuelve doc o None."""
+    if target == "soul":
+        return _compose_soul_doc()
+    if target == "identity":
+        return _compose_identity_doc(token)
+    if target == "user":
+        return _compose_user_doc(token)
+    if target == "tools":
+        return _compose_tools_doc(token)
+    return None
+
+
 def _md_sync_from_json(token: dict, target: str) -> None:
-    """Render the managed zone of <md> from the node's cached {target}Json.
-    Cheap hash check first; only rewrites on change. Resilient: any failure
-    leaves the file untouched. Bootstrap via CF when there is no cache yet."""
+    """Render la zona gestionada de <md> desde el COMPOSITOR ON-NODE (F3a).
+    Compone local (soul/identity/user) en vez de leer {target}Json de la CF.
+    Hash-gate local (sha256 del body). Resiliente: cualquier fallo deja el
+    archivo intacto."""
     desc = _MD_TARGETS[target]
     try:
-        remote_hash = _firestore_get_node_field(token, desc["hash_field"])
+        doc = _compose_md_local(token, target)
+        body = _render_tools_zone((doc or {}).get("blocks") or [])
     except Exception as e:  # noqa: BLE001
-        _log(f"md-sync[{target}]: hash read failed: {e}")
+        _log(f"md-sync[{target}]: compose failed: {e}")
         return
-    if not remote_hash:
-        # Bootstrap: nodo sin cache. Forzamos UNA composición vía la CF (una
-        # vez por proceso) para sembrar el hash; el render real ocurre aquí o
-        # en un poll posterior cuando el archivo ya exista.
-        if not _md_bootstrap_attempted.get(target):
-            _md_bootstrap_attempted[target] = True
-            resp = _md_compose_via_cf(target)
-            if isinstance(resp, dict) and resp.get("ok"):
-                _md_render_from_resp(target, resp)
-        return
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
     md = OPENCLAW_DIR / "workspace" / desc["md_name"]
-    if remote_hash == _md_read_local_hash(target) and md.is_file():
+    if digest == _md_read_local_hash(target) and md.is_file():
         return  # sin cambios → no reescribir
     try:
-        raw = _firestore_get_node_field(token, desc["json_field"])
-        doc = json.loads(raw) if raw else None
-    except Exception as e:  # noqa: BLE001
-        _log(f"md-sync[{target}]: json read/parse failed: {e}")
-        return
-    if not isinstance(doc, dict):
-        return
-    blocks = doc.get("blocks") or []
-    try:
-        if _md_apply_zone(target, _render_tools_zone(blocks)):
-            _md_write_local_hash(target, remote_hash)
-            _log(f"md-sync[{target}]: rendered {len(blocks)} blocks (hash {remote_hash[:12]})")
+        blocks = (doc or {}).get("blocks") or []
+        if _md_apply_zone(target, body):
+            _md_write_local_hash(target, digest)
+            _log(
+                f"md-sync[{target}]: rendered LOCAL {len(blocks)} blocks "
+                f"(hash {digest[:12]})"
+            )
     except Exception as e:  # noqa: BLE001
         _log(f"md-sync[{target}]: render failed: {e}")
 
@@ -10034,6 +10032,568 @@ def _team_shadow_check(token: dict) -> None:
         )
     except Exception as e:  # noqa: BLE001
         _log(f"team-shadow: error {e}")
+
+
+# ── SOUL.md / IDENTITY.md compositor ON-NODE (F3: reemplaza la CF) ──────────
+# Plantillas P (platform-plantilla) portadas byte-idénticas de
+# tnode_client/functions/src/soul_identity_sync.ts (STATIC_*). Zonas 100%
+# estáticas salvo el bloque "equipo" de IDENTITY (condicional a peers, reusa
+# _team_read_peers). El renderer/marker no cambia; solo el origen del doc.
+_SOUL_SUBAGENTES = """## Sub-agentes disponibles
+
+Lee `~/.openclaw/agency-agents/AGENTS_INDEX.md` al iniciar tu sesión para conocer el roster completo y sus especialidades. Úsalo para decidir cuándo invocar `sessions_spawn(runtime="subagent", agentId=<id>, task=...)`."""
+
+_SOUL_SEND_FILE = """## Envío de archivos al chat
+
+Cuando produzcas un archivo (PDF, imagen, código, etc.) que el usuario quiera abrir desde su app, NO le pases la ruta como texto. Incluye un marker exacto en tu respuesta así:
+
+    [adjunto: /ruta/absoluta/al/archivo.pdf]
+
+El sistema detecta el marker, sube el archivo a un canal seguro y lo reemplaza por un chip descargable en el chat (el usuario lo toca y se abre con su visor nativo).
+
+Reglas:
+- El archivo debe vivir bajo `~/.openclaw/workspace/`. Cualquier otra ruta es rechazada por seguridad.
+- Tamaño máximo: 50 MB.
+- Tipos comunes aceptados: PDF, imágenes, texto, código, ZIP/TAR/GZ, JSON/XML.
+- Puedes mezclar varios markers con texto normal: "Aquí tienes el reporte [adjunto: workspace/foo.pdf] y los datos [adjunto: workspace/bar.csv]".
+- NO uses `MEDIA:`, `file://`, ni rutas crudas — siempre el formato `[adjunto: <ruta>]`."""
+
+_SOUL_DOWNLOAD = """## Entregables descargables — workspace/download/
+
+Cuando produzcas un archivo que el usuario quiera consultar más tarde (no solo este turno del chat), guárdalo bajo:
+
+    ~/.openclaw/workspace/download/<nombre-descriptivo>.<ext>
+
+El usuario lo verá en la app → Almacenamiento → Local → tab "Descarga", ordenado por fecha de modificación. Desde ahí puede descargarlo a su dispositivo o borrarlo.
+
+Cuando lo anuncies en el chat, sigue usando el marker `[adjunto: workspace/download/<nombre>]` (ver sección "Envío de archivos al chat" para reglas del marker) — el chip clicable aparece en la conversación Y el archivo persiste en la pantalla Almacenamiento.
+
+Reglas adicionales para entregables:
+- Usa nombres descriptivos en kebab-case con fecha cuando aplique: `reporte-ventas-q1-2026.pdf`, no `out.pdf`.
+- Si reemplazas un archivo (e.g. nueva versión del mismo reporte), mantén el mismo nombre para no acumular duplicados.
+- Para archivos efímeros del turno actual (cálculos intermedios, screenshots de debug, etc.), usa `workspace/` raíz, no `workspace/download/`. La pantalla Almacenamiento solo lista `upload/` (lo que el user te mandó) y `download/` (tus entregables formales)."""
+
+_IDENTITY_SUBAGENTES = """## Sub-agentes a tu disposición
+
+Eres el coordinador principal. Cuando una tarea encaja con la especialidad de un sub-agente del roster (ver `~/.openclaw/agency-agents/AGENTS_INDEX.md`), delégala con `sessions_spawn(runtime="subagent", agentId=<id>, task=...)` en lugar de hacerla tú mismo."""
+
+_IDENTITY_EQUIPO = """## Tu equipo de TNodes
+
+Además de tus sub-agentes locales, el dueño enlazó otros de sus TNodes a un EQUIPO: nodos a los que puedes delegar tareas, cada uno con SUS canales, skills y contexto. Lee `~/.openclaw/agency-agents/TEAM_INDEX.md` para conocer el roster: alias, rol y especialidad de cada nodo.
+
+Cuando una tarea encaje con la especialidad de un nodo del equipo (un canal/skill/acceso que ESE nodo tiene y tú no), delégasela en lugar de intentarla aquí, con:
+
+    exec: python3 ~/.openclaw/workspace/skills/tnode-delegate/bin/tnode-delegate.py delegate --alias <alias> --text "<instrucción autocontenida>"
+
+El comando imprime la respuesta del agente de ese nodo; úsala para continuar tu trabajo. La instrucción debe ser CLARA y AUTOCONTENIDA (el otro nodo no ve tu conversación). El detalle del skill está en la Regla de delegación de tu TOOLS.md."""
+
+
+def _compose_soul_doc() -> dict:
+    """Puerto on-node de la CF buildSoulDoc (100% estático)."""
+    return {
+        "schema": 1,
+        "target": "SOUL.md",
+        "blocks": [
+            {"order": 0, "id": "subagentes", "kind": "static", "text": _SOUL_SUBAGENTES},
+            {"order": 10, "id": "envio-archivos", "kind": "static", "text": _SOUL_SEND_FILE},
+            {"order": 20, "id": "entregables", "kind": "static", "text": _SOUL_DOWNLOAD},
+        ],
+    }
+
+
+def _compose_identity_doc(token: dict) -> dict:
+    """Puerto on-node de la CF buildIdentityDoc: sub-agentes (estático) + equipo
+    (solo si el nodo tiene peers enabled, igual que la CF)."""
+    blocks = [
+        {"order": 0, "id": "subagentes", "kind": "static", "text": _IDENTITY_SUBAGENTES},
+    ]
+    try:
+        has_peers = len(_team_read_peers(token)) > 0
+    except Exception:  # noqa: BLE001
+        has_peers = False
+    if has_peers:
+        blocks.append(
+            {"order": 10, "id": "equipo", "kind": "static", "text": _IDENTITY_EQUIPO}
+        )
+    return {"schema": 1, "target": "IDENTITY.md", "blocks": blocks}
+
+
+def _read_user_profile(token: dict):
+    """GET users/{uid}.profile (mapa capturado en la app 'Tu perfil')."""
+    url = f"{_firestore_base()}/users/{token['uid']}?mask.fieldPaths=profile"
+    try:
+        doc = _http_request(
+            "GET", url,
+            headers={"Authorization": f"Bearer {token['idToken']}"},
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    fields = (doc or {}).get("fields") or {}
+    return _fs_unwrap(fields["profile"]) if "profile" in fields else None
+
+
+def _compose_user_doc(token: dict) -> dict:
+    """Puerto on-node de la CF buildUserDoc, BLOQUE 1 (owner-profile). El bloque 2
+    'Sobre el negocio' (config/businessProfile) es F3.5 → aquí se omite; en nodos
+    SIN businessProfile el resultado es byte-idéntico a la CF."""
+    profile = _read_user_profile(token)
+    blocks: list = []
+    if isinstance(profile, dict):
+        def s(k: str) -> str:
+            v = profile.get(k)
+            return v.strip() if isinstance(v, str) else ""
+        lines: list = []
+        full_name = " ".join(x for x in [s("firstName"), s("lastName")] if x)
+        nick = s("nickname")
+        if full_name:
+            lines.append(f"- **Nombre:** {full_name}")
+        if nick:
+            lines.append(f"- **Cómo le gusta que le digas:** {nick}")
+        if s("birthDate"):
+            lines.append(f"- **Fecha de nacimiento:** {s('birthDate')}")
+        loc = ", ".join(x for x in [s("state"), s("country")] if x)
+        tz = s("timezone")
+        if loc or tz:
+            tzpart = f"{' ' if loc else ''}(zona horaria {tz})" if tz else ""
+            lines.append(f"- **Ubicación:** {loc}{tzpart}".strip())
+        if s("phone"):
+            lines.append(f"- **Teléfono:** {s('phone')}")
+        if s("occupation"):
+            lines.append(f"- **A qué se dedica:** {s('occupation')}")
+        if s("about"):
+            lines.append(f"- **Sobre el dueño:** {s('about')}")
+        if lines:
+            tone = s("tone")
+            tone_hint = (
+                "Trátalo de manera formal y profesional." if tone == "formal"
+                else "Trátalo de manera cercana e informal, con calidez."
+                if tone == "cercano"
+                else "Mantén un tono equilibrado, ni muy formal ni muy casual."
+            )
+            addr = f"Dirígete a tu dueño como “{nick}”. " if nick else ""
+            text = (
+                "## Perfil de tu dueño\n\n"
+                "La persona dueña de este nodo configuró estos datos en su app. "
+                "Úsalos para personalizar tu trato y tus respuestas.\n\n"
+                + "\n".join(lines) + "\n\n"
+                + f"{addr}{tone_hint}"
+            )
+            blocks.append(
+                {"order": 0, "id": "owner-profile", "kind": "static", "text": text}
+            )
+    return {"schema": 1, "target": "USER.md", "blocks": blocks}
+
+
+# ── TOOLS.md compositor ON-NODE (F3: reemplaza la CF buildToolsJson) ─────────
+# Plantillas P portadas byte-idénticas de tools_sync.ts. Estáticos + MCP
+# (mcpServers/ + mcpCatalog.rule) + email (variante desde channels/email) +
+# inventory (config/inventoryFlow) + delegate (peers/). Orden idéntico a la CF.
+_T_REGLA_0 = """## Regla 0 - Herramienta especifica antes que el navegador (CRITICO)
+
+Antes de abrir el navegador (browser) o usar web_search, revisa si tienes una
+herramienta ESPECIFICA para la tarea y usala primero. El navegador y web_search
+son SOLO el ultimo recurso (fallback), cuando NINGUNA herramienta especifica aplica."""
+
+_T_ANTILOOP = """## Regla anti-loop
+Busca UNA sola vez y responde. NUNCA hagas mas de 1 busqueda por pregunta."""
+
+_T_AVISO = """## Regla de aviso previo (IMPORTANTE)
+ANTES de ejecutar cualquier herramienta (exec, web_search), SIEMPRE escribe un mensaje breve al usuario avisando que vas a buscar. Ejemplos:
+- "Dame un momento, voy a buscar eso..."
+- "Dejame consultar los precios..."
+- "Buscando informacion..."
+Esto es OBLIGATORIO. Primero el aviso, despues el tool."""
+
+_T_AGENDA = """## Regla: agendar citas (skill agenda)
+
+Cuando quien te escribe pida CITA / HORA / DISPONIBILIDAD ("¿tienen
+espacio mañana?") o quiera CANCELAR una cita, usa el skill agenda.
+NUNCA inventes horarios ni confirmes citas de memoria — el JSON del
+skill es tu única fuente de verdad.
+Manual completo: ~/.openclaw/workspace/skills/agenda/SKILL.md
+
+1. Disponibilidad:
+   exec: python3 ~/.openclaw/workspace/skills/agenda/bin/agenda.py slots --date YYYY-MM-DD
+   (hoy = `date +%F`; calcula "mañana" / "el viernes" desde ahí)
+   Ofrece 2-3 horarios del JSON en lenguaje natural.
+
+2. Reservar:
+   exec: python3 ~/.openclaw/workspace/skills/agenda/bin/agenda.py book --date YYYY-MM-DD --start HH:MM --client "Nombre" --channel whatsapp [--contact "+52..."] [--resource <id>]
+   - --channel según por dónde te hablan: whatsapp / telegram / guest.
+   - Pidieron a alguien en específico → --resource <id> (los ids salen
+     de `agenda.py resources`).
+   - Sin preferencia → OMITE --resource: el sistema asigna a la persona
+     con menos citas ese día. Confirma SIEMPRE con el nombre que regresa
+     la respuesta ("te atiende Beto a las 16:00").
+   - Datos del cliente: nombre siempre; contacto SOLO si el canal no te
+     lo da (por WhatsApp ya tienes su número → pásalo en --contact).
+
+3. Tras reservar o cancelar: SI este nodo tiene correo configurado
+   (himalaya o skill email-send), avisa al recurso al campo
+   resourceEmail de la respuesta.
+   Subject: Nueva cita: <cliente> — <fecha> <HH:MM>
+   Cuerpo: cliente, fecha, hora-fin, canal y contacto si lo tienes.
+   Si este nodo NO tiene correo, omite el aviso sin disculparte.
+
+4. Cancelar: exec: python3 ~/.openclaw/workspace/skills/agenda/bin/agenda.py cancel --id <appointmentId>
+
+Errores: slot_unavailable → la respuesta trae "alternatives", ofrécelas
+tal cual; slot_taken → vuelve a consultar slots; resources vacío → el
+dueño aún no configura su calendario en la app.
+No compartas datos de otros clientes (citas existentes = confidencial,
+solo di "ocupado"). Agendar NO es operación sensible ni de
+infraestructura: procede sin pedir permiso adicional."""
+
+_T_DRIVE = """## Regla: leer archivos del Drive del dueño (skill drive)
+
+Cuando el dueño mencione SU DRIVE, SU CARPETA COMPARTIDA o un DOCUMENTO
+por nombre que no está en tu workspace ("lee el contrato de mi carpeta",
+"¿qué hay en mi Drive?", "busca el manual de operación"), usa el skill
+drive. Es de SOLO LECTURA (su carpeta compartida, nada más). NUNCA digas
+que un archivo no existe sin haber hecho search primero.
+Manual completo: ~/.openclaw/workspace/skills/drive/SKILL.md
+
+1. Encuentra el archivo:
+   exec: python3 ~/.openclaw/workspace/skills/drive/bin/drive.py search "palabras clave"
+   (busca por nombre Y contenido; o `list` si piden "qué hay en la carpeta")
+
+2. Descárgalo:
+   exec: python3 ~/.openclaw/workspace/skills/drive/bin/drive.py get <fileId>
+   La respuesta trae savedTo = ruta local en workspace/upload/drive/.
+
+3. LEE el archivo local (savedTo) con tus herramientas normales y
+   responde resumiendo o citando lo relevante — no pegues el archivo
+   completo. Google Docs/Sheets/Slides llegan convertidos (md/csv/pdf).
+
+Errores: not_connected → "comparte tu carpeta en la app: tu nodo →
+Archivos → Carpeta compartida"; access_revoked → pídele re-compartir;
+not_found / not_in_folder → no está en SU carpeta compartida (solo ves
+esa carpeta), sugiérele moverlo ahí; too_large → pasa de 50 MB.
+
+Si el archivo cambió en Drive, descárgalo de nuevo (tu copia es local).
+Con invitados usa criterio: la carpeta es del dueño, no compartas
+contenido sensible salvo que el dueño lo haya pedido. Leer su carpeta NO
+es operación sensible: procede sin pedir permiso adicional."""
+
+_T_POLL = """## Regla: encuestas (skill poll)
+
+Cuando el DUEÑO te pida CREAR/HACER una encuesta ("haz una encuesta: ¿pizza o
+sushi?", "crea una encuesta con opciones A, B y C") o MANDAR/DIFUNDIR de nuevo
+la última ("manda la encuesta a todos"), usa el skill poll. La encuesta le
+aparece en el chat a TODOS los miembros del nodo (y al dueño) y cada uno puede
+votar; el conteo se actualiza en vivo.
+Manual completo: ~/.openclaw/workspace/skills/poll/SKILL.md
+
+Crear y repartir una encuesta nueva desde el prompt — la pregunta y de 2 a 12
+opciones (agrega --multi si permites varias respuestas):
+   exec: python3 ~/.openclaw/workspace/skills/poll/bin/poll.py create --question "¿Snack para el viernes?" --option "Pizza" --option "Sushi" --option "Tacos"
+
+Difundir de nuevo la última encuesta del dueño a todos los invitados:
+   exec: python3 ~/.openclaw/workspace/skills/poll/bin/poll.py broadcast
+
+La respuesta trae delivered = a cuántos invitados llegó y question = la
+pregunta. Confírmalo en lenguaje natural ("Listo, creé la encuesta '¿...?' y la
+mandé a N invitados").
+
+Errores: missing_question o bad_options (necesita de 2 a 12 opciones) → faltó
+info, pídesela al dueño; no_open_poll (solo en broadcast) → aún no hay una
+encuesta, créala; not_paired → el nodo no está vinculado. Solo el dueño puede
+crear o difundir (no los invitados). Crear/difundir una encuesta NO es
+operación sensible: procede sin pedir permiso adicional."""
+
+_T_APPROVAL = """## Regla de plataforma: autorización del dueño (tool request_approval)
+
+Cuando un flujo (un cron o una instrucción) te pida AUTORIZACIÓN DEL DUEÑO
+antes de ejecutar una acción, usa la tool request_approval con el resumen de
+lo que quieres hacer (título, líneas y proveedor/destinatario). Eso publica
+una tarjeta de aprobación en el chat del dueño. El contrato tiene DOS
+MOMENTOS:
+
+MOMENTO 1 — solicitar: llama request_approval y GUARDA el id devuelto en el
+estado del flujo en tu workspace ANTES de terminar — si el flujo no definió
+otro archivo, usa inventory/pending.json (créalo si no existe) con una orden
+{approvalId, guestUid, proveedor, lines, status: "esperando_autorizacion"}.
+Esto aplica IGUAL si la solicitud nació de una conversación con el dueño y
+no de un proceso automático. Luego TERMINA tu tarea AHÍ: NO ejecutes la
+acción todavía. Si la respuesta trae alreadyPending=true, esa solicitud ya
+estaba viva: no la repitas ni insistas.
+
+MOMENTO 2 — la decisión llega DESPUÉS, en un turno posterior (a menudo en
+una conversación NUEVA que no recuerda la solicitud), como mensaje del dueño
+("APRUEBO la orden <id> · código <código>" o "RECHAZO la orden <id>:
+<comentario>"). Al recibirla haz esto, en orden:
+1. BUSCA el id en el estado de tus flujos en el workspace (los flujos guardan
+   ahí sus solicitudes, p. ej. inventory/pending.json) — NO confíes en tu
+   memoria de la conversación. Ahí está registrado qué se autoriza y para
+   quién (guestUid, líneas, proveedor).
+2. ¿El id NO está en tu estado local? NO lo descartes: consulta la tool
+   approval_status con ese id — es la fuente de verdad del servidor y trae
+   la orden completa (status, código, supplierTag, guestUid, title, lines).
+   Si status=approved y el código coincide con el del mensaje del dueño,
+   continúa con esos datos como si vinieran de tu estado. Si no existe o el
+   código no coincide, dilo y NO ejecutes nada.
+3. APROBÓ → ejecuta la acción registrada incluyendo el código TAL CUAL. Si la
+   orden es un pedido a un proveedor (guest), mándala con guest_send:
+   guestUids=[el guestUid del estado o de approval_status], confirm=true,
+   approvalId=<id>, y el mensaje con productos y cantidades + "Código de
+   autorización: <código>. Coteja el código antes de surtir; una orden sin
+   código válido no fue autorizada."
+4. RECHAZÓ → NO ejecutes nada; guarda el comentario del dueño en el estado.
+5. Actualiza la orden en tu estado (aprobada/enviada o rechazada) y confirma
+   brevemente al dueño lo que hiciste. La decisión del dueño ES la
+   confirmación: no pidas permiso adicional para ejecutarla.
+
+El código de autorización SOLO existe cuando el dueño ya aprobó — nunca lo
+inventes, calcules ni prometas antes. Solicitar autorización NO es
+operación sensible: procede sin pedir permiso adicional."""
+
+_T_DELEGATE_HEADER = """## Regla: delegar tareas a otro de tus nodos (skill tnode-delegate)
+
+Cuando una tarea necesite un canal, skill, contexto o ACCESO que ESTE nodo no
+tiene pero OTRO de tus nodos SÍ, delegasela a ese nodo y usa su respuesta para
+continuar tu trabajo. No intentes hacerla aqui ni abras el navegador.
+
+Para delegar y leer la respuesta del otro nodo:
+   exec: python3 ~/.openclaw/workspace/skills/tnode-delegate/bin/tnode-delegate.py delegate --alias <alias> --text "<instruccion>"
+El comando imprime en stdout la respuesta del agente de ESE nodo; usala para
+seguir. La instruccion debe ser CLARA y AUTOCONTENIDA: el otro nodo NO ve tu
+conversacion, solo el texto que le mandas — dale ahi todo el contexto.
+Si no recuerdas los alias, corre el subcomando `list`.
+
+La PRIMERA delegacion tras un rato puede tardar ~1 min (el nodo se "calienta");
+no es falla. Si responde "delegation_failed", ese nodo no esta disponible
+(apagado o sin saldo): dilo y, si puedes, resuelve por otro medio. NUNCA
+reenvies secretos del usuario (contrasenas/tokens) por este canal.
+
+Nodos que puedes mandar llamar (alias — rol):"""
+
+
+def _t_email_himalaya(account: str, himalaya_path: str) -> str:
+    acc = account or "tu cuenta vinculada"
+    path = himalaya_path or "himalaya"
+    return f"""## Regla 4 — email (cuenta principal: {acc})
+
+Tu cuenta de email PRINCIPAL es **{acc}** (vinculada desde la app TNode,
+canal Email). La operas con el CLI himalaya — usa SIEMPRE el path completo
+{path}. Las credenciales viven en ~/.config/himalaya/ con permisos 600;
+nunca las menciones ni las pidas.
+
+1. ¿Te piden LEER/REVISAR la bandeja o un correo?
+   exec: {path} envelope list -f INBOX -p 1 -s 10
+   exec: {path} message read <ID>
+
+2. ¿Te piden MANDAR un correo? AVISA primero ("Voy a mandar el correo,
+   dame un momento...") y usa exec con el mensaje raw:
+
+   {path} message send <<'MAIL'
+   From: <Tu Nombre> <{acc}>
+   To: destinatario@dominio.com
+   Subject: Asunto
+
+   Cuerpo del mensaje.
+   MAIL
+
+3. ¿Te piden RESPONDER un correo? Localiza el ID y remitente con
+   envelope list / message read, y manda con send usando
+   Subject: Re: <asunto original> y To: <remitente>.
+
+Mandar/leer correos cuando el usuario lo pide NO es una operación
+"sensible" ni de "infraestructura". Es rutina de tu trabajo. Procede
+sin pedir permiso adicional.
+
+### Si un envío falla
+Reporta el error TAL CUAL a quien te lo pidió y detente ahí. {acc}
+(himalaya) es tu ÚNICA cuenta de correo — también para el flujo de
+ventas/leads. NUNCA uses smtplib ni ninguna otra cuenta o skill de
+correo como alternativa o "fallback", aunque himalaya falle."""
+
+
+def _t_email_resend(account: str) -> str:
+    frm = f" (remitente: {account})" if account else ""
+    return f"""## Regla 4 — email (envío vía skill email-send)
+
+Para MANDAR correos en este nodo usa el skill email-send{frm} — este nodo
+está en la nube y el SMTP saliente está bloqueado, así que himalaya NO
+funciona aquí. AVISA primero ("Voy a mandar el correo, dame un momento...")
+y usa:
+
+   exec: python3 ~/.openclaw/workspace/skills/email-send/bin/send.py --to destinatario@dominio.com --subject "Asunto" --body "Cuerpo en texto plano"
+
+Este es el ÚNICO path de envío que funciona aquí. NUNCA uses smtplib,
+himalaya message send, mail, sendmail ni curl smtp:// — todos timeout porque
+el proveedor cloud bloquea el SMTP saliente (465/587). Detalles (HTML, CC,
+--from) en ~/.openclaw/workspace/skills/email-send/SKILL.md.
+
+### Si un envío falla
+Reporta el error TAL CUAL a quien te lo pidió y detente ahí. NUNCA uses otra
+cuenta o método de correo como "fallback"."""
+
+
+def _t_inventory_flow(every_minutes: int) -> str:
+    return f"""## Regla: flujo de inventario y resurtido (dueño)
+
+El resurtido corre SOLO: un proceso automático revisa el INVENTARIO cada
+{every_minutes} min y, cuando algo baja del límite, pide autorización al dueño
+con una tarjeta en su chat. Tu papel en el CHAT es complementarlo:
+
+1. Si el dueño pregunta por inventario o resurtido, SIEMPRE re-descarga el
+   archivo INVENTARIO de Drive (skill drive) antes de responder — NUNCA uses
+   copias o datos previos de la conversación, pueden estar viejos.
+2. El estado de las solicitudes vive en inventory/pending.json — consúltalo
+   para responder qué está pendiente, aprobado o enviado.
+3. Cuando llegue la decisión del dueño ("APRUEBO la orden <id>…" / "RECHAZO
+   la orden <id>…"), ejecuta el MOMENTO 2 de la regla de autorización DE
+   INMEDIATO y sin pedir confirmación adicional — la decisión del dueño ES la
+   confirmación.
+4. NO crees crons de inventario por tu cuenta ni dupliques solicitudes que ya
+   están esperando autorización: el proceso automático ya existe."""
+
+
+def _get_node_subdoc(token: dict, rel: str) -> dict:
+    """GET users/{uid}/nodes/{nodeId}/{rel} → dict de campos unwrapped, {} si 404."""
+    url = f"{_firestore_base()}/users/{token['uid']}/nodes/{token['nodeId']}/{rel}"
+    try:
+        doc = _http_request(
+            "GET", url,
+            headers={"Authorization": f"Bearer {token['idToken']}"},
+        )
+    except Exception:  # noqa: BLE001
+        return {}
+    return {k: _fs_unwrap(v) for k, v in ((doc or {}).get("fields") or {}).items()}
+
+
+def _get_mcp_rule(token: dict, catalog_id: str):
+    """GET mcpCatalog/{catalogId}.rule (colección top-level)."""
+    url = f"{_firestore_base()}/mcpCatalog/{catalog_id}?mask.fieldPaths=rule"
+    try:
+        doc = _http_request(
+            "GET", url,
+            headers={"Authorization": f"Bearer {token['idToken']}"},
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    fields = (doc or {}).get("fields") or {}
+    return _fs_unwrap(fields["rule"]) if "rule" in fields else None
+
+
+def _list_node_subcollection(token: dict, coll: str) -> list:
+    """runQuery de una subcolección del node doc → [{id, data}]."""
+    parent = f"users/{token['uid']}/nodes/{token['nodeId']}"
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{PROJECT_ID}"
+        f"/databases/(default)/documents/{parent}:runQuery"
+    )
+    rows = _http_request(
+        "POST", url,
+        payload={"structuredQuery": {"from": [{"collectionId": coll}]}},
+        headers={"Authorization": f"Bearer {token['idToken']}"},
+    )
+    if isinstance(rows, dict):
+        rows = [rows]
+    out: list = []
+    for row in rows:
+        doc = row.get("document") if isinstance(row, dict) else None
+        if not doc:
+            continue
+        did = doc.get("name", "").split("/")[-1]
+        data = {k: _fs_unwrap(v) for k, v in (doc.get("fields") or {}).items()}
+        out.append({"id": did, "data": data})
+    return out
+
+
+def _compose_tools_doc(token: dict) -> dict:
+    """Puerto on-node de la CF buildToolsJson. Mismo orden de bloques y misma
+    lógica de gating (MCP/email/inventory/delegate)."""
+    blocks: list = [
+        {"order": 0, "id": "regla-0", "kind": "static", "text": _T_REGLA_0},
+    ]
+    # MCPs activos → 1 bloque por server (texto = mcpCatalog.rule), orden por id.
+    active = [
+        m for m in _list_node_subcollection(token, "mcpServers")
+        if m["data"].get("enabled") is True
+    ]
+    active.sort(key=lambda m: m["id"])
+    i = 0
+    for m in active:
+        catalog_id = m["data"].get("catalogId") or m["id"]
+        rule = _get_mcp_rule(token, catalog_id)
+        if isinstance(rule, str) and rule.strip():
+            blocks.append({
+                "order": 20 + i, "id": f"mcp:{catalog_id}", "kind": "mcp",
+                "mcpId": catalog_id, "text": rule.strip(),
+            })
+            i += 1
+    blocks.append({"order": 200, "id": "antiloop", "kind": "static", "text": _T_ANTILOOP})
+    blocks.append({"order": 210, "id": "aviso", "kind": "static", "text": _T_AVISO})
+    email = _get_node_subdoc(token, "channels/email")
+    if email.get("linked") is True:
+        variant = email.get("variant") or "himalaya"
+        account = email.get("account") or ""
+        text = (
+            _t_email_resend(account) if variant == "resend"
+            else _t_email_himalaya(account, email.get("himalayaPath") or "himalaya")
+        )
+        blocks.append({
+            "order": 220, "id": "feature:email", "kind": "feature",
+            "requires": "channel:email", "text": text,
+        })
+    blocks.append({"order": 230, "id": "feature:agenda", "kind": "feature", "text": _T_AGENDA})
+    blocks.append({"order": 240, "id": "feature:drive", "kind": "feature", "text": _T_DRIVE})
+    blocks.append({"order": 250, "id": "feature:poll", "kind": "feature", "text": _T_POLL})
+    blocks.append({"order": 255, "id": "feature:approval", "kind": "feature", "text": _T_APPROVAL})
+    inv = _get_node_subdoc(token, "config/inventoryFlow")
+    if inv.get("enabled") is True:
+        try:
+            every = min(1440, max(5, round(float(inv.get("everyMinutes")))))
+        except Exception:  # noqa: BLE001
+            every = 15
+        blocks.append({
+            "order": 256, "id": "feature:inventory", "kind": "feature",
+            "text": _t_inventory_flow(every),
+        })
+    # delegate: peers enabled, ordenados por DOC ID (como buildToolsJson).
+    peers = sorted(_team_read_peers(token), key=lambda p: p["id"])
+    if peers:
+        lines = []
+        for p in peers:
+            alias = p["alias"] or p["id"]
+            role = p["role"]
+            lines.append(f"- {alias} — {role}" if role else f"- {alias}")
+        blocks.append({
+            "order": 260, "id": "feature:delegate", "kind": "feature",
+            "text": _T_DELEGATE_HEADER + "\n" + "\n".join(lines),
+        })
+    return {"schema": 1, "target": "TOOLS.md", "blocks": blocks}
+
+
+def _md_shadow_check(token: dict, target: str) -> None:
+    """MODO SOMBRA (F3 cutover): compone SOUL/IDENTITY/USER localmente y compara,
+    byte-a-byte, contra el <target>Json de la CF. NO renderiza. Diff a archivo."""
+    try:
+        doc = _compose_md_local(token, target)
+        if doc is None:
+            _log(f"md-shadow[{target}]: target no soportado aún")
+            return
+        local_body = _render_tools_zone(doc.get("blocks") or [])
+        raw = _firestore_get_node_field(token, f"{target}Json")
+        cf = json.loads(raw) if raw else {"blocks": []}
+        cf_body = _render_tools_zone(cf.get("blocks") or [])
+        if local_body == cf_body:
+            _log(f"md-shadow[{target}]: PARITY ok ({len(local_body)} chars)")
+            return
+        import difflib
+        d = "\n".join(
+            difflib.unified_diff(
+                cf_body.splitlines(), local_body.splitlines(),
+                fromfile="cf", tofile="local", lineterm="",
+            )
+        )
+        (OPENCLAW_DIR / f".tnode-md-shadow-{target}.diff").write_text(
+            d[:8000], encoding="utf-8"
+        )
+        _log(f"md-shadow[{target}]: DIFF local={len(local_body)} cf={len(cf_body)}")
+    except Exception as e:  # noqa: BLE001
+        _log(f"md-shadow[{target}]: error {e}")
 
 
 def _team_index_sync_from_json(token: dict) -> None:
@@ -11771,6 +12331,12 @@ def run_decl_oneshot() -> int:
             # F1 cutover: solo corre el gate de paridad del compositor on-node
             # contra la CF. No renderiza ni toca ningún archivo.
             _team_shadow_check(token)
+            return 0
+        _md_sh = os.environ.get("TNODE_MD_SHADOW_ONLY")
+        if _md_sh:
+            # F3 cutover: gate de paridad de SOUL/IDENTITY (lista de targets).
+            for _t in _md_sh.split(","):
+                _md_shadow_check(token, _t.strip())
             return 0
         _run_declarative_sync(token)
         _log("decl-oneshot: declarative refresh complete")
