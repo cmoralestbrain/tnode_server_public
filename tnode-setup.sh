@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.66.0"
+TNODE_SETUP_VERSION="1.67.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -12131,8 +12131,26 @@ Env/overrides:
   TNODE_CHAT_SYNC_OUTBOX_HOT_S / _OUTBOX_IDLE_S  Outbox poll cadence
   TNODE_CHAT_SYNC_GATEWAY_WS  Gateway WS url (default ws://127.0.0.1:18789)
   TNODE_CHAT_SYNC_DECL_THROTTLE_S  Min seconds between declarative-refresh spawns (default 5)
+  TNODE_CHAT_SYNC_PRESENCE_FILE    App-presence touch file (default ~/.openclaw/app-presence)
+  TNODE_CHAT_SYNC_PRESENCE_FRESH_S Presence freshness window (default 90)
+  TNODE_CHAT_SYNC_UPLOAD_POLL_IDLE_S / _CRON_CMD_IDLE_S / _TASK_CMD_IDLE_S
+                            Idle backstop cadences for uploads/commands (default 30)
+  TNODE_CHAT_SYNC_CRON_MIRROR_IDLE_S / _TASKS_MIRROR_IDLE_S  Idle mirror scan (default 60)
+  TNODE_CHAT_SYNC_MIRROR_RECONCILE_S  Mirror full-reconcile backstop (default 600)
 """
 from __future__ import annotations
+# 1.28.0 — Adaptive Firestore cadence (read-cost fix, auditoría 2026-07-04:
+#          ~146k queries/día/nodo con la flota EN REPOSO). Los relojes rápidos
+#          (uploads 2s, cron/task commands 3s, mirrors 10s, transport GET 10s)
+#          solo corren así mientras el nodo está HOT: actividad reciente de
+#          trajectory/outbox, o el app sosteniendo un WS a través del sidecar
+#          de telemetría (archivo app-presence, tnode-telemetry 1.18.0+).
+#          En idle: backstops de 30s (uploads/commands), 60s (mirror scans) y
+#          90s (transport TTL). Los mirrors de crons/tasks además quedan
+#          change-gated por hash del snapshot local + reconcile de 600s — un
+#          nodo en reposo ya no re-lista ni re-escribe cada cron doc cada 10s.
+#          El outbox conserva su idle de 10s: es el camino GARANTIZADO de
+#          entrada para guests (Firestore-first, sin WS) y no debe degradarse.
 # 1.26.0 — Fresh-node guest DELIVERY fix: the session tailer now re-resolves
 #          `agents/*/sessions` on EVERY pass and ADDS new dirs, instead of only
 #          re-resolving while the watched set was empty. On a snapshot-
@@ -12156,7 +12174,7 @@ from __future__ import annotations
 #          live session, spawn tnode-config-sync DECL_ONESHOT to refresh the
 #          workspace .md (throttled, fire-and-forget). Replaces config-sync's
 #          Firestore poll → Document reads scale with sessions, not the clock.
-__VERSION__ = "1.27.0"
+__VERSION__ = "1.28.0"
 
 import hashlib
 import hmac
@@ -12230,6 +12248,63 @@ LOG_PATH = Path(
     os.environ.get("TNODE_CHAT_SYNC_LOG", str(OPENCLAW_DIR / "logs" / "tnode-chat-sync.log"))
 )
 POLL_MS = int(os.environ.get("TNODE_CHAT_SYNC_POLL_MS", "500"))
+
+# ── Adaptive cadence (v1.28.0) ──────────────────────────────────
+# Every Firestore poll runs on two clocks: HOT (the historical fast
+# cadences) while somebody is actually using the node, IDLE (slow
+# backstops) otherwise. Hot signals:
+#   - trajectory/outbox activity (the pre-existing outbox hot window), and
+#   - the app holding a WS client through the telemetry sidecar, which
+#     touches APP_PRESENCE_FILE every ~30s while ≥1 client is connected
+#     (tnode-telemetry 1.18.0+). File missing → activity signal only.
+# The outbox keeps its own 10s idle clock — it is the GUARANTEED inbound
+# path for guests (Firestore-first, no WS) and must not back off further.
+APP_PRESENCE_FILE = Path(
+    os.environ.get(
+        "TNODE_CHAT_SYNC_PRESENCE_FILE", str(OPENCLAW_DIR / "app-presence")
+    )
+)
+APP_PRESENCE_FRESH_S = float(
+    os.environ.get("TNODE_CHAT_SYNC_PRESENCE_FRESH_S", "90")
+)
+
+
+def _app_present(now: float) -> bool:
+    """True while the telemetry sidecar reports a live app WS client
+    (presence file mtime within APP_PRESENCE_FRESH_S). Local stat() —
+    zero Firestore cost; called once per main-loop pass."""
+    try:
+        return (now - APP_PRESENCE_FILE.stat().st_mtime) < APP_PRESENCE_FRESH_S
+    except OSError:
+        return False
+
+
+# Idle backstops for the fast pollers. Worst case with the app open but
+# without WS presence (shouldn't happen — the app keeps the sidecar WS on
+# every node screen) a cron/upload command takes up to ~30s to reflect;
+# the first hit found flips the node hot so the rest of the editing
+# session runs at the fast cadence again.
+UPLOAD_POLL_IDLE_S = float(
+    os.environ.get("TNODE_CHAT_SYNC_UPLOAD_POLL_IDLE_S", "30.0")
+)
+CRON_COMMAND_POLL_IDLE_S = float(
+    os.environ.get("TNODE_CHAT_SYNC_CRON_CMD_IDLE_S", "30.0")
+)
+TASK_COMMAND_POLL_IDLE_S = float(
+    os.environ.get("TNODE_CHAT_SYNC_TASK_CMD_IDLE_S", "30.0")
+)
+CRON_MIRROR_IDLE_S = float(
+    os.environ.get("TNODE_CHAT_SYNC_CRON_MIRROR_IDLE_S", "60.0")
+)
+TASKS_MIRROR_IDLE_S = float(
+    os.environ.get("TNODE_CHAT_SYNC_TASKS_MIRROR_IDLE_S", "60.0")
+)
+# Mirrors are change-gated by a hash of the local snapshot; this backstop
+# forces a full list+reconcile against Firestore even without local
+# changes, healing any drift (e.g. docs edited/deleted server-side).
+MIRROR_RECONCILE_S = float(
+    os.environ.get("TNODE_CHAT_SYNC_MIRROR_RECONCILE_S", "600")
+)
 
 # ── Chat attachments (v1.9.0+) ──────────────────────────────────
 # Files the mobile app uploads via the (+) menu land in Firestore at
@@ -12664,11 +12739,12 @@ def mark_upload_failed(
         _log(f"upload {attachment_id}: mark failed errored: {e}")
 
 
-def process_uploads(token: dict, project_id: str) -> None:
+def process_uploads(token: dict, project_id: str) -> bool:
     """Poll pending uploads, download each into workspace/upload/,
     verify sha256, and flip status. Best-effort — failures are logged +
     written back to the doc so the user sees them in the chip.
 
+    Returns True when pending docs were seen (feeds the hot window).
     Raises HTTPError(401) so the main loop refreshes the token. Other
     errors are swallowed (logged) so one bad attachment doesn't stall
     the daemon's chat-mirror loop."""
@@ -12679,10 +12755,10 @@ def process_uploads(token: dict, project_id: str) -> None:
         if e.code == 401:
             raise
         _log(f"uploads query: HTTP {e.code} {e.reason}")
-        return
+        return False
     except Exception as e:  # noqa: BLE001
         _log(f"uploads query error: {e}")
-        return
+        return False
 
     for doc in pending:
         aid = doc["id"]
@@ -12761,6 +12837,8 @@ def process_uploads(token: dict, project_id: str) -> None:
             _log(f"upload {aid}: status update HTTP {e.code} {e.reason}")
         except Exception as e:  # noqa: BLE001
             _log(f"upload {aid}: status update error: {e}")
+
+    return bool(pending)
 
 
 # ── JSONL turn extraction ──────────────────────────────────────
@@ -13034,20 +13112,27 @@ def _read_gateway_token() -> str | None:
 # channel schema doesn't even allow). The main loop refreshes this cache (it
 # owns the minted token); the hot-path gate just reads it. Default False
 # (webchat) until Firestore proves otherwise.
-_TNODE_TRANSPORT_TTL_S = 10.0
+_TNODE_TRANSPORT_TTL_HOT_S = 10.0
+_TNODE_TRANSPORT_TTL_IDLE_S = float(
+    os.environ.get("TNODE_CHAT_SYNC_TRANSPORT_TTL_IDLE_S", "90.0")
+)
 _tnode_transport_cache: dict = {"active": False, "ts": 0.0}
 
 
 def _refresh_tnode_transport_active(
-    token: dict, project_id: str, node_id: str
+    token: dict, project_id: str, node_id: str, hot: bool = True
 ) -> None:
     """Refresh `_tnode_transport_cache` from Firestore
     `users/{uid}/nodes/{nodeId}.transportEnabled`. TTL-gated (≈1 GET per
-    _TNODE_TRANSPORT_TTL_S). Called from the main loop, which owns the token.
+    TTL window; 10s hot / 90s idle — flipping the cutover toggle happens
+    from the app, which makes the node hot via presence, so the idle TTL
+    is never on the user's critical path). Called from the main loop,
+    which owns the token.
     Fail-safe: a 404 (node doc absent) means NOT cut over; transient errors
     keep the last known value so a blip doesn't flip the chat path."""
     now = time.time()
-    if now - _tnode_transport_cache["ts"] < _TNODE_TRANSPORT_TTL_S:
+    ttl = _TNODE_TRANSPORT_TTL_HOT_S if hot else _TNODE_TRANSPORT_TTL_IDLE_S
+    if now - _tnode_transport_cache["ts"] < ttl:
         return
     uid = token.get("uid")
     if not uid:
@@ -13233,18 +13318,39 @@ def _delete_cron_doc(token: dict, project_id: str, cron_id: str) -> None:
         _log(f"cron delete {cron_id}: {e}")
 
 
-def process_crons_mirror(token: dict, project_id: str) -> None:
+_crons_mirror_state: dict = {"hash": None, "ts": 0.0}
+
+
+def process_crons_mirror(
+    token: dict, project_id: str, force: bool = False
+) -> None:
     """Sync `openclaw cron list --json` → Firestore `crons/`.
     Upserts each present job; deletes Firestore docs for jobs no longer
-    in the local list. Idempotent — safe to call frequently."""
+    in the local list. Idempotent — safe to call frequently.
+
+    v1.28.0: change-gated — the Firestore list + writes only run when the
+    local snapshot hash changed, on `force` (right after a cron command),
+    or every MIRROR_RECONCILE_S as a drift-healing backstop. The local
+    CLI fetch still runs each call (no Firestore cost)."""
     jobs = _fetch_local_crons()
     if jobs is None:
+        return
+    now = time.time()
+    snapshot_hash = hashlib.sha256(
+        json.dumps(jobs, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    if (
+        not force
+        and snapshot_hash == _crons_mirror_state["hash"]
+        and (now - _crons_mirror_state["ts"]) < MIRROR_RECONCILE_S
+    ):
         return
     local_ids = {j.get("id") for j in jobs if j.get("id")}
     remote_ids = _query_existing_cron_ids(token, project_id)
     if remote_ids is None:
         # Couldn't enumerate — only do upserts, skip deletes to avoid
-        # nuking docs by accident on a transient error.
+        # nuking docs by accident on a transient error. Don't record the
+        # hash so the next tick retries the full reconcile.
         for job in jobs:
             _write_cron_doc(token, project_id, job)
         return
@@ -13252,6 +13358,8 @@ def process_crons_mirror(token: dict, project_id: str) -> None:
         _write_cron_doc(token, project_id, job)
     for orphan in remote_ids - local_ids:
         _delete_cron_doc(token, project_id, orphan)
+    _crons_mirror_state["hash"] = snapshot_hash
+    _crons_mirror_state["ts"] = now
 
 
 # ── Command handler ─────────────────────────────────────────────
@@ -13462,12 +13570,13 @@ def _update_cron_command(
         _log(f"cron cmd update {cmd_id}: {e.code} {e.reason}")
 
 
-def process_cron_commands(token: dict, project_id: str) -> None:
+def process_cron_commands(token: dict, project_id: str) -> bool:
     """Pop pending cron.* commands, execute, mirror state (the mirror loop
-    re-runs anyway, but doing it inline keeps the UI responsive)."""
+    re-runs anyway, but doing it inline keeps the UI responsive).
+    Returns True when commands were seen (feeds the hot window)."""
     pending = _query_pending_cron_commands(token, project_id)
     if not pending:
-        return
+        return False
     for cmd in pending:
         cmd_id = cmd["id"]
         ok, summary = _execute_cron_command(cmd["type"], cmd["params"])
@@ -13475,7 +13584,9 @@ def process_cron_commands(token: dict, project_id: str) -> None:
         _update_cron_command(token, project_id, cmd_id, new_status, summary)
         _log(f"cron cmd {cmd_id} type={cmd['type']} → {new_status}: {summary[:80]}")
     # Refresh mirror so the client sees the post-command state immediately.
-    process_crons_mirror(token, project_id)
+    # force=True: bypass the change-gate — the command just mutated crons.
+    process_crons_mirror(token, project_id, force=True)
+    return True
 
 
 # ── Tasks mirror (v1.13.0+) ─────────────────────────────────────
@@ -13639,17 +13750,34 @@ def _delete_task_doc(token: dict, project_id: str, task_id: str) -> None:
         _log(f"task delete {task_id}: {e}")
 
 
+_tasks_mirror_state: dict = {"hash": None, "ts": 0.0}
+
+
 def process_tasks_mirror(token: dict, project_id: str) -> None:
-    """Snapshot SQLite `task_runs` → Firestore `tasks/`. Idempotent."""
+    """Snapshot SQLite `task_runs` → Firestore `tasks/`. Idempotent.
+
+    v1.28.0: change-gated on the hash of the selected rows, with a
+    MIRROR_RECONCILE_S backstop — the SQLite read is local and free, the
+    Firestore list + writes only run when something actually changed."""
     all_tasks = _fetch_local_tasks()
     if all_tasks is None:
         return
     to_mirror = _select_tasks_to_mirror(all_tasks)
+    now = time.time()
+    snapshot_hash = hashlib.sha256(
+        json.dumps(to_mirror, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    if (
+        snapshot_hash == _tasks_mirror_state["hash"]
+        and (now - _tasks_mirror_state["ts"]) < MIRROR_RECONCILE_S
+    ):
+        return
     local_ids = {t["taskId"] for t in to_mirror if t.get("taskId")}
     remote_ids = _query_existing_task_ids(token, project_id)
     if remote_ids is None:
         # Couldn't enumerate — only upsert, skip deletes to avoid
-        # accidental loss on a transient error.
+        # accidental loss on a transient error. Don't record the hash so
+        # the next tick retries the full reconcile.
         for task in to_mirror:
             _write_task_doc(token, project_id, task)
         return
@@ -13657,6 +13785,8 @@ def process_tasks_mirror(token: dict, project_id: str) -> None:
         _write_task_doc(token, project_id, task)
     for orphan in remote_ids - local_ids:
         _delete_task_doc(token, project_id, orphan)
+    _tasks_mirror_state["hash"] = snapshot_hash
+    _tasks_mirror_state["ts"] = now
 
 
 # ── Task artifact commands (v1.14.0+) ───────────────────────────
@@ -13898,11 +14028,12 @@ def _update_task_command(
 
 def process_task_commands(
     token: dict, project_id: str, cfg: dict,
-) -> None:
-    """Pop pending tasks.* commands and execute them."""
+) -> bool:
+    """Pop pending tasks.* commands and execute them.
+    Returns True when commands were seen (feeds the hot window)."""
     pending = _query_pending_task_commands(token, project_id)
     if not pending:
-        return
+        return False
     for cmd in pending:
         cmd_id = cmd["id"]
         ok, summary, extra = _execute_task_command(
@@ -13926,6 +14057,7 @@ def process_task_commands(
             token, project_id, cmd_id, new_status, summary, extra,
         )
         _log(f"task cmd {cmd_id} type={cmd['type']} → {new_status}: {summary[:80]}")
+    return True
 
 
 def extract_content(raw):
@@ -15416,10 +15548,12 @@ def main() -> int:
     last_tasks_mirror_check = 0.0
     last_task_command_check = 0.0
     last_media_sweep_check = 0.0
-    # Outbox consumer (v1.17.0): adaptive clock — hot after trajectory
-    # activity or recent pendings, idle otherwise.
+    # Global hot window (v1.28.0, grew out of the outbox's v1.17.0 clock):
+    # trajectory activity, outbox pendings, found commands/uploads, or app
+    # presence via the sidecar keep the node hot; every Firestore poll picks
+    # its fast or backstop cadence off this single signal.
     last_outbox_check = 0.0
-    outbox_hot_until = 0.0
+    hot_until = 0.0
     outbox_state: dict = {}
 
     while True:
@@ -15488,14 +15622,18 @@ def main() -> int:
             # _tnode_channel_active() reads (TTL-gated; same Firestore field the
             # client reads). The token block above guarantees a usable token.
             if token is not None:
-                _refresh_tnode_transport_active(token, project_id, cfg["nodeId"])
+                now_f = time.time()
+                _refresh_tnode_transport_active(
+                    token, project_id, cfg["nodeId"],
+                    hot=(now_f < hot_until) or _app_present(now_f),
+                )
 
             for line in tailer.read_new_lines():
                 # Any trajectory activity means the user is around — keep
                 # the outbox poll on the hot clock so a WS-down message
                 # lands within a few seconds instead of the idle interval.
-                outbox_hot_until = max(
-                    outbox_hot_until, time.time() + OUTBOX_TAIL_HOT_S
+                hot_until = max(
+                    hot_until, time.time() + OUTBOX_TAIL_HOT_S
                 )
                 entry = parse_line(line)
                 if entry is None:
@@ -15584,15 +15722,27 @@ def main() -> int:
                         token = None
                         break
 
-            # Chat-attachment poll — slower clock than the JSONL tail.
+            # Firestore polls (v1.28.0) — each clock picks its fast cadence
+            # while the node is hot, its slow backstop while idle. Any poll
+            # that finds work re-arms the hot window so the rest of the
+            # user's session runs at the fast cadence.
             now_f = time.time()
+            is_hot = (now_f < hot_until) or _app_present(now_f)
+
+            # Chat-attachment poll — slower clock than the JSONL tail.
+            uploads_interval = (
+                UPLOAD_POLL_INTERVAL_S if is_hot else UPLOAD_POLL_IDLE_S
+            )
             if (
                 token is not None
-                and (now_f - last_uploads_check) >= UPLOAD_POLL_INTERVAL_S
+                and (now_f - last_uploads_check) >= uploads_interval
             ):
                 last_uploads_check = now_f
                 try:
-                    process_uploads(token, project_id)
+                    if process_uploads(token, project_id):
+                        hot_until = max(
+                            hot_until, time.time() + OUTBOX_HOT_WINDOW_S
+                        )
                 except urllib.error.HTTPError as e:
                     if e.code == 401:
                         _log("uploads poll: idToken rejected — refreshing")
@@ -15600,24 +15750,35 @@ def main() -> int:
 
             # Cron CRUD commands poll — fast clock so the app sees the
             # operation reflected within a few seconds.
+            cron_cmd_interval = (
+                CRON_COMMAND_POLL_INTERVAL_S if is_hot
+                else CRON_COMMAND_POLL_IDLE_S
+            )
             if (
                 token is not None
-                and (now_f - last_cron_command_check) >= CRON_COMMAND_POLL_INTERVAL_S
+                and (now_f - last_cron_command_check) >= cron_cmd_interval
             ):
                 last_cron_command_check = now_f
                 try:
-                    process_cron_commands(token, project_id)
+                    if process_cron_commands(token, project_id):
+                        hot_until = max(
+                            hot_until, time.time() + OUTBOX_HOT_WINDOW_S
+                        )
                 except urllib.error.HTTPError as e:
                     if e.code == 401:
                         _log("cron commands poll: idToken rejected — refreshing")
                         token = None
 
-            # Cron mirror — periodic snapshot of `openclaw cron list --json`
-            # to Firestore. Skipped when a command just ran (process_cron_commands
-            # already refreshes the mirror as its last step).
+            # Cron mirror — snapshot of `openclaw cron list --json` to
+            # Firestore. The scan itself is local; process_crons_mirror only
+            # touches Firestore when the snapshot hash changed (or on its
+            # reconcile backstop).
+            cron_mirror_interval = (
+                CRON_MIRROR_INTERVAL_S if is_hot else CRON_MIRROR_IDLE_S
+            )
             if (
                 token is not None
-                and (now_f - last_cron_mirror_check) >= CRON_MIRROR_INTERVAL_S
+                and (now_f - last_cron_mirror_check) >= cron_mirror_interval
             ):
                 last_cron_mirror_check = now_f
                 try:
@@ -15627,11 +15788,14 @@ def main() -> int:
                         _log("cron mirror: idToken rejected — refreshing")
                         token = None
 
-            # Tasks mirror — periodic SQLite → Firestore snapshot of
-            # TaskFlow runs.
+            # Tasks mirror — SQLite → Firestore snapshot of TaskFlow runs.
+            # Same change-gate as the cron mirror.
+            tasks_mirror_interval = (
+                TASKS_MIRROR_INTERVAL_S if is_hot else TASKS_MIRROR_IDLE_S
+            )
             if (
                 token is not None
-                and (now_f - last_tasks_mirror_check) >= TASKS_MIRROR_INTERVAL_S
+                and (now_f - last_tasks_mirror_check) >= tasks_mirror_interval
             ):
                 last_tasks_mirror_check = now_f
                 try:
@@ -15643,13 +15807,20 @@ def main() -> int:
 
             # Task artifact commands — fast clock so the app sees the
             # download ready within a few seconds after tapping.
+            task_cmd_interval = (
+                TASK_COMMAND_POLL_INTERVAL_S if is_hot
+                else TASK_COMMAND_POLL_IDLE_S
+            )
             if (
                 token is not None
-                and (now_f - last_task_command_check) >= TASK_COMMAND_POLL_INTERVAL_S
+                and (now_f - last_task_command_check) >= task_cmd_interval
             ):
                 last_task_command_check = now_f
                 try:
-                    process_task_commands(token, project_id, cfg)
+                    if process_task_commands(token, project_id, cfg):
+                        hot_until = max(
+                            hot_until, time.time() + OUTBOX_HOT_WINDOW_S
+                        )
                 except urllib.error.HTTPError as e:
                     if e.code == 401:
                         _log("task commands: idToken rejected — refreshing")
@@ -15672,10 +15843,11 @@ def main() -> int:
             # Chat outbox consumer (v1.17.0) — Firestore-first messaging.
             # Picks up user messages the app wrote with delivery="pending"
             # (direct WS down) and injects them into the local gateway.
+            # OUTBOX_POLL_IDLE_S (10s) is the floor for this clock even on a
+            # fully idle node — guests message Firestore-first with no WS, so
+            # this is their guaranteed inbound latency.
             outbox_interval = (
-                OUTBOX_POLL_HOT_S
-                if now_f < outbox_hot_until
-                else OUTBOX_POLL_IDLE_S
+                OUTBOX_POLL_HOT_S if is_hot else OUTBOX_POLL_IDLE_S
             )
             if (
                 token is not None
@@ -15684,7 +15856,7 @@ def main() -> int:
                 last_outbox_check = now_f
                 try:
                     if process_outbox(token, project_id, outbox_state):
-                        outbox_hot_until = time.time() + OUTBOX_HOT_WINDOW_S
+                        hot_until = time.time() + OUTBOX_HOT_WINDOW_S
                 except urllib.error.HTTPError as e:
                     if e.code == 401:
                         _log("outbox poll: idToken rejected — refreshing")
@@ -15969,7 +16141,14 @@ from __future__ import annotations
 #          turno y sus tools no aparecieron es "error" real (token malo). Arregla
 #          el rojo falso al activar un MCP y abrir CTX sin mandar mensaje. El
 #          gateway NO necesita reinicio (hot-reload); ver config-sync 1.21.1.
-__VERSION__ = "1.17.0"
+# 1.18.0 — App-presence beacon para el fix de reads Firestore (chat-sync
+#          1.28.0): mientras haya ≥1 cliente WS conectado (el app entra por
+#          este proxy — túnel CF → :18790), se toca ~/.openclaw/app-presence
+#          cada PRESENCE_TOUCH_SEC (30s) y al conectar. chat-sync lee el
+#          mtime (stat local, gratis) y mantiene sus polls de Firestore en
+#          cadencia rápida solo mientras el archivo esté fresco. Sin
+#          clientes → sin touch → chat-sync cae a backstops idle.
+__VERSION__ = "1.18.0"
 
 import argparse
 import asyncio
@@ -16020,6 +16199,27 @@ OPENCLAW_HOME = Path(
 SESSIONS_DIR = OPENCLAW_HOME / "agents" / "main" / "sessions"
 OPENCLAW_JSON = OPENCLAW_HOME / "openclaw.json"
 CHAT_SYNC_CONFIG = OPENCLAW_HOME / "tnode-chat-sync.json"
+
+# App-presence beacon (v1.18.0) — touched on client connect and every
+# PRESENCE_TOUCH_SEC while ≥1 WS client is connected. tnode-chat-sync
+# 1.28.0+ stats this file to keep its Firestore polls on the fast cadence
+# only while the app is actually around.
+PRESENCE_FILE = Path(
+    os.environ.get(
+        "TNODE_TELEMETRY_PRESENCE_FILE", str(OPENCLAW_HOME / "app-presence")
+    )
+)
+PRESENCE_TOUCH_SEC = float(
+    os.environ.get("TNODE_TELEMETRY_PRESENCE_TOUCH_SEC", "30")
+)
+
+
+def _touch_presence() -> None:
+    """Best-effort mtime bump; never raises into the caller."""
+    try:
+        PRESENCE_FILE.touch()
+    except OSError:
+        pass
 
 # How often the sessions tailer re-checks new bytes. Cheap enough at 250 ms.
 TAIL_INTERVAL_MS = int(os.environ.get("TNODE_TELEMETRY_TAIL_INTERVAL_MS", "250"))
@@ -16673,6 +16873,7 @@ class TelemetryProxy:
         self._channels_task: Optional[asyncio.Task] = None
         self._channels_cache: Optional[Dict[str, Any]] = None
         self._channels_state_mtime: float = 0.0
+        self._presence_task: Optional[asyncio.Task] = None
 
     async def start_background(self) -> None:
         self._accumulator.bootstrap()
@@ -16703,6 +16904,21 @@ class TelemetryProxy:
                 "Install with: apt install python3-psutil"
             )
         self._channels_task = asyncio.create_task(self._channels_loop())
+        self._presence_task = asyncio.create_task(self._presence_loop())
+
+    async def _presence_loop(self) -> None:
+        """Keep the app-presence beacon fresh while clients are connected.
+        No clients → no touches → chat-sync's polls fall back to their
+        idle backstops after APP_PRESENCE_FRESH_S."""
+        while True:
+            try:
+                if self._clients:
+                    _touch_presence()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.exception("presence loop error: %s", e)
+            await asyncio.sleep(PRESENCE_TOUCH_SEC)
 
     async def stop_background(self) -> None:
         for task in (
@@ -16711,6 +16927,7 @@ class TelemetryProxy:
             self._refresh_pending,
             self._health_task,
             self._channels_task,
+            self._presence_task,
         ):
             if task is None:
                 continue
@@ -16724,6 +16941,7 @@ class TelemetryProxy:
         self._refresh_pending = None
         self._health_task = None
         self._channels_task = None
+        self._presence_task = None
 
     async def _tail_loop(self) -> None:
         while True:
@@ -16876,6 +17094,9 @@ class TelemetryProxy:
     async def handle_client(self, ws_client) -> None:
         session = ClientSession(self, ws_client)
         self._clients.add(session)
+        # Presence beacon: flip chat-sync hot as soon as the app connects,
+        # without waiting for the next _presence_loop tick.
+        _touch_presence()
         if len(self._clients) > WARN_CONCURRENT_CLIENTS:
             logger.warning(
                 "unusually high client count: %d (check for leaked connections)",
