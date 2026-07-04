@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.69.0"
+TNODE_SETUP_VERSION="1.70.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -5680,7 +5680,18 @@ from __future__ import annotations
 #          zonas antes del flip. La CF build{Tools,Soul,Identity,User}Json queda
 #          no-op hasta retirarse (aún alimenta el toolsJson que TEAM_INDEX lee de
 #          cada peer para derivar especialidad — retirar SOLO tras resolver eso).
-__VERSION__ = "1.44.0"
+# 1.45.0 — AGENTS.md gestionado ON-NODE (Harness Eng. F3b Ola 1): 4 zonas P
+#          platform-pure (tnode:agents:startup/memory/actions/heartbeats) en
+#          _MD_TARGETS, compuestas local (_compose_agents_doc, plantillas _AGENTS_*
+#          owner-agnósticas). A diferencia de soul/identity, AGENTS.md se
+#          ESTANDARIZA: _agents_standardize resetea el archivo a un canónico limpio
+#          (preámbulo neutral) una vez —descartando la capa A (pitch de negocio
+#          manual, persona libre, boilerplate stock inglés)— con backup completo
+#          reversible (.bak-pre-agents); luego las 4 zonas se appendean por hash.
+#          Fixea el gap #1 (AGENTS sin zona gestionada) y el bug de refs vacías
+#          (`Leo ** —` con filenames comidos por un strip viejo). Verificado con
+#          TNODE_AGENTS_DRYRUN antes del flip; flota Mini/Pi/VPS byte-idéntica.
+__VERSION__ = "1.45.0"
 
 import hashlib
 import hmac
@@ -9624,6 +9635,47 @@ _MD_TARGETS = {
         "legacy_headers": (),
         "position": "start",
     },
+    # AGENTS.md — F3b Ola 1. CUATRO zonas P (platform-pure) en un mismo archivo,
+    # cada una su par de markers + hash independiente. NO usan CF (net-new, sin
+    # {target}Json): compone local + render por hash. La limpieza del archivo la
+    # hace `_agents_standardize` (reset a canónico) UNA vez, así que aquí
+    # legacy_headers va vacío (no hay strip por-header). backup compartido.
+    "agents_startup": {
+        "md_name": "AGENTS.md",
+        "zone_start": "<!-- tnode:agents:startup:start -->",
+        "zone_end": "<!-- tnode:agents:startup:end -->",
+        "hash_path": OPENCLAW_DIR / ".tnode-agents-startup-hash",
+        "sentinel": OPENCLAW_DIR / ".tnode-agents-startup-migrated",
+        "backup_name": "AGENTS.md.bak-pre-agents",
+        "legacy_headers": (),
+    },
+    "agents_memory": {
+        "md_name": "AGENTS.md",
+        "zone_start": "<!-- tnode:agents:memory:start -->",
+        "zone_end": "<!-- tnode:agents:memory:end -->",
+        "hash_path": OPENCLAW_DIR / ".tnode-agents-memory-hash",
+        "sentinel": OPENCLAW_DIR / ".tnode-agents-memory-migrated",
+        "backup_name": "AGENTS.md.bak-pre-agents",
+        "legacy_headers": (),
+    },
+    "agents_actions": {
+        "md_name": "AGENTS.md",
+        "zone_start": "<!-- tnode:agents:actions:start -->",
+        "zone_end": "<!-- tnode:agents:actions:end -->",
+        "hash_path": OPENCLAW_DIR / ".tnode-agents-actions-hash",
+        "sentinel": OPENCLAW_DIR / ".tnode-agents-actions-migrated",
+        "backup_name": "AGENTS.md.bak-pre-agents",
+        "legacy_headers": (),
+    },
+    "agents_heartbeats": {
+        "md_name": "AGENTS.md",
+        "zone_start": "<!-- tnode:agents:heartbeats:start -->",
+        "zone_end": "<!-- tnode:agents:heartbeats:end -->",
+        "hash_path": OPENCLAW_DIR / ".tnode-agents-heartbeats-hash",
+        "sentinel": OPENCLAW_DIR / ".tnode-agents-heartbeats-migrated",
+        "backup_name": "AGENTS.md.bak-pre-agents",
+        "legacy_headers": (),
+    },
 }
 
 _md_bootstrap_attempted: dict = {}
@@ -9748,6 +9800,8 @@ def _compose_md_local(token: dict, target: str):
         return _compose_user_doc(token)
     if target == "tools":
         return _compose_tools_doc(token)
+    if target in _AGENTS_ZONE_TEXT:
+        return _compose_agents_doc(target)
     return None
 
 
@@ -9853,6 +9907,80 @@ def _md_migrate(target: str) -> None:
         sentinel.write_text("done", encoding="utf-8")
     except Exception as e:  # noqa: BLE001
         _log(f"md-migrate[{target}]: {e}")
+
+
+# ── AGENTS.md standardize (F3b Ola 1) ────────────────────────────────────────
+# A diferencia de soul/identity/user (zonas inyectadas preservando la persona
+# curada), AGENTS.md se ESTANDARIZA: una sola vez reseteamos el archivo a un
+# canónico limpio (preámbulo neutral) descartando TODO lo de capa A — pitch de
+# negocio manual (TBrain/TVision/precios), persona libre y el boilerplate stock
+# en inglés de nodos no-tropicalizados. Decisión de tobal (2026-07-04): dejar la
+# flota limpia y estándar; el negocio se recaptura luego por el Wizard (capa D).
+# Backup completo reversible en AGENTS.md.bak-pre-agents. Tras el reset, las 4
+# zonas P (`agents_*`) se appendean vía _md_sync_from_json (mecánica normal).
+_AGENTS_STANDARDIZE_SENTINEL = OPENCLAW_DIR / ".tnode-agents-standardized"
+
+
+def _agents_standardize() -> None:
+    """One-time: backup + reset AGENTS.md a un canónico limpio (solo preámbulo).
+    No-op si ya se corrió (sentinel) o si el archivo aún no existe (nodo fresco
+    antes de que OpenClaw lo siembre → reintenta en el próximo poll)."""
+    if _AGENTS_STANDARDIZE_SENTINEL.exists():
+        return
+    p = OPENCLAW_DIR / "workspace" / "AGENTS.md"
+    if not p.is_file():
+        return
+    try:
+        original = p.read_text(encoding="utf-8")
+        bak = p.with_name("AGENTS.md.bak-pre-agents")
+        if not bak.exists():
+            bak.write_text(original, encoding="utf-8")
+        clean = _AGENTS_PREAMBLE.strip() + "\n"
+        if clean != original:
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text(clean, encoding="utf-8")
+            os.replace(tmp, p)
+            _log("agents-standardize: AGENTS.md reset a canónico limpio (backup .bak-pre-agents)")
+        # Fuerza el re-render de las 4 zonas: al vaciar el archivo, cualquier hash
+        # previo quedaría stale (el body ya no está) y _md_sync_from_json lo
+        # saltaría. Borrar los hashes garantiza que se vuelvan a appendear.
+        for _ag in _AGENTS_ORDER:
+            try:
+                _MD_TARGETS[_ag]["hash_path"].unlink()
+            except Exception:  # noqa: BLE001
+                pass
+        _AGENTS_STANDARDIZE_SENTINEL.write_text("done", encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        _log(f"agents-standardize: {e}")
+
+
+def _agents_dryrun() -> None:
+    """MODO DRY-RUN (verificación F3b): compone el AGENTS.md estandarizado que
+    RESULTARÍA (preámbulo + 4 zonas P) y lo diffea contra el archivo real, SIN
+    escribir nada. Escribe el diff a .tnode-agents-dryrun.diff e imprime el
+    resultado a stdout para revisión. Cero side-effects."""
+    try:
+        p = OPENCLAW_DIR / "workspace" / "AGENTS.md"
+        before = p.read_text(encoding="utf-8") if p.is_file() else ""
+        parts = [_AGENTS_PREAMBLE.strip()]
+        for t in _AGENTS_ORDER:
+            desc = _MD_TARGETS[t]
+            body = _render_tools_zone(_compose_agents_doc(t).get("blocks") or [])
+            parts.append(f'{desc["zone_start"]}\n{body}\n{desc["zone_end"]}')
+        after = "\n\n".join(parts) + "\n"
+        import difflib
+        d = "\n".join(difflib.unified_diff(
+            before.splitlines(), after.splitlines(),
+            fromfile="AGENTS.md (actual)", tofile="AGENTS.md (estandarizado)",
+            lineterm="",
+        ))
+        (OPENCLAW_DIR / ".tnode-agents-dryrun.diff").write_text(d[:20000], encoding="utf-8")
+        _log(f"agents-dryrun: actual={len(before)} → estandarizado={len(after)} chars")
+        print("===== AGENTS.md ESTANDARIZADO (dry-run, NO escrito) =====")
+        print(after)
+        print("===== FIN =====")
+    except Exception as e:  # noqa: BLE001
+        _log(f"agents-dryrun: {e}")
 
 
 # ── TEAM_INDEX.md renderer (roster de TNodes-peer, archivo dedicado) ──
@@ -10133,6 +10261,79 @@ Cuando una tarea encaje con la especialidad de un nodo del equipo (un canal/skil
     exec: python3 ~/.openclaw/workspace/skills/tnode-delegate/bin/tnode-delegate.py delegate --alias <alias> --text "<instrucción autocontenida>"
 
 El comando imprime la respuesta del agente de ese nodo; úsala para continuar tu trabajo. La instrucción debe ser CLARA y AUTOCONTENIDA (el otro nodo no ve tu conversación). El detalle del skill está en la Regla de delegación de tu TOOLS.md."""
+
+
+# ── AGENTS.md — plantillas P (F3b Ola 1) ─────────────────────────────────────
+# Protocolo de operación platform-pure, IDÉNTICO para todo agente de la flota
+# (owner-agnóstico: sin nombres/negocio hardcodeados). La especialización por
+# sector/persona vive en la capa D del Wizard (F3.5), no aquí.
+_AGENTS_PREAMBLE = """# AGENTS.md — Protocolo de Operación
+
+> Define cómo opero como agente de la plataforma: arranque de sesión, manejo de memoria, acciones y respuesta a heartbeats. Estándar para todos los agentes de la plataforma."""
+
+_AGENTS_STARTUP = """## Startup de Sesión — Mi Protocolo
+
+Al iniciar cada sesión, ejecuto en este orden:
+
+1. Leo `SOUL.md` — quién soy, cómo pienso, mis límites
+2. Leo `IDENTITY.md` — mi nombre, rol y posición
+3. Leo `USER.md` — quién es mi interlocutor y su contexto
+4. Leo `HEARTBEAT.md` (hoy y ayer) — ¿qué pasó recientemente?
+5. Si estoy en sesión MAIN con mi dueño: leo también `MEMORY.md` — mi memoria de largo plazo
+
+No pido permiso. Lo hago y estoy listo."""
+
+_AGENTS_MEMORY = """## Memoria y Continuidad
+
+- **Notas diarias:** `HEARTBEAT.md` — registro de lo que pasó
+- **Memoria de largo plazo:** `MEMORY.md` — solo en sesión MAIN con mi dueño
+- **Estado de herramientas:** `TOOLS.md` — integraciones activas
+
+**Regla de oro:** Si no lo escribo, lo olvido. Todo lo relevante va al archivo."""
+
+_AGENTS_ACTIONS = """## Acciones que Hago Libremente
+
+- Leer archivos, explorar contexto, investigar
+- Responder consultas con mi contexto de negocio
+- Actualizar mis archivos de memoria
+
+## Acciones que Requieren Confirmación
+
+- Enviar mensajes externos (WhatsApp, email) en nombre del negocio
+- Publicar contenido en canales públicos
+- Cualquier acción que comprometa algo irreversible"""
+
+_AGENTS_HEARTBEATS = """## Heartbeats — Proactividad Inteligente
+
+Cuando recibo un heartbeat, reviso:
+- ¿Hay conversaciones pendientes de responder?
+- ¿Alguien esperando seguimiento?
+- ¿Actualizaciones en `HEARTBEAT.md`?
+
+Si no hay nada urgente: no interrumpo.
+Si hay algo importante: actúo o notifico.
+
+Respeto el horario: no molesto entre 23:00 y 08:00 salvo urgencia real."""
+
+_AGENTS_ZONE_TEXT = {
+    "agents_startup": _AGENTS_STARTUP,
+    "agents_memory": _AGENTS_MEMORY,
+    "agents_actions": _AGENTS_ACTIONS,
+    "agents_heartbeats": _AGENTS_HEARTBEATS,
+}
+# Orden de render en el archivo (append secuencial tras el preámbulo).
+_AGENTS_ORDER = ("agents_startup", "agents_memory", "agents_actions", "agents_heartbeats")
+
+
+def _compose_agents_doc(target: str) -> dict:
+    """Compositor on-node de una zona P de AGENTS.md (estático, sin data hot)."""
+    return {
+        "schema": 1,
+        "target": "AGENTS.md",
+        "blocks": [
+            {"order": 0, "id": target, "kind": "static", "text": _AGENTS_ZONE_TEXT[target]}
+        ],
+    }
 
 
 def _compose_soul_doc() -> dict:
@@ -12350,6 +12551,11 @@ def _run_declarative_sync(token: dict) -> None:
         _md_sync_from_json(token, _md_target)
     # USER.md: owner profile (no migrate; curated content preserved below).
     _md_sync_from_json(token, "user")
+    # AGENTS.md: estandariza a canónico limpio (one-time) + render de las 4 zonas
+    # P (startup/memory/actions/heartbeats). F3b Ola 1 — platform-pure, sin data.
+    _agents_standardize()
+    for _ag in _AGENTS_ORDER:
+        _md_sync_from_json(token, _ag)
     # TEAM_INDEX.md: peer roster (dedicated file, hash-rendered; gone if no peers).
     _team_index_sync_from_json(token)
     # Cron declarativo del resurtido (hash-gated; rm+add vía CLI del core).
@@ -12384,6 +12590,11 @@ def run_decl_oneshot() -> int:
             # F3 cutover: gate de paridad de SOUL/IDENTITY (lista de targets).
             for _t in _md_sh.split(","):
                 _md_shadow_check(token, _t.strip())
+            return 0
+        if os.environ.get("TNODE_AGENTS_DRYRUN"):
+            # F3b: simula la estandarización de AGENTS.md (compone + diffea),
+            # sin escribir nada. Para revisar before/after antes del rollout.
+            _agents_dryrun()
             return 0
         _run_declarative_sync(token)
         _log("decl-oneshot: declarative refresh complete")
