@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.71.0"
+TNODE_SETUP_VERSION="1.72.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -5703,7 +5703,19 @@ from __future__ import annotations
 #          user}); las zonas gestionadas se re-appendean. La persona/negocio se
 #          recaptura por el Wizard (F3.5, capa D). Retira el _md_migrate (CF strip)
 #          de soul/identity. Core entero limpio y consistente en la flota.
-__VERSION__ = "1.46.0"
+# 1.47.0 — Zonas D del Wizard "Especializa tu Agente" (Harness Eng. F3.5 Fase A,
+#          backend): 4 zonas data-hot compuestas on-node desde config/specialization
+#          (per-Node) + config/specialization (per-Owner), capturadas por la app:
+#          `tnode:identity:data` (agentName+role, IDENTITY) · `tnode:persona`
+#          (personaStyle sliders→párrafo vía _persona_from_sliders, SOUL) ·
+#          `tnode:guardrails` (lista; fuente per-Owner si purpose=business /
+#          per-Node si personal, AGENTS) · `tnode:memory:priorities` (lista con
+#          framing clientes-vs-dueño según purpose, SOUL). Todas GATED por
+#          data-presente (nuevo guard en _md_sync_from_json: body vacío → no crea
+#          markers; también limpia el caso user-sin-perfil). Sin data sembrada, el
+#          core queda idéntico a 1.46.0. AI-suggest CF + app Flutter = fuera de este
+#          backend (se testea sembrando Firestore a mano).
+__VERSION__ = "1.47.0"
 
 import hashlib
 import hmac
@@ -9714,6 +9726,38 @@ _MD_TARGETS = {
         "backup_name": "SOUL.md.bak-pre-soul",
         "legacy_headers": (),
     },
+    # ── Zonas D del Wizard "Especializa tu Agente" (F3.5 Fase A) ──
+    # Data-hot desde Firestore (config/specialization per-Node + per-Owner), la
+    # captura la app. Gated: sin data → body vacío → _md_sync_from_json no crea
+    # markers (ver guard). Se appendean al core ya estandarizado.
+    "identity_data": {
+        "md_name": "IDENTITY.md",
+        "zone_start": "<!-- tnode:identity:data:start -->",
+        "zone_end": "<!-- tnode:identity:data:end -->",
+        "hash_path": OPENCLAW_DIR / ".tnode-identity-data-hash",
+        "legacy_headers": (),
+    },
+    "persona": {
+        "md_name": "SOUL.md",
+        "zone_start": "<!-- tnode:persona:start -->",
+        "zone_end": "<!-- tnode:persona:end -->",
+        "hash_path": OPENCLAW_DIR / ".tnode-persona-hash",
+        "legacy_headers": (),
+    },
+    "memory_priorities": {
+        "md_name": "SOUL.md",
+        "zone_start": "<!-- tnode:memory:priorities:start -->",
+        "zone_end": "<!-- tnode:memory:priorities:end -->",
+        "hash_path": OPENCLAW_DIR / ".tnode-memory-priorities-hash",
+        "legacy_headers": (),
+    },
+    "guardrails": {
+        "md_name": "AGENTS.md",
+        "zone_start": "<!-- tnode:guardrails:start -->",
+        "zone_end": "<!-- tnode:guardrails:end -->",
+        "hash_path": OPENCLAW_DIR / ".tnode-guardrails-hash",
+        "legacy_headers": (),
+    },
 }
 
 _md_bootstrap_attempted: dict = {}
@@ -9767,6 +9811,32 @@ def _md_apply_zone(target: str, zone_text: str) -> bool:
         tmp.write_text(new, encoding="utf-8")
         os.replace(tmp, p)
     return True
+
+
+def _md_remove_zone(target: str) -> None:
+    """Quita el par de markers de <md> (y su contenido) si existe, y borra el hash
+    local. Para zonas D que se quedaron sin data (el dueño las vació en la app):
+    la zona debe DESAPARECER, no quedar stale. No-op si no hay markers."""
+    desc = _MD_TARGETS[target]
+    p = OPENCLAW_DIR / "workspace" / desc["md_name"]
+    try:
+        desc["hash_path"].unlink()
+    except Exception:  # noqa: BLE001
+        pass
+    if not p.is_file():
+        return
+    text = p.read_text(encoding="utf-8")
+    start, end = desc["zone_start"], desc["zone_end"]
+    if start not in text or end not in text:
+        return
+    pre = text.split(start, 1)[0].rstrip()
+    post = text.split(end, 1)[1].lstrip("\n")
+    new = pre + ("\n\n" + post if post.strip() else "\n")
+    if new != text:
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(new, encoding="utf-8")
+        os.replace(tmp, p)
+        _log(f"md-sync[{target}]: zona removida (data D vacía)")
 
 
 def _md_compose_via_cf(target: str) -> dict | None:
@@ -9844,6 +9914,14 @@ def _compose_md_local(token: dict, target: str):
         return _compose_security_doc()
     if target == "memory":
         return _compose_memory_doc()
+    if target == "identity_data":
+        return _compose_identity_data_doc(token)
+    if target == "persona":
+        return _compose_persona_doc(token)
+    if target == "guardrails":
+        return _compose_guardrails_doc(token)
+    if target == "memory_priorities":
+        return _compose_memory_priorities_doc(token)
     return None
 
 
@@ -9858,6 +9936,9 @@ def _md_sync_from_json(token: dict, target: str) -> None:
         body = _render_tools_zone((doc or {}).get("blocks") or [])
     except Exception as e:  # noqa: BLE001
         _log(f"md-sync[{target}]: compose failed: {e}")
+        return
+    if not body.strip():
+        _md_remove_zone(target)  # data D vacía → quita la zona si existía (no stale)
         return
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
     md = OPENCLAW_DIR / "workspace" / desc["md_name"]
@@ -10490,6 +10571,112 @@ def _compose_memory_doc() -> dict:
         "target": "SOUL.md",
         "blocks": [{"order": 0, "id": "memory", "kind": "static", "text": _MEMORY}],
     }
+
+
+# ── Zonas D del Wizard "Especializa tu Agente" (F3.5 Fase A) ─────────────────
+# Data-hot desde config/specialization (per-Node) + config/specialization
+# (per-Owner). Todas gated: sin data → blocks vacío → _md_sync_from_json no crea
+# markers. La app captura estos datos (wizard); aquí sólo se componen.
+def _read_owner_spec(token: dict) -> dict:
+    """GET users/{uid}.specialization (mapa business-wide del Wizard: sector,
+    guardrails, memoryPriorities). Se lee como CAMPO del user doc (mismo patrón que
+    .profile) — el token del nodo puede leer users/{uid} pero NO subcolecciones
+    owner-scoped tipo users/{uid}/config/* (reglas de seguridad). {} si ausente."""
+    url = f"{_firestore_base()}/users/{token['uid']}?mask.fieldPaths=specialization"
+    try:
+        doc = _http_request(
+            "GET", url, headers={"Authorization": f"Bearer {token['idToken']}"},
+        )
+    except Exception:  # noqa: BLE001
+        return {}
+    fields = (doc or {}).get("fields") or {}
+    val = _fs_unwrap(fields["specialization"]) if "specialization" in fields else {}
+    return val if isinstance(val, dict) else {}
+
+
+def _wiz_str(d: dict, k: str) -> str:
+    v = d.get(k) if isinstance(d, dict) else None
+    return v.strip() if isinstance(v, str) else ""
+
+
+def _wiz_list(d: dict, k: str) -> list:
+    v = d.get(k) if isinstance(d, dict) else None
+    return [str(x).strip() for x in v if str(x).strip()] if isinstance(v, list) else []
+
+
+def _persona_from_sliders(style) -> str:
+    """Traduce personaStyle {formalidad,detalle,proactividad} (0-100) a un párrafo.
+    Bandas: <34 extremo-bajo · 34-66 medio · >66 extremo-alto."""
+    if not isinstance(style, dict):
+        return ""
+    def band(k: str, lo: str, mid: str, hi: str) -> str:
+        try:
+            v = int(style.get(k))
+        except (TypeError, ValueError):
+            return mid
+        return lo if v < 34 else (hi if v > 66 else mid)
+    f = band("formalidad", "de manera formal y profesional",
+             "con un tono equilibrado", "de manera cercana, cálida e informal")
+    d = band("detalle", "Respondo breve y al punto",
+             "Doy el detalle que convenga", "Doy explicaciones completas con contexto")
+    p = band("proactividad", "Espero a que me pidan las cosas",
+             "Sugiero cuando es útil", "Soy proactivo y anticipo necesidades")
+    return f"Hablo {f}. {d}. {p}."
+
+
+def _compose_identity_data_doc(token: dict) -> dict:
+    spec = _get_node_subdoc(token, "config/specialization")
+    name, role = _wiz_str(spec, "agentName"), _wiz_str(spec, "role")
+    blocks = []
+    if name:
+        line = f"Soy **{name}**" + (f", {role}." if role else ".")
+        blocks.append({"order": 0, "id": "identity-data", "kind": "static",
+                       "text": f"## Quién soy\n\n{line}"})
+    return {"schema": 1, "target": "IDENTITY.md", "blocks": blocks}
+
+
+def _compose_persona_doc(token: dict) -> dict:
+    spec = _get_node_subdoc(token, "config/specialization")
+    text = _persona_from_sliders(spec.get("personaStyle") if isinstance(spec, dict) else None)
+    blocks = []
+    if text:
+        blocks.append({"order": 0, "id": "persona", "kind": "static",
+                       "text": f"## Personalidad y tono\n\n{text}"})
+    return {"schema": 1, "target": "SOUL.md", "blocks": blocks}
+
+
+def _compose_guardrails_doc(token: dict) -> dict:
+    node = _get_node_subdoc(token, "config/specialization")
+    personal = _wiz_str(node, "purpose") == "personal"
+    if personal:
+        items = _wiz_list(node, "guardrails")
+        title, intro = "## Mis límites", "Reglas que nunca cruzo:"
+    else:
+        items = _wiz_list(_read_owner_spec(token), "guardrails")
+        title, intro = "## Límites del negocio", "Reglas que nunca cruzo, con cualquier cliente:"
+    blocks = []
+    if items:
+        body = f"{title}\n\n{intro}\n" + "\n".join(f"- {x}" for x in items)
+        blocks.append({"order": 0, "id": "guardrails", "kind": "static", "text": body})
+    return {"schema": 1, "target": "AGENTS.md", "blocks": blocks}
+
+
+def _compose_memory_priorities_doc(token: dict) -> dict:
+    node = _get_node_subdoc(token, "config/specialization")
+    personal = _wiz_str(node, "purpose") == "personal"
+    if personal:
+        items = _wiz_list(node, "memoryPriorities")
+        title = "## Qué priorizo recordar de mi dueño"
+        intro = "De la persona dueña de este nodo, priorizo recordar:"
+    else:
+        items = _wiz_list(_read_owner_spec(token), "memoryPriorities")
+        title = "## Qué priorizo recordar de clientes"
+        intro = "De cada cliente, priorizo recordar:"
+    blocks = []
+    if items:
+        body = f"{title}\n\n{intro}\n" + "\n".join(f"- {x}" for x in items)
+        blocks.append({"order": 0, "id": "memory-priorities", "kind": "static", "text": body})
+    return {"schema": 1, "target": "SOUL.md", "blocks": blocks}
 
 
 def _compose_soul_doc() -> dict:
@@ -12708,20 +12895,24 @@ def _run_declarative_sync(token: dict) -> None:
     _soul_standardize()
     _identity_standardize()
     _user_standardize()
-    # SOUL: protocolo de memoria (GATED por presencia del skill) + zona soul.
+    # SOUL: memoria(P,gated) → persona(D) → memory:priorities(D) → soul(P).
     if _has_conversation_memory():
         _md_sync_from_json(token, "memory")
+    _md_sync_from_json(token, "persona")
+    _md_sync_from_json(token, "memory_priorities")
     _md_sync_from_json(token, "soul")
-    # IDENTITY: sub-agentes + equipo (condicional-a-peers).
+    # IDENTITY: identity:data(D) → sub-agentes+equipo(P).
+    _md_sync_from_json(token, "identity_data")
     _md_sync_from_json(token, "identity")
     # USER: perfil del dueño (position=start).
     _md_sync_from_json(token, "user")
-    # AGENTS.md: estandariza (one-time) + 4 zonas agents:* P + tnode:security
-    # consolidada (5ª, append). F3b Ola 1.
+    # AGENTS.md: estandariza (one-time) + 4 zonas agents:* P + tnode:security(P)
+    # + tnode:guardrails(D). F3b Ola 1 + F3.5.
     _agents_standardize()
     for _ag in _AGENTS_ORDER:
         _md_sync_from_json(token, _ag)
     _md_sync_from_json(token, "security")
+    _md_sync_from_json(token, "guardrails")
     # TEAM_INDEX.md: peer roster (dedicated file, hash-rendered; gone if no peers).
     _team_index_sync_from_json(token)
     # Cron declarativo del resurtido (hash-gated; rm+add vía CLI del core).
