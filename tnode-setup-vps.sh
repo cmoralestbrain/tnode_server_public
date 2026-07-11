@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.72.0"
+TNODE_SETUP_VERSION="1.73.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -157,22 +157,33 @@ SUPPORTED_COMPONENTS=(
     "cloudflared"
 )
 
-# Tunnel provisioning API
-TUNNEL_API_URL="https://api.tbrain.app/v1/tunnel/provision"
+# ── Environment (pre-prod/beta support) ──────────────────────
+# One knob: TNODE_PROJECT_ID selects the Firebase project this node talks
+# to. Defaults to prod, so existing installs are untouched. Beta nodes get
+# it from /etc/tnode/auto-pair.env (cloud VPS) or the shell env (BYO/Pi).
+# TNODE_TUNNEL_API points at the per-env tunnel-provisioner Worker
+# (prod: api.tbrain.app, beta: api-beta.tbrain.app).
+TNODE_PROJECT_ID="${TNODE_PROJECT_ID:-tbrain-platform-7fc1f}"
+TNODE_FUNCTIONS_BASE="https://us-central1-${TNODE_PROJECT_ID}.cloudfunctions.net"
+
+# Tunnel provisioning API (cloud-init exports TNODE_TUNNEL_API as
+# ".../v1/tunnel"; accept either base or full /provision form)
+TNODE_TUNNEL_API="${TNODE_TUNNEL_API:-https://api.tbrain.app/v1/tunnel}"
+TUNNEL_API_URL="${TNODE_TUNNEL_API%/provision}/provision"
 # Firebase Function that issues short-lived HMAC tokens. The shared HMAC
 # secret never leaves Firebase Secret Manager + Worker env; the installer
 # only ever sees a per-request signed token (expires in 300s, single-use
 # nonce). Same pattern as `setupKey` for OpenRouter.
-PROVISION_TOKEN_URL="https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/getProvisionToken"
+PROVISION_TOKEN_URL="${TNODE_FUNCTIONS_BASE}/getProvisionToken"
 # Firebase Functions for chat-sync (tnode-chat-sync watcher on this node
 # mirrors conversations to Firestore so the mobile app never loses a turn
 # when it's closed).
-REGISTER_NODE_SYNC_URL="https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/registerNodeSync"
-MINT_NODE_TOKEN_URL="https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/mintNodeToken"
+REGISTER_NODE_SYNC_URL="${TNODE_FUNCTIONS_BASE}/registerNodeSync"
+MINT_NODE_TOKEN_URL="${TNODE_FUNCTIONS_BASE}/mintNodeToken"
 # Firebase Function that hands the per-node OR apiKey to the on-node
 # daemon when it receives apply_openrouter_key. HMAC-signed with the same
 # per-node secret as mintNodeToken. Key is minted/topped-up from the app.
-PULL_LLM_CONFIG_URL="https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/pullLLMConfig"
+PULL_LLM_CONFIG_URL="${TNODE_FUNCTIONS_BASE}/pullLLMConfig"
 
 # ─────────────────────────────────────────────
 # Colors
@@ -5374,6 +5385,7 @@ RestartSec=15
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 Environment=HOME=${TNODE_HOME}
 Environment=OPENCLAW_HOME=${OPENCLAW_HOME}
+EnvironmentFile=-/etc/tnode/env
 StandardOutput=append:${OPENCLAW_HOME}/logs/llm-config-watcher.out.log
 StandardError=append:${OPENCLAW_HOME}/logs/llm-config-watcher.err.log
 
@@ -5715,7 +5727,7 @@ from __future__ import annotations
 #          markers; también limpia el caso user-sin-perfil). Sin data sembrada, el
 #          core queda idéntico a 1.46.0. AI-suggest CF + app Flutter = fuera de este
 #          backend (se testea sembrando Firestore a mano).
-__VERSION__ = "1.47.0"
+__VERSION__ = "1.48.0"
 
 import hashlib
 import hmac
@@ -5738,14 +5750,20 @@ from pathlib import Path
 
 # ── Constants ──────────────────────────────────────────────────
 
-PROJECT_ID = "tbrain-platform-7fc1f"
+# Per-environment project id (pre-prod/beta). Default = prod; beta nodes get
+# TNODE_PROJECT_ID via the installer-written systemd Environment= line.
+PROJECT_ID = os.environ.get("TNODE_PROJECT_ID", "tbrain-platform-7fc1f")
 SCOPE = "sync_admin"
 
 # Public API key (project-scoped, gates only signInWithCustomToken). Same one
-# used by tnode-chat-sync and the iOS app.
+# used by tnode-chat-sync and the iOS app. Non-prod environments ship their
+# own key via TNODE_FIREBASE_WEB_API_KEY (legacy per-daemon var wins if set).
 FIREBASE_WEB_API_KEY_FALLBACK = os.environ.get(
     "TNODE_CONFIG_SYNC_WEB_API_KEY",
-    "AIzaSyCOybTP4r9J2bWXiJvXY0MQBFvaYDo_iWU",
+    os.environ.get(
+        "TNODE_FIREBASE_WEB_API_KEY",
+        "AIzaSyCOybTP4r9J2bWXiJvXY0MQBFvaYDo_iWU",
+    ),
 )
 
 HOME = Path.home()
@@ -7713,7 +7731,9 @@ import uuid
 
 AGENDA_URL = os.environ.get(
     "TNODE_AGENDA_URL",
-    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/agendaApi",
+    "https://us-central1-"
+    + os.environ.get("TNODE_PROJECT_ID", "tbrain-platform-7fc1f")
+    + ".cloudfunctions.net/agendaApi",
 )
 
 
@@ -7972,7 +7992,9 @@ import uuid
 
 DRIVE_URL = os.environ.get(
     "TNODE_DRIVE_URL",
-    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/driveReadApi",
+    "https://us-central1-"
+    + os.environ.get("TNODE_PROJECT_ID", "tbrain-platform-7fc1f")
+    + ".cloudfunctions.net/driveReadApi",
 )
 
 
@@ -8256,7 +8278,9 @@ import uuid
 
 POLL_URL = os.environ.get(
     "TNODE_POLL_URL",
-    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/pollApi",
+    "https://us-central1-"
+    + os.environ.get("TNODE_PROJECT_ID", "tbrain-platform-7fc1f")
+    + ".cloudfunctions.net/pollApi",
 )
 
 
@@ -8538,8 +8562,10 @@ import uuid  # noqa: E402
 
 from websockets.sync.client import connect as ws_connect  # noqa: E402
 
-PROJECT_ID = "tbrain-platform-7fc1f"
-FIREBASE_WEB_API_KEY = "AIzaSyCOybTP4r9J2bWXiJvXY0MQBFvaYDo_iWU"
+PROJECT_ID = os.environ.get("TNODE_PROJECT_ID", "tbrain-platform-7fc1f")
+FIREBASE_WEB_API_KEY = os.environ.get(
+    "TNODE_FIREBASE_WEB_API_KEY", "AIzaSyCOybTP4r9J2bWXiJvXY0MQBFvaYDo_iWU"
+)
 SCOPE = "sync_admin"
 
 
@@ -9443,7 +9469,7 @@ def _sync_tools_md_from_json(token: dict) -> None:
 # ── v1.1: compose vía CF + reflejo de canales + migración one-time ──
 TOOLS_SYNC_URL = os.environ.get(
     "TNODE_TOOLS_SYNC_URL",
-    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/tnodeConfigSyncTools",
+    f"https://us-central1-{PROJECT_ID}.cloudfunctions.net/tnodeConfigSyncTools",
 )
 _CHANNELS_HASH_PATH = OPENCLAW_DIR / ".tnode-channels-hash"
 _TOOLS_V11_SENTINEL = OPENCLAW_DIR / ".tnode-tools-v11-migrated"
@@ -9606,7 +9632,7 @@ def _migrate_tools_v11() -> None:
 # (OpenClaw los siembra) — solo renderizamos en archivos ya presentes.
 MD_SYNC_URL = os.environ.get(
     "TNODE_MD_SYNC_URL",
-    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/tnodeConfigSyncMd",
+    f"https://us-central1-{PROJECT_ID}.cloudfunctions.net/tnodeConfigSyncMd",
 )
 
 _MD_TARGETS = {
@@ -13325,6 +13351,7 @@ RestartSec=10
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 Environment=HOME=${TNODE_HOME}
 Environment=OPENCLAW_HOME=${OPENCLAW_HOME}
+EnvironmentFile=-/etc/tnode/env
 StandardOutput=append:${OPENCLAW_HOME}/logs/tnode-config-sync.out.log
 StandardError=append:${OPENCLAW_HOME}/logs/tnode-config-sync.err.log
 
@@ -13357,6 +13384,7 @@ Environment=HOME=${TNODE_HOME}
 Environment=OPENCLAW_HOME=${OPENCLAW_HOME}
 Environment=TNODE_CONFIG_SYNC_ONESHOT=1
 ExecStart=/usr/bin/env python3 ${OPENCLAW_HOME}/scripts/tnode_config_sync.py
+EnvironmentFile=-/etc/tnode/env
 StandardOutput=append:${OPENCLAW_HOME}/logs/tnode-config-sync-watch.out.log
 StandardError=append:${OPENCLAW_HOME}/logs/tnode-config-sync-watch.err.log
 SVCUNIT
@@ -13398,6 +13426,7 @@ Environment=HOME=${TNODE_HOME}
 Environment=OPENCLAW_HOME=${OPENCLAW_HOME}
 Environment=TNODE_CONFIG_SYNC_DRAIN=1
 ExecStart=/usr/bin/env python3 ${OPENCLAW_HOME}/scripts/tnode_config_sync.py
+EnvironmentFile=-/etc/tnode/env
 StandardOutput=append:${OPENCLAW_HOME}/logs/tnode-config-sync-wake.out.log
 StandardError=append:${OPENCLAW_HOME}/logs/tnode-config-sync-wake.err.log
 SVCUNIT
@@ -13532,7 +13561,7 @@ from __future__ import annotations
 #          live session, spawn tnode-config-sync DECL_ONESHOT to refresh the
 #          workspace .md (throttled, fire-and-forget). Replaces config-sync's
 #          Firestore poll → Document reads scale with sessions, not the clock.
-__VERSION__ = "1.28.0"
+__VERSION__ = "1.29.0"
 
 import hashlib
 import hmac
@@ -13551,7 +13580,13 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-FIREBASE_API_KEY_URL = "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net"
+# Per-environment project id (pre-prod/beta support). Default = prod so
+# existing nodes are unaffected; beta nodes get TNODE_PROJECT_ID via the
+# installer-written systemd Environment= line.
+PROJECT_ID = os.environ.get("TNODE_PROJECT_ID", "tbrain-platform-7fc1f")
+FUNCTIONS_BASE = f"https://us-central1-{PROJECT_ID}.cloudfunctions.net"
+
+FIREBASE_API_KEY_URL = FUNCTIONS_BASE
 # The web API key is public — it gates only anonymous signup/signin with a
 # Firebase customToken (which itself requires HMAC-signed mint). We fetch it
 # lazily once from a helper endpoint; if unavailable, fall back to the
@@ -13560,9 +13595,15 @@ FIREBASE_API_KEY_URL = "https://us-central1-tbrain-platform-7fc1f.cloudfunctions
 # Firebase API keys are designed to be public (they only identify the
 # project; auth still gates access). Using the iOS key is fine for REST
 # identitytoolkit calls from any environment.
+# Non-prod environments MUST ship their own key via either env var
+# (TNODE_FIREBASE_WEB_API_KEY is the cross-daemon name; the legacy
+# TNODE_CHAT_SYNC_WEB_API_KEY still wins if set).
 FIREBASE_WEB_API_KEY_FALLBACK = os.environ.get(
     "TNODE_CHAT_SYNC_WEB_API_KEY",
-    "AIzaSyCOybTP4r9J2bWXiJvXY0MQBFvaYDo_iWU",
+    os.environ.get(
+        "TNODE_FIREBASE_WEB_API_KEY",
+        "AIzaSyCOybTP4r9J2bWXiJvXY0MQBFvaYDo_iWU",
+    ),
 )
 
 # Endpoints used by the self-healing path. When `mintNodeToken` returns 404
@@ -13572,24 +13613,16 @@ FIREBASE_WEB_API_KEY_FALLBACK = os.environ.get(
 # from `getProvisionToken`, then trade it for a fresh nodeSecret at
 # `registerNodeSync`. The new secret overwrites the local config and the
 # next mint cycle picks up where it left off, no manual intervention.
-PROVISION_TOKEN_URL = (
-    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/getProvisionToken"
-)
-REGISTER_NODE_SYNC_URL = (
-    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/registerNodeSync"
-)
+PROVISION_TOKEN_URL = f"{FUNCTIONS_BASE}/getProvisionToken"
+REGISTER_NODE_SYNC_URL = f"{FUNCTIONS_BASE}/registerNodeSync"
 
 # Assistant file uploads (v1.10.0+) — the inverse of process_uploads. When
 # the agent writes `[adjunto: <path>]` in its turn text, we read the file,
 # negotiate a signed PUT URL with `prepareAssistantFile`, upload, then
 # `confirmAssistantFile` flips the doc to `uploaded` and we rewrite the
 # marker as `[archivo:{attachmentId}]` before persisting to chats/.
-PREPARE_ASSISTANT_FILE_URL = (
-    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/prepareAssistantFile"
-)
-CONFIRM_ASSISTANT_FILE_URL = (
-    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/confirmAssistantFile"
-)
+PREPARE_ASSISTANT_FILE_URL = f"{FUNCTIONS_BASE}/prepareAssistantFile"
+CONFIRM_ASSISTANT_FILE_URL = f"{FUNCTIONS_BASE}/confirmAssistantFile"
 # Hard cap (mirrors server-side MAX_BYTES). Agents that try to attach a
 # 200MB log get a friendly "[adjunto-error: too-large]" rewrite instead.
 ASSISTANT_FILE_MAX_BYTES = 50 * 1024 * 1024
@@ -16701,8 +16734,8 @@ def main() -> int:
         _log(f"config error: {e}")
         return 2
 
-    # Project id is derived from the mintUrl hostname.
-    project_id = "tbrain-platform-7fc1f"
+    # Per-environment project id (TNODE_PROJECT_ID; default prod).
+    project_id = PROJECT_ID
 
     sessions_dirs = resolve_all_sessions_dirs()
     _log("watching " + ", ".join(str(d) for d in sessions_dirs))
@@ -17315,6 +17348,7 @@ RestartSec=10
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 Environment=HOME=${TNODE_HOME}
 Environment=OPENCLAW_HOME=${OPENCLAW_HOME}
+EnvironmentFile=-/etc/tnode/env
 StandardOutput=append:${OPENCLAW_HOME}/logs/tnode-chat-sync.out.log
 StandardError=append:${OPENCLAW_HOME}/logs/tnode-chat-sync.err.log
 
@@ -17376,6 +17410,7 @@ Environment=OPENCLAW_HOME=${OPENCLAW_HOME}
 Environment=TNODE_TELEMETRY_HOST=127.0.0.1
 Environment=TNODE_TELEMETRY_PORT=18790
 Environment=TNODE_TELEMETRY_UPSTREAM=ws://127.0.0.1:18789
+EnvironmentFile=-/etc/tnode/env
 StandardOutput=append:${OPENCLAW_HOME}/logs/tnode-telemetry.out.log
 StandardError=append:${OPENCLAW_HOME}/logs/tnode-telemetry.err.log
 
@@ -17456,7 +17491,7 @@ from __future__ import annotations
 #          mtime (stat local, gratis) y mantiene sus polls de Firestore en
 #          cadencia rápida solo mientras el archivo esté fresco. Sin
 #          clientes → sin touch → chat-sync cae a backstops idle.
-__VERSION__ = "1.18.0"
+__VERSION__ = "1.19.0"
 
 import argparse
 import asyncio
@@ -18674,12 +18709,12 @@ _STORAGE_MAX_LIST = 500
 # up-front so the user sees a clear error instead of a generic HTTP 400.
 _STORAGE_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024
 # CF endpoints (same constants as chat-sync; redefined here to avoid a
-# cross-daemon import).
+# cross-daemon import). Per-environment via PROJECT_ID (TNODE_PROJECT_ID).
 _PREPARE_ASSISTANT_FILE_URL = (
-    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/prepareAssistantFile"
+    f"https://us-central1-{PROJECT_ID}.cloudfunctions.net/prepareAssistantFile"
 )
 _CONFIRM_ASSISTANT_FILE_URL = (
-    "https://us-central1-tbrain-platform-7fc1f.cloudfunctions.net/confirmAssistantFile"
+    f"https://us-central1-{PROJECT_ID}.cloudfunctions.net/confirmAssistantFile"
 )
 _STORAGE_DOWNLOAD_TIMEOUT_SEC = 30
 _STORAGE_DOWNLOAD_PUT_TIMEOUT_SEC = 120
@@ -20995,6 +21030,33 @@ cmd_component() {
 # ═════════════════════════════════════════════
 # MAIN
 # ═════════════════════════════════════════════
+# ═════════════════════════════════════════════
+# Entorno TNode (pre-prod/beta)
+# ═════════════════════════════════════════════
+# Persiste la selección de entorno para que TODOS los procesos on-node la
+# hereden: las units systemd de los daemons (EnvironmentFile=) y el gateway
+# user-level (drop-in — el CLI de openclaw es dueño de la unit; el drop-in
+# compone sin pelearse con él, mismo patrón que cloudflared restart-always).
+# Con los defaults de prod esto es un no-op para nodos existentes.
+configure_tnode_environment() {
+    mkdir -p /etc/tnode
+    cat > /etc/tnode/env <<TNODEENV
+TNODE_PROJECT_ID=${TNODE_PROJECT_ID}
+TNODE_TUNNEL_API=${TNODE_TUNNEL_API}
+TNODE_FIREBASE_WEB_API_KEY=${TNODE_FIREBASE_WEB_API_KEY:-}
+TNODEENV
+    chmod 0644 /etc/tnode/env
+
+    local dropin_dir="${TNODE_HOME}/.config/systemd/user/openclaw-gateway.service.d"
+    mkdir -p "$dropin_dir"
+    cat > "$dropin_dir/tnode-env.conf" <<'DROPIN'
+[Service]
+EnvironmentFile=-/etc/tnode/env
+DROPIN
+    chown -R "$TNODE_USER":"$TNODE_USER" "${TNODE_HOME}/.config" 2>/dev/null || true
+    success "entorno TNode → /etc/tnode/env (project ${TNODE_PROJECT_ID})"
+}
+
 main() {
     parse_args "$@"
 
@@ -21036,6 +21098,7 @@ main() {
     fi
 
     phase_validate
+    configure_tnode_environment
     if [[ "$UPDATE_ONLY" == "0" ]]; then
         # Full install path
         if [[ "$BAKED_FAST_PATH" == "0" ]]; then
