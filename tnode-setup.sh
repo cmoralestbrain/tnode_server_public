@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.76.0"
+TNODE_SETUP_VERSION="1.77.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -5876,7 +5876,12 @@ from __future__ import annotations
 #          gana estampa `enviado` en momento 2 + MOMENTO 3 (decisión del
 #          proveedor → estampar resultado + pending.json), y
 #          _t_inventory_flow lee con el skill inventario (no drive).
-__VERSION__ = "1.51.0"
+# 1.52.0 — _ensure_heartbeat_default en el self-heal de arranque: persiste
+#          agents.defaults.heartbeat.every="0m" si la key está AUSENTE (el
+#          default 30m del core re-manda todo el contexto al LLM cada poll —
+#          leak de saldo; incidente Oracle Front 2026-07-13). Valor explícito
+#          se respeta.
+__VERSION__ = "1.52.0"
 
 import hashlib
 import hmac
@@ -6553,6 +6558,32 @@ def _ensure_model_registered(cfg: dict, model_slug: str) -> bool:
         changed = True
 
     return changed
+
+
+def _ensure_heartbeat_default() -> None:
+    """OpenClaw trae heartbeat con DEFAULT 30m aunque el config no tenga la
+    key — cada poll re-manda TODO el contexto de la sesión al LLM y en nodos
+    con OpenRouter de paga es un leak de saldo silencioso (2026-07-13: el
+    Oracle Front de Félix quemó su saldo COMPLETO en 2 semanas de polls; el
+    heartbeat en TNode no aporta — chat-sync + tnode-wake ya cubren entrega).
+    Se persiste APAGADO (`agents.defaults.heartbeat.every: "0m"`). Solo si la
+    key está AUSENTE: un valor explícito (dueño o feature futura de
+    proactividad) se respeta. Requiere restart del gateway para aplicar, que
+    en un nodo fresco ocurre naturalmente en el arranque."""
+    try:
+        cfg = json.loads(OPENCLAW_JSON_PATH.read_text())
+        hb = (
+            cfg.setdefault("agents", {})
+            .setdefault("defaults", {})
+            .setdefault("heartbeat", {})
+        )
+        if "every" in hb:
+            return
+        hb["every"] = "0m"
+        _write_openclaw_json(cfg)
+        _log("heartbeat: default 0m persistido (agents.defaults.heartbeat.every)")
+    except Exception as e:  # noqa: BLE001
+        _log(f"heartbeat default: {e}")
 
 
 def _write_openclaw_json(cfg: dict) -> None:
@@ -13527,6 +13558,7 @@ def _run_startup_self_heal() -> bool:
         _ensure_workspace_dirs()
         _ensure_workspace_skills()
         _ensure_guest_agent()
+        _ensure_heartbeat_default()
     except PermissionError as e:
         _log(f"self-heal deferred (boot race, will retry): {e}")
         return False
@@ -14002,7 +14034,13 @@ from __future__ import annotations
 #          live session, spawn tnode-config-sync DECL_ONESHOT to refresh the
 #          workspace .md (throttled, fire-and-forget). Replaces config-sync's
 #          Firestore poll → Document reads scale with sessions, not the clock.
-__VERSION__ = "1.29.0"
+# 1.30.0 — espejo de grupos WA DETECTADOS: al tailear turnos de sesiones
+#          whatsapp:group:* se extraen conversation_label (JID) +
+#          group_subject (nombre) del bloque "Conversation info" y se
+#          upsertea channels/whatsapp.detectedGroups.{jid}={name,lastSeenAt}
+#          (throttle 6h/nombre). Alimenta el picker de grupos por NOMBRE del
+#          app (el usuario nunca ve JIDs). Ver architecture WA v1.5.
+__VERSION__ = "1.30.0"
 
 import hashlib
 import hmac
@@ -14017,6 +14055,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -16739,6 +16778,58 @@ def _now_ts_value() -> dict:
     }
 
 
+# ── WA groups: espejo de grupos DETECTADOS (picker sin JIDs) ─────────────
+# Cuando el canal WhatsApp deja pasar un mensaje de grupo, la línea de
+# sesión/trayectoria trae el bloque "Conversation info" con
+# conversation_label (el JID @g.us) y group_subject (el NOMBRE del grupo).
+# Se espeja {jid: {name, lastSeenAt}} a channels/whatsapp.detectedGroups
+# para que el app pinte el selector de grupos por NOMBRE — el usuario nunca
+# ve un JID (feature WA v1.5, diseño 2026-07-14). Los regex toleran el JSON
+# escapado (trajectory) y el crudo (legacy jsonl). Throttle en memoria:
+# write solo si el nombre cambió o pasaron >6 h desde el último.
+_WA_GROUP_JID_RE = re.compile(r'conversation_label\\?":\s*\\?"([0-9][0-9-]*@g\.us)')
+_WA_GROUP_SUBJECT_RE = re.compile(r'group_subject\\?":\s*\\?"([^"\\]+)')
+_WA_GROUP_REWRITE_S = 6 * 3600.0
+
+
+def detect_wa_group(line: str, token: dict, project_id: str, state: dict) -> None:
+    """Best-effort: nunca interrumpe el tail loop (cualquier fallo se loguea
+    y se sigue)."""
+    try:
+        m_jid = _WA_GROUP_JID_RE.search(line)
+        if not m_jid:
+            return
+        jid = m_jid.group(1)
+        m_sub = _WA_GROUP_SUBJECT_RE.search(line)
+        name = (m_sub.group(1).strip() if m_sub else "") or jid
+        cache = state.setdefault("wa_groups", {})
+        prev = cache.get(jid)
+        now = time.time()
+        if prev and prev[0] == name and (now - prev[1]) < _WA_GROUP_REWRITE_S:
+            return
+        parent = (
+            f"projects/{project_id}/databases/(default)/documents"
+            f"/users/{token['uid']}/nodes/{token['nodeId']}/channels/whatsapp"
+        )
+        # Field path con backticks: el JID trae `.`/`@` (segmento literal).
+        mask = urllib.parse.quote(f"detectedGroups.`{jid}`", safe="")
+        url = f"https://firestore.googleapis.com/v1/{parent}?updateMask.fieldPaths={mask}"
+        body = {
+            "fields": {
+                "detectedGroups": {"mapValue": {"fields": {jid: {"mapValue": {"fields": {
+                    "name": {"stringValue": name[:120]},
+                    "lastSeenAt": _now_ts_value(),
+                }}}}}},
+            }
+        }
+        headers = {"Authorization": f"Bearer {token['idToken']}"}
+        _http_patch_json(url, body, headers)
+        cache[jid] = (name, now)
+        _log(f"wa-groups: detected '{name}' ({jid})")
+    except Exception as e:  # noqa: BLE001
+        _log(f"wa-groups: {e}")
+
+
 def _gateway_send_pending(items: list) -> tuple[list, str | None]:
     """Inject pending user messages into the local gateway over one
     ephemeral WS connection (challenge → connect → chat.send per item).
@@ -17467,6 +17558,10 @@ def main() -> int:
                 hot_until = max(
                     hot_until, time.time() + OUTBOX_TAIL_HOT_S
                 )
+                # Grupos de WA detectados (picker por nombre): gate barato en
+                # el substring antes de pagar los regex.
+                if token is not None and "group_subject" in line:
+                    detect_wa_group(line, token, project_id, outbox_state)
                 entry = parse_line(line)
                 if entry is None:
                     continue
