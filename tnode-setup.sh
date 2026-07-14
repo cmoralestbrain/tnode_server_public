@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.75.0"
+TNODE_SETUP_VERSION="1.76.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -4870,6 +4870,40 @@ if [[ -z "$SETUP_CODE" ]]; then
     exit 1
 fi
 
+# ── Elevar el bootstrap profile del owner a full-operator ──
+# `openclaw qr` (core) hornea el profile con solo [approvals, read,
+# write]; sin operator.admin/operator.pairing el device token del owner
+# nace sub-scopeado y los RPC admin-gated (web.login.*, channels.logout,
+# config.patch) mueren con scope_mismatch. El gateway lee bootstrap.json
+# de disco al redimir, así que basta parchar las entries emitidas antes
+# de escanear (el swap de URL no toca el profile).
+if ! python3 -c "
+import json, os, sys
+path = sys.argv[1]
+FULL = ['operator.admin', 'operator.approvals', 'operator.pairing',
+        'operator.read', 'operator.write']
+with open(path) as f:
+    data = json.load(f)
+changed = False
+for entry in data.values():
+    prof = entry.get('profile') if isinstance(entry, dict) else None
+    if not isinstance(prof, dict):
+        continue
+    scopes = prof.get('scopes') or []
+    missing = [s for s in FULL if s not in scopes]
+    if missing:
+        prof['scopes'] = scopes + missing
+        changed = True
+if changed:
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+" "$HOME/.openclaw/devices/bootstrap.json" 2>/dev/null; then
+    echo "Advertencia: no se pudo elevar el bootstrap profile a operator.admin" >&2
+    echo "El pareo funcionará, pero los RPC admin (WhatsApp/canales) quedarán bloqueados" >&2
+fi
+
 # Swap URL using Python (stdlib base64 + json)
 NEW_CODE=$(python3 -c "
 import base64, json, sys
@@ -5834,7 +5868,15 @@ from __future__ import annotations
 #          markers; también limpia el caso user-sin-perfil). Sin data sembrada, el
 #          core queda idéntico a 1.46.0. AI-suggest CF + app Flutter = fuera de este
 #          backend (se testea sembrando Firestore a mano).
-__VERSION__ = "1.50.0"
+# 1.51.0 — P5 resurtido: (a) embed skill `inventario` 1.0.0 en
+#          _ensure_workspace_skills: leer (sheet→JSON) + estampar (tracking
+#          ORDEN/ESTADO/FECHA/COMENTARIO derivado del doc approvals), thin
+#          client de la CF inventoryApi (HMAC inventory_*); (b) TOOLS.md v3
+#          en el compositor on-node (espejo de tools_sync.ts): _T_APPROVAL
+#          gana estampa `enviado` en momento 2 + MOMENTO 3 (decisión del
+#          proveedor → estampar resultado + pending.json), y
+#          _t_inventory_flow lee con el skill inventario (no drive).
+__VERSION__ = "1.51.0"
 
 import hashlib
 import hmac
@@ -8949,6 +8991,216 @@ def main() -> int:
 if __name__ == "__main__":
     sys.exit(main())
 '''
+
+_INVENTARIO_SKILL_MD = r'''# inventario
+
+Herramienta del **flujo de resurtido**: lee el Google Sheet del
+inventario del dueño (ya parseado a JSON) y **estampa el tracking** de
+una orden de resurtido en el sheet (columnas ORDEN / ESTADO / FECHA
+AUTORIZACION / COMENTARIO). Para el inventario usa SIEMPRE este skill —
+no el skill `drive`.
+
+## Cuándo usarlo
+
+- Al **revisar el inventario** (corrida programada o pregunta del dueño):
+  `leer` te da las filas frescas para aplicar la regla de resurtido.
+- **Después de enviar una orden** a un proveedor (`guest_send` con
+  `approvalId`): `estampar --fase enviado`.
+- **Cuando el proveedor decide** (te llega un mensaje "PROVEEDOR …
+  ACEPTÓ/RECHAZÓ la orden …"): `estampar --fase resultado`.
+
+## Cómo invocar
+
+```bash
+SKILL=~/.openclaw/workspace/skills/inventario/bin/inventario.py
+
+python3 $SKILL leer                                    # filas del sheet en JSON
+python3 $SKILL leer --sheet INVENTARIO                 # otro nombre de sheet
+python3 $SKILL estampar --orden <approvalId> --fase enviado
+python3 $SKILL estampar --orden <approvalId> --fase resultado
+```
+
+## Reglas
+
+1. **`leer` SIEMPRE descarga el sheet fresco.** Nunca contestes sobre el
+   inventario con datos de una lectura anterior de la conversación.
+2. **`estampar` no recibe valores** — el servidor los deriva del registro
+   de la autorización (`approvalId`). Tú solo das el id y la fase; no
+   inventes códigos, fechas ni estados.
+3. `--fase resultado` solo funciona cuando el proveedor ya decidió; si
+   regresa `supplier_not_decided`, la decisión aún no llega — no la
+   inventes.
+4. Si regresa `notFound` con alguna línea, repórtalo al dueño tal cual
+   (la fila ya no existe en el sheet con ese PRODUCTO+SUCURSAL).
+'''
+
+_INVENTARIO_MANIFEST = r'''{
+  "name": "inventario",
+  "version": "1.0.0",
+  "type": "openclaw-skill",
+  "entrypoint": "SKILL.md"
+}
+'''
+
+_INVENTARIO_PY = r'''#!/usr/bin/env python3
+"""inventario — lee el sheet del inventario y estampa el tracking de órdenes.
+
+__VERSION__ = "1.0.0"
+
+Thin client del endpoint `inventoryApi` (Cloud Function, HMAC con el
+nodeSecret de tnode-chat-sync.json; la firma es
+`nodeId:ts:nonce:<action>` con actions ya namespaced `inventory_*`,
+patrón approvalApi). Transporte `curl` via subprocess: urllib falla TLS
+en el python de sistema de macOS (gotcha conocido) y curl existe en toda
+la flota (Mac/Linux).
+
+Las dos operaciones son 100% DETERMINISTAS — aquí no hay reglas de
+negocio (esas viven en el prompt del agente):
+  leer     → el server localiza el Google Sheet en la carpeta compartida
+             del dueño y regresa las filas YA PARSEADAS a JSON.
+  estampar → el server deriva ORDEN/ESTADO/FECHA/COMENTARIO del registro
+             de la autorización (fuente de verdad) y escribe SOLO esas
+             celdas en las filas de la orden. El agente aporta únicamente
+             el approvalId y la fase.
+
+Salida: JSON a stdout. Exit 0 en ok, 1 en error (el JSON de error también
+va a stdout porque trae información accionable).
+
+Uso:
+  inventario.py leer [--sheet <nombre>]
+  inventario.py estampar --orden <approvalId> --fase enviado|resultado [--sheet <nombre>]
+"""
+
+import argparse
+import datetime as dt
+import hashlib
+import hmac
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import uuid
+
+INVENTORY_URL = os.environ.get(
+    "TNODE_INVENTORY_URL",
+    "https://us-central1-"
+    + os.environ.get("TNODE_PROJECT_ID", "tbrain-platform-7fc1f")
+    + ".cloudfunctions.net/inventoryApi",
+)
+
+_FASE_MAP = {"enviado": "sent", "resultado": "result"}
+
+
+def _openclaw_home() -> pathlib.Path:
+    home = os.environ.get("OPENCLAW_HOME")
+    return pathlib.Path(home) if home else pathlib.Path.home() / ".openclaw"
+
+
+def _config_path() -> pathlib.Path:
+    return _openclaw_home() / "tnode-chat-sync.json"
+
+
+def _load_auth() -> tuple[str, str]:
+    path = _config_path()
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        _die(f"config_not_found: {path}")
+    except json.JSONDecodeError:
+        _die(f"config_invalid_json: {path}")
+    node_id = data.get("nodeId")
+    node_secret = data.get("nodeSecret")
+    if not node_id or not node_secret:
+        _die(f"config_missing_fields: {path}")
+    return node_id, node_secret
+
+
+def _die(msg: str) -> None:
+    print(json.dumps({"error": msg}))
+    sys.exit(1)
+
+
+def _signed_body(action: str, params: dict) -> str:
+    node_id, node_secret = _load_auth()
+    ts = str(int(dt.datetime.now().timestamp() * 1000))
+    nonce = uuid.uuid4().hex
+    signature = hmac.new(
+        node_secret.encode(),
+        f"{node_id}:{ts}:{nonce}:{action}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return json.dumps({
+        "action": action,
+        "nodeId": node_id,
+        "timestamp": ts,
+        "nonce": nonce,
+        "signature": signature,
+        "params": params,
+    })
+
+
+def _call_json(action: str, params: dict) -> None:
+    body = _signed_body(action, params)
+    try:
+        proc = subprocess.run(
+            [
+                "curl", "-sS", "-X", "POST",
+                "-H", "Content-Type: application/json",
+                "--max-time", "45",
+                "-d", "@-",
+                INVENTORY_URL,
+            ],
+            input=body.encode(),
+            capture_output=True,
+            timeout=60,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        _die(f"transport_error: {e}")
+    out = proc.stdout.decode().strip()
+    if proc.returncode != 0:
+        _die(f"curl_failed: {proc.stderr.decode().strip()[:200]}")
+    if not out:
+        _die("empty_response")
+    print(out)
+    try:
+        parsed = json.loads(out)
+    except json.JSONDecodeError:
+        sys.exit(1)
+    sys.exit(0 if parsed.get("ok") else 1)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="inventario.py")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_leer = sub.add_parser("leer")
+    p_leer.add_argument("--sheet", default=None, help="nombre del sheet (default INVENTARIO)")
+
+    p_est = sub.add_parser("estampar")
+    p_est.add_argument("--orden", required=True, dest="approval_id",
+                       help="approvalId de la autorización (ap_…)")
+    p_est.add_argument("--fase", required=True, choices=sorted(_FASE_MAP),
+                       help="enviado (tras mandar la orden) | resultado (tras decidir el proveedor)")
+    p_est.add_argument("--sheet", default=None, help="nombre del sheet (default INVENTARIO)")
+
+    args = ap.parse_args()
+
+    if args.cmd == "leer":
+        params: dict = {}
+        if args.sheet:
+            params["sheetName"] = args.sheet
+        _call_json("inventory_read", params)
+    elif args.cmd == "estampar":
+        params = {"approvalId": args.approval_id, "phase": _FASE_MAP[args.fase]}
+        if args.sheet:
+            params["sheetName"] = args.sheet
+        _call_json("inventory_stamp", params)
+
+
+if __name__ == "__main__":
+    main()
+'''
 # <<< END EMBEDDED WORKSPACE SKILLS
 
 
@@ -9060,7 +9312,8 @@ def _ensure_workspace_skill(name: str, files: dict) -> None:
 
 
 def _ensure_workspace_skills() -> None:
-    """agenda + drive + poll + tnode-delegate on every node (startup self-heal)."""
+    """agenda + drive + poll + tnode-delegate + inventario on every node
+    (startup self-heal)."""
     _ensure_workspace_skill("agenda", {
         "SKILL.md": _AGENDA_SKILL_MD,
         "manifest.json": _AGENDA_MANIFEST,
@@ -9080,6 +9333,11 @@ def _ensure_workspace_skills() -> None:
         "SKILL.md": _TNODE_DELEGATE_SKILL_MD,
         "manifest.json": _TNODE_DELEGATE_MANIFEST,
         "bin/tnode-delegate.py": _TNODE_DELEGATE_PY,
+    })
+    _ensure_workspace_skill("inventario", {
+        "SKILL.md": _INVENTARIO_SKILL_MD,
+        "manifest.json": _INVENTARIO_MANIFEST,
+        "bin/inventario.py": _INVENTARIO_PY,
     })
 
 
@@ -11117,10 +11375,27 @@ una conversación NUEVA que no recuerda la solicitud), como mensaje del dueño
    approvalId=<id>, y el mensaje con productos y cantidades + "Código de
    autorización: <código>. Coteja el código antes de surtir; una orden sin
    código válido no fue autorizada."
+   Si la orden es del INVENTARIO (está en inventory/pending.json), justo
+   después del guest_send estampa el tracking en el sheet:
+   exec: python3 ~/.openclaw/workspace/skills/inventario/bin/inventario.py estampar --orden <id> --fase enviado
 4. RECHAZÓ → NO ejecutes nada; guarda el comentario del dueño en el estado.
 5. Actualiza la orden en tu estado (aprobada/enviada o rechazada) y confirma
    brevemente al dueño lo que hiciste. La decisión del dueño ES la
    confirmación: no pidas permiso adicional para ejecutarla.
+
+MOMENTO 3 — el PROVEEDOR decide (solo órdenes a proveedores): después te
+llegará un mensaje "PROVEEDOR <proveedor> ACEPTÓ la orden <id> · orden
+proveedor <ORD-…> · comentario: <c>" (o "… RECHAZÓ la orden <id> …"). Al
+recibirlo haz esto, en orden y SIN pedir confirmación:
+1. Estampa el resultado en el sheet (los valores los deriva el servidor del
+   registro de la autorización — tú NO los aportas):
+   exec: python3 ~/.openclaw/workspace/skills/inventario/bin/inventario.py estampar --orden <id> --fase resultado
+2. Actualiza la orden en inventory/pending.json: status "confirmada" (aceptó)
+   o "rechazada_proveedor" (rechazó), guardando el id de orden del proveedor
+   y su comentario si vienen en el mensaje.
+3. Confirma brevemente al dueño (p. ej. "<proveedor> confirmó la orden
+   <ORD-…>; entrega: <comentario>"). Si el estampado regresa
+   supplier_not_decided, espera: la decisión aún no está registrada.
 
 El código de autorización SOLO existe cuando el dueño ya aprobó — nunca lo
 inventes, calcules ni prometas antes. Solicitar autorización NO es
@@ -11215,15 +11490,19 @@ El resurtido corre SOLO: un proceso automático revisa el INVENTARIO cada
 {every_minutes} min y, cuando algo baja del límite, pide autorización al dueño
 con una tarjeta en su chat. Tu papel en el CHAT es complementarlo:
 
-1. Si el dueño pregunta por inventario o resurtido, SIEMPRE re-descarga el
-   archivo INVENTARIO de Drive (skill drive) antes de responder — NUNCA uses
-   copias o datos previos de la conversación, pueden estar viejos.
+1. Si el dueño pregunta por inventario o resurtido, SIEMPRE lee el sheet
+   FRESCO con el skill inventario antes de responder — NUNCA uses copias o
+   datos previos de la conversación, pueden estar viejos:
+   exec: python3 ~/.openclaw/workspace/skills/inventario/bin/inventario.py leer
+   Regresa las filas en JSON (incluye el tracking ORDEN/ESTADO/FECHA). Para
+   el inventario usa este skill, NO el skill drive.
 2. El estado de las solicitudes vive en inventory/pending.json — consúltalo
-   para responder qué está pendiente, aprobado o enviado.
+   para responder qué está pendiente, aprobado, enviado o confirmado.
 3. Cuando llegue la decisión del dueño ("APRUEBO la orden <id>…" / "RECHAZO
    la orden <id>…"), ejecuta el MOMENTO 2 de la regla de autorización DE
    INMEDIATO y sin pedir confirmación adicional — la decisión del dueño ES la
-   confirmación.
+   confirmación. Cuando llegue la del proveedor ("PROVEEDOR … la orden …"),
+   ejecuta el MOMENTO 3 igual de inmediato.
 4. NO crees crons de inventario por tu cuenta ni dupliques solicitudes que ya
    están esperando autorización: el proceso automático ya existe."""
 
