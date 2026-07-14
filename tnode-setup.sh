@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.78.0"
+TNODE_SETUP_VERSION="1.79.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -6645,7 +6645,17 @@ from __future__ import annotations
 #          backfill de projectId/webApiKey en tnode-chat-sync.json desde
 #          /etc/tnode/env para que los plugins del gateway no dependan de
 #          sus fallbacks (CREDENTIAL_MISMATCH beta, mismo incidente).
-__VERSION__ = "1.53.0"
+# 1.54.0 — apply_openrouter_key: en PRIMERA activación (sin key previa en
+#          openclaw.json) el done ya no confía en el file-watcher del
+#          gateway — en el nodo 3e549d66 (2026-07-14) el watcher murió
+#          silencioso: key escrita y viva, cero "config hot reload applied"
+#          en todo el log, y el primer turno arrancó sin provider ("No API
+#          key found for provider openai"). Ahora: restart determinista del
+#          gateway (_restart_gateway_blocking: systemctl --user → CLI
+#          fallback → espera puerto 18789 + settle) antes del done. Los
+#          top-ups/rotaciones siguen por hot-reload (hay sesiones vivas que
+#          preservar y la key vieja sigue válida).
+__VERSION__ = "1.54.0"
 
 import hashlib
 import hmac
@@ -6655,6 +6665,7 @@ import platform
 import re
 import secrets as py_secrets
 import shutil
+import socket
 import signal
 import subprocess
 import sys
@@ -7645,12 +7656,56 @@ def handle_detect_local_models(token: dict, params: dict) -> dict:
     }
 
 
+def _restart_gateway_blocking(timeout_s: float = 45.0) -> bool:
+    """Reinicia el gateway y espera a que el puerto 18789 vuelva a aceptar
+    conexiones. Camino: systemctl --user (unit openclaw-gateway) → fallback
+    CLI `openclaw gateway restart` (que a su vez trae el fallback de spawn
+    manual para VPS sin bus). Usado en la PRIMERA activación de key, donde
+    el hot-reload por file-watcher demostró no ser confiable."""
+    r = subprocess.run(
+        ["systemctl", "--user", "restart", "openclaw-gateway"],
+        capture_output=True, text=True, check=False, env=_cli_env(),
+    )
+    if r.returncode != 0:
+        _log(
+            "gateway restart via systemctl failed "
+            f"({(r.stderr or '').strip()[:120]}); CLI fallback"
+        )
+        _run_openclaw("gateway", "restart", timeout=60)
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", 18789), timeout=2):
+                # Colchón corto: el puerto abre antes de que el pre-warm de
+                # providers termine (~10s medidos); dale aire al runtime.
+                time.sleep(8)
+                return True
+        except OSError:
+            time.sleep(2)
+    _log("gateway restart: port 18789 not up within timeout")
+    return False
+
+
 def handle_apply_openrouter_key(token: dict, params: dict) -> dict:
     """Fetch the provisioned OpenRouter key via pullLLMConfig (legacy HMAC)
     and apply it to openclaw.json. The key must already have been minted
     by the Flutter app calling the `mintNodeKey` callable.
     """
     cfg = load_config()
+
+    # ¿Primera activación? Leído ANTES de escribir: si openclaw.json aún no
+    # tiene key de openrouter, no hay sesiones vivas que preservar y el done
+    # se garantiza con un restart del gateway (ver changelog 1.54.0).
+    first_activation = True
+    try:
+        _prev_cfg = json.loads((OPENCLAW_DIR / "openclaw.json").read_text())
+        first_activation = not bool(
+            ((_prev_cfg.get("models") or {}).get("providers") or {})
+            .get("openrouter", {})
+            .get("apiKey")
+        )
+    except Exception:  # noqa: BLE001 — sin archivo = primera activación
+        first_activation = True
     pull_url = cfg.get("pullLLMConfigUrl") or (
         f"https://us-central1-{PROJECT_ID}.cloudfunctions.net/pullLLMConfig"
     )
@@ -7767,17 +7822,28 @@ def handle_apply_openrouter_key(token: dict, params: dict) -> dict:
     waited_s = int(time.time() - probe_started)
     _log(f"apply_openrouter_key: keyLive={key_live} after {waited_s}s")
 
-    # Colchón del hot-reload: el file-watcher del gateway tarda ~10s en
-    # aplicar el openclaw.json nuevo (medido en gateway log: write 09:16:33 →
-    # `hot reload applied (models)` 09:16:43, E2E beta 2026-07-12). Si el
-    # probe de liveness regresó al instante, un `done` inmediato suelta el
-    # mensaje retenido DENTRO de esa ventana y el turno arranca con la config
-    # vieja ("No API key found for provider openai"). Garantiza ≥15s entre el
-    # write y el done.
-    reload_cushion = 15 - (time.time() - applied_at)
-    if reload_cushion > 0:
-        _log(f"apply_openrouter_key: hot-reload cushion {reload_cushion:.0f}s")
-        time.sleep(reload_cushion)
+    applied_via = "hot-reload"
+    if first_activation:
+        # PRIMERA activación: el file-watcher del gateway puede morir
+        # silencioso (nodo 3e549d66, 2026-07-14: key escrita y viva, cero
+        # reloads en el log, primer turno sin provider). Restart determinista:
+        # barato (no hay sesiones vivas) y el cliente retiene el primer
+        # mensaje hasta este done.
+        applied_via = "gateway-restart"
+        _log("apply_openrouter_key: first activation — restarting gateway")
+        if not _restart_gateway_blocking():
+            applied_via = "gateway-restart-timeout"
+    else:
+        # Re-asignación/top-up: hot-reload (la key vieja sigue válida durante
+        # la rotación; un restart dropearía WS vivos). Colchón: el
+        # file-watcher tarda ~10s en aplicar el openclaw.json nuevo (medido
+        # E2E beta 2026-07-12). Garantiza ≥15s entre el write y el done.
+        reload_cushion = 15 - (time.time() - applied_at)
+        if reload_cushion > 0:
+            _log(
+                f"apply_openrouter_key: hot-reload cushion {reload_cushion:.0f}s"
+            )
+            time.sleep(reload_cushion)
 
     try:
         new_state = push_openclaw_config(token)
@@ -7790,7 +7856,7 @@ def handle_apply_openrouter_key(token: dict, params: dict) -> dict:
         "result": {
             "provider": "openrouter",
             "model": model,
-            "applied": "hot-reload",
+            "applied": applied_via,
             "llmMode": (new_state or {}).get("llmMode"),
             "keyLive": key_live,
             "keyLiveWaitS": waited_s,
