@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.79.0"
+TNODE_SETUP_VERSION="1.80.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -6655,7 +6655,7 @@ from __future__ import annotations
 #          fallback → espera puerto 18789 + settle) antes del done. Los
 #          top-ups/rotaciones siguen por hot-reload (hay sesiones vivas que
 #          preservar y la key vieja sigue válida).
-__VERSION__ = "1.54.0"
+__VERSION__ = "1.56.0"
 
 import hashlib
 import hmac
@@ -12351,28 +12351,122 @@ Reporta el error TAL CUAL a quien te lo pidió y detente ahí. NUNCA uses otra
 cuenta o método de correo como "fallback"."""
 
 
-def _t_inventory_flow(every_minutes: int) -> str:
-    return f"""## Regla: flujo de inventario y resurtido (dueño)
+# W5: _t_inventory_flow se ELIMINÓ — espejo de tools_sync.ts (el flujo de
+# inventario se rinde desde su workflowDefinition).
 
-El resurtido corre SOLO: un proceso automático revisa el INVENTARIO cada
-{every_minutes} min y, cuando algo baja del límite, pide autorización al dueño
-con una tarjeta en su chat. Tu papel en el CHAT es complementarlo:
 
-1. Si el dueño pregunta por inventario o resurtido, SIEMPRE lee el sheet
-   FRESCO con el skill inventario antes de responder — NUNCA uses copias o
-   datos previos de la conversación, pueden estar viejos:
-   exec: python3 ~/.openclaw/workspace/skills/inventario/bin/inventario.py leer
-   Regresa las filas en JSON (incluye el tracking ORDEN/ESTADO/FECHA). Para
-   el inventario usa este skill, NO el skill drive.
-2. El estado de las solicitudes vive en inventory/pending.json — consúltalo
-   para responder qué está pendiente, aprobado, enviado o confirmado.
-3. Cuando llegue la decisión del dueño ("APRUEBO la orden <id>…" / "RECHAZO
-   la orden <id>…"), ejecuta el MOMENTO 2 de la regla de autorización DE
-   INMEDIATO y sin pedir confirmación adicional — la decisión del dueño ES la
-   confirmación. Cuando llegue la del proveedor ("PROVEEDOR … la orden …"),
-   ejecuta el MOMENTO 3 igual de inmediato.
-4. NO crees crons de inventario por tu cuenta ni dupliques solicitudes que ya
-   están esperando autorización: el proceso automático ya existe."""
+# ── TNode Workflows (architecture_tnode_workflows.md) ──
+# ⚠️ BYTE-IGUAL con STATIC_WORKFLOW / workflowBlockText de tools_sync.ts —
+# mismo contrato de dos lugares que _T_APPROVAL (el nodo compone TOOLS.md
+# LOCAL; editar solo la CF no llega aquí y viceversa).
+_T_WORKFLOW = """## Regla de plataforma: flujos de trabajo declarados (workflows)
+
+Algunos procesos del negocio están DECLARADOS como flujos de pasos (bloques
+"Flujo:" más abajo). En ellos TÚ ejecutas, pero la SECUENCIA la arbitra el
+servidor con las tools workflow_list / workflow_run_start /
+workflow_step_report / workflow_run_get:
+
+1. Al disparo del flujo (corrida automática o petición del dueño):
+   workflow_run_start con su wfId. Si regresa alreadyRunning NO arranques
+   otro: workflow_run_get de ese run y continúa desde su paso vigente — y si
+   ese paso espera al dueño o a un invitado, no hay nada que hacer (en
+   corrida automática responde exactamente NO_REPLY).
+2. Ejecuta SOLO el paso vigente, en orden. Repórtalo con
+   workflow_step_report: running al empezar uno largo, done al terminarlo
+   (con una note corta de lo que pasó — el dueño ve ese timeline en su app),
+   failed si no se pudo.
+3. Los pasos con tool propia se reportan SOLOS al pasarles runId+stepId — NO
+   los dupliques con workflow_step_report:
+   - paso de autorización → request_approval con runId y stepId. La decisión
+     del dueño cierra el paso por sí sola: NUNCA lo cierres tú (el servidor
+     lo rechaza con approval_step_decides_only).
+   - paso de delegación → guest_send con runId y stepId. El servidor exige
+     el paso vigente Y la autorización aprobada (doble candado); si no, 409
+     y NADA se envía.
+4. Si una tool regresa step_out_of_order NO insistas ni fuerces: consulta
+   workflow_run_get (fuente de verdad, no tu memoria) y ejecuta el paso
+   vigente que te indique.
+5. Al retomar un flujo en una conversación nueva (decisión del dueño,
+   respuesta de un proveedor): workflow_run_get ANTES de ejecutar nada.
+6. Un run terminado (completed/failed/cancelled) NO se reabre: si el flujo
+   debe correr otra vez, workflow_run_start de nuevo.
+7. NO crees crons de flujos por tu cuenta: los disparos automáticos ya
+   existen si el flujo los declara."""
+
+_WF_STEP_LABELS = {
+    "agent-task": "tarea del agente",
+    "approval": "autorización del dueño",
+    "delegate-to-guest": "delegación a un invitado",
+    "notify": "aviso",
+}
+
+
+def _sanitize_workflow_def(wf_id: str, raw: dict):
+    """Espejo de sanitizeWorkflowDef (tools_sync.ts): mismos defaults ⇒ mismos
+    bytes en el render. Devuelve None si la definición está malformada."""
+    steps_raw = raw.get("steps") if isinstance(raw.get("steps"), list) else []
+    clean = []
+    for s in steps_raw:
+        o = s if isinstance(s, dict) else {}
+        sid = str(o.get("id") or "").strip()
+        stype = str(o.get("type") or "").strip()
+        name = str(o.get("name") or "").strip()
+        instructions = o.get("instructions")
+        entry = {"id": sid, "type": stype, "name": name}
+        if isinstance(instructions, str) and instructions.strip():
+            entry["instructions"] = instructions.strip()
+        if sid and name and stype in _WF_STEP_LABELS:
+            clean.append(entry)
+    if not clean or len(clean) != len(steps_raw):
+        return None
+    trg = raw.get("trigger") if isinstance(raw.get("trigger"), dict) else {}
+    ttype = str(trg.get("type")) if str(trg.get("type")) in (
+        "manual", "cron", "event") else "manual"
+    try:
+        # floor(x+0.5) = Math.round de JS (round() de Python banker-redondea).
+        every = min(1440, max(5, int(float(trg.get("everyMinutes")) + 0.5)))
+    except (TypeError, ValueError):
+        every = 15
+    try:
+        version = int(float(raw.get("version")) + 0.5)
+    except (TypeError, ValueError):
+        version = 1
+    trigger = {"type": ttype}
+    if ttype == "cron":
+        trigger["everyMinutes"] = every
+    return {
+        "wfId": wf_id,
+        "name": str(raw.get("name") or wf_id).strip() or wf_id,
+        "description": str(raw.get("description")).strip()
+        if isinstance(raw.get("description"), str) else "",
+        "version": version,
+        "trigger": trigger,
+        "steps": clean,
+    }
+
+
+def _t_workflow_block(d: dict) -> str:
+    """Espejo BYTE-IGUAL de workflowBlockText (tools_sync.ts)."""
+    trg = d["trigger"]
+    if trg["type"] == "cron":
+        trigger = f"Disparo: automático cada {trg['everyMinutes']} min."
+    elif trg["type"] == "event":
+        trigger = "Disparo: por evento."
+    else:
+        trigger = "Disparo: manual (a petición del dueño)."
+    steps = "\n".join(
+        f"{i + 1}. [{s['id']}] {s['name']} ({_WF_STEP_LABELS[s['type']]})"
+        + (f" — {s['instructions']}" if s.get("instructions") else "")
+        for i, s in enumerate(d["steps"])
+    )
+    desc = f"{d['description']}\n" if d["description"] else ""
+    return (
+        f"## Flujo: {d['name']} (wfId {d['wfId']}, v{d['version']})\n\n"
+        f"{desc}{trigger}\n"
+        "Pasos declarados — síguelos EXACTAMENTE en este orden con la regla de\n"
+        "plataforma de flujos de trabajo:\n"
+        f"{steps}"
+    )
 
 
 def _get_node_subdoc(token: dict, rel: str) -> dict:
@@ -12467,16 +12561,27 @@ def _compose_tools_doc(token: dict) -> dict:
     blocks.append({"order": 240, "id": "feature:drive", "kind": "feature", "text": _T_DRIVE})
     blocks.append({"order": 250, "id": "feature:poll", "kind": "feature", "text": _T_POLL})
     blocks.append({"order": 255, "id": "feature:approval", "kind": "feature", "text": _T_APPROVAL})
-    inv = _get_node_subdoc(token, "config/inventoryFlow")
-    if inv.get("enabled") is True:
-        try:
-            every = min(1440, max(5, round(float(inv.get("everyMinutes")))))
-        except Exception:  # noqa: BLE001
-            every = 15
+    # W5: feature:inventory (256) DEPRECIADO — el flujo de inventario se
+    # rinde como workflow:wf_inventario (la CF convierte config/inventoryFlow
+    # a la definición; espejo de tools_sync.ts).
+    # TNode Workflows: contrato de plataforma (257) + un bloque por definición
+    # enabled (270+, orden estable por wfId) — como buildToolsJson.
+    wf_defs = [
+        _sanitize_workflow_def(w["id"], w["data"])
+        for w in _list_node_subcollection(token, "workflowDefinitions")
+        if w["data"].get("enabled") is True
+    ]
+    wf_defs = sorted((d for d in wf_defs if d), key=lambda d: d["wfId"])
+    if wf_defs:
         blocks.append({
-            "order": 256, "id": "feature:inventory", "kind": "feature",
-            "text": _t_inventory_flow(every),
+            "order": 257, "id": "feature:workflow", "kind": "feature",
+            "text": _T_WORKFLOW,
         })
+        for idx, d in enumerate(wf_defs):
+            blocks.append({
+                "order": 270 + idx, "id": f"workflow:{d['wfId']}",
+                "kind": "feature", "text": _t_workflow_block(d),
+            })
     # delegate: peers enabled, ordenados por DOC ID (como buildToolsJson).
     peers = sorted(_team_read_peers(token), key=lambda p: p["id"])
     if peers:
@@ -14203,6 +14308,133 @@ def _sync_inventory_cron(token: dict) -> None:
         _log(f"inventory-cron: sync failed (will retry): {e}")
 
 
+# ── TNode Workflows: crons declarativos + barrido stalled ──
+# workflow_sync.ts compone workflowCronsJson/Hash en el node doc (un job
+# `tnode-wf-<wfId>` por definición enabled con trigger cron); aquí se
+# materializan hash-gated, misma mecánica rm+add que el cron de inventario.
+_WORKFLOW_CRONS_HASH_PATH = OPENCLAW_DIR / ".tnode-workflow-crons-hash"
+_WORKFLOW_CRON_PREFIX = "tnode-wf-"
+_WORKFLOW_SWEEP_AT_PATH = OPENCLAW_DIR / ".tnode-workflow-sweep-at"
+_WORKFLOW_SWEEP_MIN_SECONDS = 1800
+_WORKFLOW_URL = os.environ.get(
+    "TNODE_WORKFLOW_URL",
+    f"https://us-central1-{PROJECT_ID}.cloudfunctions.net/workflowApi",
+)
+
+
+def _read_state_file(path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _write_state_file(path, value: str) -> None:
+    try:
+        path.write_text(value, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _sync_workflow_crons(token: dict) -> None:
+    """Materializa los crons declarados en workflowCronsJson (hash-gated).
+    rm+add por PREFIJO: se quitan TODOS los jobs `tnode-wf-*` del gateway y
+    se recrean los declarados — flujos apagados/borrados desaparecen solos.
+    El hash local solo se estampa en éxito (gateway caído reintenta)."""
+    try:
+        remote_hash = _firestore_get_node_field(token, "workflowCronsHash")
+    except Exception as e:  # noqa: BLE001
+        _log(f"workflow-crons: hash read failed: {e}")
+        return
+    if not remote_hash or remote_hash == _read_state_file(_WORKFLOW_CRONS_HASH_PATH):
+        return
+    try:
+        raw = _firestore_get_node_field(token, "workflowCronsJson")
+        doc = json.loads(raw) if raw else None
+    except Exception as e:  # noqa: BLE001
+        _log(f"workflow-crons: json read/parse failed: {e}")
+        return
+    if not isinstance(doc, dict):
+        return
+    jobs = [j for j in (doc.get("jobs") or []) if isinstance(j, dict)]
+    try:
+        res = _gateway_rpc("cron.list", {"includeDisabled": True})
+        existing = ((res.get("payload") or {}).get("jobs")) or []
+        for j in existing:
+            name = str(j.get("name") or "")
+            if name.startswith(_WORKFLOW_CRON_PREFIX) and j.get("id"):
+                _gateway_rpc("cron.remove", {"id": j["id"]})
+        for j in jobs:
+            if j.get("enabled") is not True or not j.get("message"):
+                continue
+            every = int(j.get("everyMinutes") or 15)
+            _gateway_rpc("cron.add", {
+                "name": str(j.get("name") or ""),
+                "agentId": str(j.get("agent") or "main"),
+                "sessionTarget": str(j.get("session") or "isolated"),
+                "wakeMode": "now",
+                "enabled": True,
+                "schedule": {"kind": "every", "everyMs": every * 60000},
+                "payload": {
+                    "kind": "agentTurn",
+                    "message": str(j.get("message")),
+                    "thinking": str(j.get("thinking") or "low"),
+                    "timeoutSeconds": int(j.get("timeoutSeconds") or 480),
+                },
+                # Mismo delivery que el cron de inventario: canal explícito
+                # ("last" truena multi-canal) y best-effort (los avisos al
+                # dueño van por server-write, no dependen del announce).
+                "delivery": {
+                    "mode": "announce",
+                    "channel": "tnode",
+                    "bestEffort": True,
+                },
+            })
+        _log(
+            f"workflow-crons: materialized {len(jobs)} job(s) "
+            f"(hash {remote_hash[:12]})"
+        )
+        _write_state_file(_WORKFLOW_CRONS_HASH_PATH, remote_hash)
+    except Exception as e:  # noqa: BLE001
+        _log(f"workflow-crons: sync failed (will retry): {e}")
+
+
+def _workflow_sweep_maybe() -> None:
+    """Barrido stalled del ledger (workflowApi workflow_sweep, HMAC): runs
+    `running` sin latido >60 min → stalled + aviso al dueño. Throttled a 30
+    min entre llamadas — corre colgado del decl-sync, no de un timer propio
+    (cero lecturas en nodo idle sin sesiones, patrón firestore_read_audit)."""
+    now = int(time.time())
+    last = _read_state_file(_WORKFLOW_SWEEP_AT_PATH)
+    if last.isdigit() and now - int(last) < _WORKFLOW_SWEEP_MIN_SECONDS:
+        return
+    _write_state_file(_WORKFLOW_SWEEP_AT_PATH, str(now))
+    try:
+        cfg = load_config()
+        ts = str(int(time.time() * 1000))
+        nonce = py_secrets.token_hex(16)
+        sig = hmac.new(
+            cfg["nodeSecret"].encode("utf-8"),
+            f'{cfg["nodeId"]}:{ts}:{nonce}:workflow_sweep'.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        body = json.dumps({
+            "action": "workflow_sweep", "nodeId": cfg["nodeId"],
+            "timestamp": ts, "nonce": nonce, "signature": sig, "params": {},
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            _WORKFLOW_URL, data=body,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            out = json.loads(r.read() or b"{}")
+        stalled = out.get("stalled") or []
+        if stalled:
+            _log(f"workflow-sweep: {len(stalled)} run(s) → stalled: {stalled}")
+    except Exception as e:  # noqa: BLE001
+        _log(f"workflow-sweep: failed (next window retries): {e}")
+
+
 def _run_declarative_sync(token: dict) -> None:
     """Prime the hash fields in ONE masked GET, then render every
     declarative file (TOOLS/SOUL/IDENTITY/USER/TEAM) whose hash changed.
@@ -14213,7 +14445,7 @@ def _run_declarative_sync(token: dict) -> None:
         token,
         [
             "toolsHash", "soulHash", "identityHash", "userHash",
-            "teamIndexHash", "inventoryCronHash",
+            "teamIndexHash", "inventoryCronHash", "workflowCronsHash",
         ],
     )
     # Reflect channel state to Firestore + the one-time v1.1 migration, then
@@ -14252,6 +14484,10 @@ def _run_declarative_sync(token: dict) -> None:
     _team_index_sync_from_json(token)
     # Cron declarativo del resurtido (hash-gated; rm+add vía CLI del core).
     _sync_inventory_cron(token)
+    # TNode Workflows: crons declarativos (hash-gated) + barrido stalled
+    # (throttled 30 min — colgado de aquí, sin timer propio).
+    _sync_workflow_crons(token)
+    _workflow_sweep_maybe()
     # Guest workspace SOUL.md: render the owner's Business Profile so the guest
     # agent knows the business it represents (needs the token to read the
     # node-scoped config/businessProfile doc).
