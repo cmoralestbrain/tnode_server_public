@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.80.1"
+TNODE_SETUP_VERSION="1.81.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -15223,7 +15223,7 @@ from __future__ import annotations
 #          upsertea channels/whatsapp.detectedGroups.{jid}={name,lastSeenAt}
 #          (throttle 6h/nombre). Alimenta el picker de grupos por NOMBRE del
 #          app (el usuario nunca ve JIDs). Ver architecture WA v1.5.
-__VERSION__ = "1.30.0"
+__VERSION__ = "1.31.0"
 
 import hashlib
 import hmac
@@ -18013,7 +18013,66 @@ def detect_wa_group(line: str, token: dict, project_id: str, state: dict) -> Non
         _log(f"wa-groups: {e}")
 
 
-def _gateway_send_pending(items: list) -> tuple[list, str | None]:
+def _member_display_name(
+    token: dict, project_id: str, guest_uid: str, state: dict
+) -> str | None:
+    """Nombre visible del invitado (para el sender inyectado). Lee
+    members/{guestUid}.contextProfile (nickname o firstName+lastName). Cache
+    300s en state; best-effort (None si falla)."""
+    cache = state.setdefault("_sender_name_cache", {})
+    hit = cache.get(guest_uid)
+    now = time.time()
+    if hit and (now - hit[0]) < 300.0:
+        return hit[1]
+    name = None
+    try:
+        path = (
+            f"projects/{project_id}/databases/(default)/documents"
+            f"/nodeSyncRegistrations/{token['nodeId']}/members/{guest_uid}"
+        )
+        req = urllib.request.Request(
+            f"https://firestore.googleapis.com/v1/{path}",
+            headers={"Authorization": f"Bearer {token['idToken']}"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            doc = json.loads(resp.read().decode("utf-8"))
+        cp = (
+            (((doc.get("fields") or {}).get("contextProfile") or {})
+             .get("mapValue") or {}).get("fields") or {}
+        )
+
+        def _s(k: str) -> str:
+            return ((cp.get(k) or {}).get("stringValue") or "").strip()
+
+        name = _s("nickname") or f"{_s('firstName')} {_s('lastName')}".strip() or None
+    except Exception:  # noqa: BLE001
+        name = None
+    cache[guest_uid] = (now, name)
+    return name
+
+
+def _sender_name_for(
+    items: list, token: dict, project_id: str, state: dict
+) -> str:
+    """Sender HUMANO para el connect del inject — así el modelo no ve
+    'tnode-chat-sync (gateway-client)' (que parece bot) y decide NO_REPLY.
+    Nombre del invitado si el batch es de un solo guest; 'Titular' si es del
+    dueño; genérico si mixto. Ver architecture_stripe_venta_guest.md."""
+    guest_uids = {
+        g for it in items if (g := _guest_uid_from_session(it.get("sessionKey")))
+    }
+    if len(guest_uids) == 1:
+        gu = next(iter(guest_uids))
+        return _member_display_name(token, project_id, gu, state) or "Cliente"
+    if not guest_uids:
+        return "Titular"
+    return "Cliente"
+
+
+def _gateway_send_pending(
+    items: list, sender_name: str = "Cliente"
+) -> tuple[list, str | None]:
     """Inject pending user messages into the local gateway over one
     ephemeral WS connection (challenge → connect → chat.send per item).
 
@@ -18075,8 +18134,13 @@ def _gateway_send_pending(items: list) -> tuple[list, str | None]:
                 "minProtocol": 4,
                 "maxProtocol": 4,
                 "client": {
+                    # `id` DEBE ser un valor del enum permitido por el gateway
+                    # (probado: "tnode-app-user" → INVALID_REQUEST). Se queda
+                    # "gateway-client"; el sender HUMANO va en displayName →
+                    # el modelo lee `name`/`username` = nombre del usuario y ya
+                    # no lo trata como bot ni hace NO_REPLY (bug 2026-07-18).
                     "id": "gateway-client",
-                    "displayName": "tnode-chat-sync",
+                    "displayName": sender_name,
                     "version": __VERSION__,
                     "platform": sys.platform,
                     "mode": "backend",
@@ -18370,8 +18434,9 @@ def process_outbox(token: dict, project_id: str, state: dict) -> bool:
     if not sendable:
         return True
 
+    sender_name = _sender_name_for(sendable, token, project_id, state)
     try:
-        results, abort_reason = _gateway_send_pending(sendable)
+        results, abort_reason = _gateway_send_pending(sendable, sender_name)
     except _GatewayDown as e:
         if (now - state.get("last_gwdown_warn", 0.0)) > 60:
             state["last_gwdown_warn"] = now
