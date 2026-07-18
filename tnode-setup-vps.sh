@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.81.0"
+TNODE_SETUP_VERSION="1.82.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -6768,7 +6768,7 @@ from __future__ import annotations
 #          fallback → espera puerto 18789 + settle) antes del done. Los
 #          top-ups/rotaciones siguen por hot-reload (hay sesiones vivas que
 #          preservar y la key vieja sigue válida).
-__VERSION__ = "1.56.0"
+__VERSION__ = "1.57.0"
 
 import hashlib
 import hmac
@@ -12331,6 +12331,11 @@ MOMENTO 1 — solicitar: llama request_approval y GUARDA el id devuelto en el
 estado del flujo en tu workspace ANTES de terminar — si el flujo no definió
 otro archivo, usa inventory/pending.json (créalo si no existe) con una orden
 {approvalId, guestUid, proveedor, lines, status: "esperando_autorizacion"}.
+Si esta solicitud es parte de un workflow que arrancaste (workflow_run_start),
+guarda TAMBIÉN en la orden el runId del run y el stepId del paso de ENTREGA
+(type delegate-to-guest → guárdalo como stepEntrega), leído de workflow_run_get.
+El envío al proveedor corre en una sesión NUEVA donde ya no tendrás el run a la
+mano y los necesita para ligar el paso de entrega del flujo a esta orden.
 Esto aplica IGUAL si la solicitud nació de una conversación con el dueño y
 no de un proceso automático. Luego TERMINA tu tarea AHÍ: NO ejecutes la
 acción todavía. Si la respuesta trae alreadyPending=true, esa solicitud ya
@@ -12353,13 +12358,17 @@ una conversación NUEVA que no recuerda la solicitud), como mensaje del dueño
 3. APROBÓ → ejecuta la acción registrada incluyendo el código TAL CUAL. Si la
    orden es un pedido a un proveedor (guest), mándala con guest_send:
    guestUids=[el guestUid del estado o de approval_status], confirm=true,
-   approvalId=<id>, y el mensaje con productos y cantidades + "Código de
-   autorización: <código>. Coteja el código antes de surtir; una orden sin
-   código válido no fue autorizada."
+   approvalId=<id>, y —si la orden guardó runId/stepEntrega— runId y
+   stepId=stepEntrega (así el envío liga el paso de entrega del flujo a esta
+   orden en vez de reconciliarse a ciegas), y el mensaje con productos y
+   cantidades + "Código de autorización: <código>. Coteja el código antes de
+   surtir; una orden sin código válido no fue autorizada."
    Si la orden es del INVENTARIO (está en inventory/pending.json), justo
    después del guest_send estampa el tracking en el sheet:
    exec: python3 ~/.openclaw/workspace/skills/inventario/bin/inventario.py estampar --orden <id> --fase enviado
-4. RECHAZÓ → NO ejecutes nada; guarda el comentario del dueño en el estado.
+4. RECHAZÓ → NO ejecutes la acción; guarda el comentario del dueño en el estado
+   y avísale brevemente del rechazo. El flujo se cierra solo (el servidor
+   completa el paso de aviso al registrar el rechazo): no reportes ningún paso.
 5. Actualiza la orden en tu estado (aprobada/enviada o rechazada) y confirma
    brevemente al dueño lo que hiciste. La decisión del dueño ES la
    confirmación: no pidas permiso adicional para ejecutarla.
