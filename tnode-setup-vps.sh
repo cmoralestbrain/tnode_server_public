@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.82.0"
+TNODE_SETUP_VERSION="1.83.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -6768,7 +6768,7 @@ from __future__ import annotations
 #          fallback → espera puerto 18789 + settle) antes del done. Los
 #          top-ups/rotaciones siguen por hot-reload (hay sesiones vivas que
 #          preservar y la key vieja sigue válida).
-__VERSION__ = "1.57.0"
+__VERSION__ = "1.58.0"
 
 import hashlib
 import hmac
@@ -11361,6 +11361,12 @@ def _md_sync_from_json(token: dict, target: str) -> None:
     try:
         doc = _compose_md_local(token, target)
         body = _render_tools_zone((doc or {}).get("blocks") or [])
+    except SubdocUnavailable as e:
+        # NO pudimos leer la fuente. Ojo: NO caer al camino de "data vacía"
+        # (que borra la zona) — un 403 o un timeout no significa que el dueño
+        # haya vaciado su persona. Dejar el archivo tal cual y reintentar.
+        _log(f"md-sync[{target}]: fuente ilegible ({e}) — zona intacta")
+        return
     except Exception as e:  # noqa: BLE001
         _log(f"md-sync[{target}]: compose failed: {e}")
         return
@@ -12008,14 +12014,22 @@ def _read_owner_spec(token: dict) -> dict:
     """GET users/{uid}.specialization (mapa business-wide del Wizard: sector,
     guardrails, memoryPriorities). Se lee como CAMPO del user doc (mismo patrón que
     .profile) — el token del nodo puede leer users/{uid} pero NO subcolecciones
-    owner-scoped tipo users/{uid}/config/* (reglas de seguridad). {} si ausente."""
+    owner-scoped tipo users/{uid}/config/* (reglas de seguridad). {} si ausente.
+
+    Mismo contrato que `_get_node_subdoc`: `{}` solo si el doc no existe;
+    cualquier otra falla levanta `SubdocUnavailable` para no confundir "no
+    pude leer" con "sin guardrails" y borrar la zona."""
     url = f"{_firestore_base()}/users/{token['uid']}?mask.fieldPaths=specialization"
     try:
         doc = _http_request(
             "GET", url, headers={"Authorization": f"Bearer {token['idToken']}"},
         )
-    except Exception:  # noqa: BLE001
-        return {}
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return {}
+        raise SubdocUnavailable(f"users/{token['uid']}.specialization: HTTP {e.code}") from e
+    except Exception as e:  # noqa: BLE001
+        raise SubdocUnavailable(f"users/{token['uid']}.specialization: {e}") from e
     fields = (doc or {}).get("fields") or {}
     val = _fs_unwrap(fields["specialization"]) if "specialization" in fields else {}
     return val if isinstance(val, dict) else {}
@@ -12591,16 +12605,36 @@ def _t_workflow_block(d: dict) -> str:
     )
 
 
+class SubdocUnavailable(RuntimeError):
+    """La lectura de un subdoc FALLÓ (403/5xx/red/timeout) — distinto de que
+    el doc NO EXISTA. Ver `_get_node_subdoc`."""
+
+
 def _get_node_subdoc(token: dict, rel: str) -> dict:
-    """GET users/{uid}/nodes/{nodeId}/{rel} → dict de campos unwrapped, {} si 404."""
+    """GET users/{uid}/nodes/{nodeId}/{rel} → dict de campos unwrapped.
+
+    `{}` SOLO cuando el doc no existe (404) — eso sí significa "el dueño no
+    configuró esto". Cualquier otra falla levanta `SubdocUnavailable`.
+
+    ⚠️ Esta distinción es CRÍTICA, no cosmética: el `{}` de aquí fluye a los
+    compositores de zonas D (persona / identity_data / user / guardrails /
+    memory_priorities) y un doc vacío hace que `_md_sync_from_json` BORRE la
+    zona del SOUL.md / IDENTITY.md / USER.md. Mientras esto se tragaba todo
+    error, un 403 o un timeout le borraba la personalidad al agente del
+    cliente, en silencio. Al levantar, el `except` del llamador deja los
+    archivos INTACTOS y reintenta en el siguiente ciclo."""
     url = f"{_firestore_base()}/users/{token['uid']}/nodes/{token['nodeId']}/{rel}"
     try:
         doc = _http_request(
             "GET", url,
             headers={"Authorization": f"Bearer {token['idToken']}"},
         )
-    except Exception:  # noqa: BLE001
-        return {}
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return {}
+        raise SubdocUnavailable(f"{rel}: HTTP {e.code}") from e
+    except Exception as e:  # noqa: BLE001
+        raise SubdocUnavailable(f"{rel}: {e}") from e
     return {k: _fs_unwrap(v) for k, v in ((doc or {}).get("fields") or {}).items()}
 
 
