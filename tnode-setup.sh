@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.86.0"
+TNODE_SETUP_VERSION="1.87.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -97,6 +97,11 @@ CLOUD_MODEL="kimi-k2.5:cloud"
 # provisioning E2E. Override with `OPENCLAW_PIN_VERSION=` (empty) to take
 # whatever is current.
 OPENCLAW_PIN_VERSION="${OPENCLAW_PIN_VERSION-2026.6.10}"
+# Canal WhatsApp Personal (Baileys). El pin SIGUE al del core: cada release del
+# plugin sube su peerDependency (2026.6.33 pide openclaw >= 2026.6.33, 2026.7.1
+# pide >= 2026.7.1) y el core está clavado arriba. Bumpear SOLO junto con
+# OPENCLAW_PIN_VERSION, nunca por separado.
+OPENCLAW_WA_PLUGIN_VERSION="${OPENCLAW_WA_PLUGIN_VERSION-2026.5.19}"
 TNODE_USER="tnode"
 TNODE_HOME=""      # set in setup_tnode_user()
 OPENCLAW_HOME=""   # set in setup_tnode_user()
@@ -5023,6 +5028,17 @@ enable_pathb_plugins() {
             fi
         fi
     done
+
+    # El canal WhatsApp no vive en extensions/ sino en npm/projects/ (install
+    # por spec npm), así que no entra en el loop de arriba: pierde su entry con
+    # el mismo cleanup y hay que re-habilitarlo igual en cada provisión.
+    if compgen -G "$OPENCLAW_HOME/npm/projects/openclaw-whatsapp-*" >/dev/null 2>&1; then
+        if run_as_tnode openclaw plugins enable whatsapp </dev/null >/dev/null 2>&1; then
+            info "Path B: whatsapp enabled (SDK)"
+        else
+            warn "Path B: enable de whatsapp falló"
+        fi
+    fi
 }
 
 # Install the web-search plugin. @ollama/openclaw-web-search ships raw
@@ -5071,6 +5087,45 @@ install_websearch_plugin() {
     chown "$TNODE_USER":"$TNODE_USER" "$OPENCLAW_HOME/openclaw.json" 2>/dev/null || true
 }
 
+# Canal WhatsApp Personal (Baileys). NO viene con el core de OpenClaw —
+# verificado contra los tarballs npm de 2026.5.19 y 2026.6.10: solo traen
+# docs/ y un helper de doctor, ni el canal ni Baileys. Sin este paso el nodo
+# no registra los RPC `web.login.start|wait` y la pantalla Canales del app
+# falla con "Este nodo no tiene instalado el canal de WhatsApp" (el widget
+# diagnosticaba bien; lo que faltaba era instalarlo).
+#
+# Se instala desde npm con versión PINEADA en vez de viajar en el blob Path B:
+# el paquete arrastra ~121 MB de dependencias, entre ellas los binarios NATIVOS
+# de sharp (@img/sharp-linux-x64, sharp-libvips-linux-x64). Son específicos de
+# plataforma+arquitectura, así que un único base64 embebido no puede servir al
+# installer de Mac y al de Linux a la vez; npm los resuelve por host.
+#
+# Queda instalado y ENABLED en TODOS los nodos para que el RPC exista, pero
+# inerte hasta que se vincule una cuenta por QR. Si el dueño puede configurarlo
+# o no lo decide el app por tier del TNode (Business), no este script.
+#
+# Idempotente en los dos caminos: en full-install baja de npm; en arranque
+# desde snapshot el payload ya vive en ~/.openclaw/npm/projects/ (cleanup-pre-
+# snapshot borra openclaw.json, no el paquete) y solo re-habilita.
+install_whatsapp_plugin() {
+    local wa_pkg="@openclaw/whatsapp" wa_ver="$OPENCLAW_WA_PLUGIN_VERSION"
+    local projects_dir="$OPENCLAW_HOME/npm/projects"
+
+    if compgen -G "$projects_dir/openclaw-whatsapp-*" >/dev/null 2>&1; then
+        info "Canal WhatsApp ya presente (snapshot); re-habilitando"
+    elif ! run_as_tnode openclaw plugins install "$wa_pkg@$wa_ver" --pin </dev/null; then
+        warn "WhatsApp: openclaw plugins install $wa_pkg@$wa_ver falló"
+        return 1
+    fi
+
+    if ! run_as_tnode openclaw plugins enable whatsapp </dev/null >/dev/null 2>&1; then
+        warn "WhatsApp: enable del canal falló"
+        return 1
+    fi
+    chown "$TNODE_USER":"$TNODE_USER" "$OPENCLAW_HOME/openclaw.json" 2>/dev/null || true
+    return 0
+}
+
 # Configure OpenClaw and transfer ownership to tnode user
 openclaw_configure_as_tnode() {
     # Ensure OPENCLAW_HOME exists and is owned by tnode before plugin install
@@ -5094,6 +5149,9 @@ openclaw_configure_as_tnode() {
 
     # Path B: materialize embedded plugins + enable them (openclaw.json now exists)
     materialize_pathb_plugins
+
+    # Canal WhatsApp Personal: npm pineado (no cabe en Path B — deps nativas).
+    run_with_progress "Instalando canal WhatsApp" --estimate 45 install_whatsapp_plugin || true
 
     if [[ "$USE_API" == "1" ]]; then
         if [[ -z "$API_KEY" ]] && [[ "$API_PROVIDER" == "openrouter" ]]; then
