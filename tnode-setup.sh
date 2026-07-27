@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.91.0"
+TNODE_SETUP_VERSION="1.91.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -5769,6 +5769,13 @@ install_qrencode() {
 
     if command_exists qrencode; then
         success "qrencode instalado"
+    elif [[ "$OS" == "Linux" && "$(id -u)" != "0" ]]; then
+        # El apt-get de arriba lleva `|| true` y se traga el fallo. En
+        # instalaciones a nivel de usuario (installer sin sudo) NUNCA se pudo
+        # instalar, y el nodo se quedaba sin QR de emparejamiento sin que
+        # nada lo dijera: clawpi llevaba asi hasta que verify_qrencode lo
+        # destapo el 2026-07-27.
+        warn "qrencode no se pudo instalar sin root — instálalo con: sudo apt-get install -y qrencode"
     else
         info "qrencode no disponible — setup code se mostrará como texto"
     fi
@@ -7002,7 +7009,7 @@ from __future__ import annotations
 #          System) — el agente interactivo solo confirma. Mata el doble
 #          envío al proveedor (outbox "APRUEBO…" + tarjeta del motor).
 #          Espejos byte-iguales en tools_sync.ts (editar AMBOS).
-__VERSION__ = "1.59.0"
+__VERSION__ = "1.60.0"
 
 import hashlib
 import hmac
@@ -7462,11 +7469,31 @@ def _openclaw_binary() -> str | None:
         return bin_path
     for cand in (
         HOME / ".local" / "bin" / "openclaw",
+        # Instalaciones a nivel de usuario: `npm config set prefix ~/.npm-global`.
+        # Es el layout de clawpi, donde el binario vive en ~/.npm-global/bin y NO
+        # aparece ni en el PATH del usuario ni en el PATH acotado de la unit
+        # systemd (/usr/local/bin:/usr/bin:/bin). Sin esta ruta, _openclaw_binary
+        # devolvia None y TODA invocacion del CLI fallaba con openclaw_not_found:
+        # restart del gateway, apply_openrouter_key, install_subagent, mcp.*.
+        # Detectado el 2026-07-27 al estrenar verify_openclaw-cli.
+        HOME / ".npm-global" / "bin" / "openclaw",
         Path("/usr/local/bin/openclaw"),
         Path("/opt/homebrew/bin/openclaw"),
     ):
         if cand.is_file() and os.access(cand, os.X_OK):
             return str(cand)
+    # Ultimo recurso: preguntarle a npm por su prefijo global, para prefijos no
+    # estandar. Solo se llega aqui si el binario no esta en ninguna ruta comun,
+    # asi que el coste del subprocess es de camino de error.
+    try:
+        proc = subprocess.run(["npm", "prefix", "-g"], capture_output=True,
+                              text=True, timeout=10, check=False)
+        if proc.returncode == 0 and proc.stdout.strip():
+            cand = Path(proc.stdout.strip()) / "bin" / "openclaw"
+            if cand.is_file() and os.access(cand, os.X_OK):
+                return str(cand)
+    except Exception:
+        pass
     return None
 
 
@@ -9116,7 +9143,7 @@ _AGENDA_MANIFEST = r'''{
 _AGENDA_PY = r'''#!/usr/bin/env python3
 """agenda — consulta y reserva citas contra el calendario del nodo.
 
-__VERSION__ = "1.0.0"
+__VERSION__ = "1.60.0"
 
 Thin client del endpoint `agendaApi` (Cloud Function, HMAC con el
 nodeSecret de tnode-chat-sync.json — mismo flujo que pullLLMConfig, con el
@@ -9372,7 +9399,7 @@ _DRIVE_MANIFEST = r'''{
 _DRIVE_PY = r'''#!/usr/bin/env python3
 """drive — lee la carpeta de Google Drive que el dueño compartió con el nodo.
 
-__VERSION__ = "1.0.0"
+__VERSION__ = "1.60.0"
 
 Thin client del endpoint `driveReadApi` (Cloud Function, HMAC con el
 nodeSecret de tnode-chat-sync.json; la firma incluye el namespace y el
@@ -9661,7 +9688,7 @@ _POLL_MANIFEST = r'''{
 _POLL_PY = r'''#!/usr/bin/env python3
 """poll — difunde una encuesta del dueño a todos los invitados del nodo.
 
-__VERSION__ = "1.1.0"
+__VERSION__ = "1.60.0"
 
 Thin client del endpoint `pollApi` (Cloud Function, HMAC con el nodeSecret de
 tnode-chat-sync.json; la firma incluye namespace + action:
@@ -9883,7 +9910,7 @@ _TNODE_DELEGATE_MANIFEST = r'''{
 _TNODE_DELEGATE_PY = r'''#!/usr/bin/env python3
 """tnode-delegate — delega una tarea a OTRO de los TNodes del dueño.
 
-__VERSION__ = "1.0.0"
+__VERSION__ = "1.60.0"
 
 El agente de ESTE nodo (A) le pasa una tarea al agente de otro nodo enlazado
 (B, un "peer" configurado en el widget Equipo de la app) y lee su respuesta.
@@ -9916,7 +9943,7 @@ import os
 import subprocess
 import sys
 
-__VERSION__ = "1.0.0"
+__VERSION__ = "1.60.0"
 
 
 def _ensure_websockets() -> None:
@@ -10260,7 +10287,7 @@ _INVENTARIO_MANIFEST = r'''{
 _INVENTARIO_PY = r'''#!/usr/bin/env python3
 """inventario — lee el sheet del inventario y estampa el tracking de órdenes.
 
-__VERSION__ = "1.0.0"
+__VERSION__ = "1.60.0"
 
 Thin client del endpoint `inventoryApi` (Cloud Function, HMAC con el
 nodeSecret de tnode-chat-sync.json; la firma es
