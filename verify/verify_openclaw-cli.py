@@ -15,7 +15,7 @@ Hasta v1.90.0 este verify no existía y el componente salía siempre como
 `skipped` en el health-check.
 """
 from __future__ import annotations
-__VERSION__ = "1.0.0"
+__VERSION__ = "1.1.0"
 
 import sys
 from pathlib import Path
@@ -40,9 +40,18 @@ def main() -> int:
     entry = find_self(COMPONENT_ID)
     expected = entry.get("version") if entry else "unknown"
 
+    # Las mismas rutas que resuelve `_openclaw_binary()` en tnode-config-sync.
+    # Si el daemon puede ejecutarlo, el verify no debe decir que falta.
+    extra = [
+        Path.home() / ".local" / "bin" / BINARY,
+        Path.home() / ".npm-global" / "bin" / BINARY,
+        Path("/usr/local/bin") / BINARY,
+        Path("/opt/homebrew/bin") / BINARY,
+    ]
+
     checks = [
         check_npm_version(NPM_PACKAGE),
-        check_binary_version(BINARY),
+        check_binary_version(BINARY, extra_paths=extra),
     ]
 
     # La versión de npm es la autoritativa; el binario puede reportar un formato

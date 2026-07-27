@@ -24,7 +24,7 @@ Exit codes:
 Stdlib only (Python 3.9+). Diseñado para correr en Mac/Linux sin deps externas.
 """
 from __future__ import annotations
-__VERSION__ = "1.2.0"
+__VERSION__ = "1.3.0"
 
 import hashlib
 import json
@@ -314,19 +314,34 @@ def check_start_limit_disabled(unit: str) -> CheckResult:
             "details": f"no existe la unit {unit}"}
 
 
-def check_binary_version(command: str, args: Optional[list] = None) -> CheckResult:
+def check_binary_version(command: str, args: Optional[list] = None,
+                        extra_paths: Optional[list] = None) -> CheckResult:
     """Versión de un binario suelto, vía `<command> --version`.
 
     Para lo que no viene de un package manager. cloudflared se instala
     descargando el binario de GitHub Releases a /usr/local/bin, así que
     dpkg-query nunca lo encuentra y `check_apt_version` avisaba de que "no
     está instalado" en todos los nodos Linux, con el túnel corriendo.
+
+    extra_paths: rutas donde buscar si no está en el PATH. Lo que importa no es
+    que el binario esté en el PATH del verify, sino que se pueda encontrar y
+    ejecutar — que es lo que hacen los daemons, que resuelven por rutas
+    conocidas. Sin esto, `openclaw` daba fail en clawpi (npm con prefijo de
+    usuario, binario en ~/.npm-global/bin) aunque config-sync lo resolviera
+    perfectamente: medir el PATH en vez de la usabilidad es la misma clase de
+    falso positivo que se limpió en v1.88.0.
     """
     path = shutil.which(command)
     if path is None:
+        for cand in (extra_paths or []):
+            cand = Path(cand)
+            if cand.is_file() and os.access(cand, os.X_OK):
+                path = str(cand)
+                break
+    if path is None:
         return {"name": "binary-version", "status": "fail",
-                "details": f"{command} no encontrado en PATH"}
-    rc, out, err = _run([command] + (args or ["--version"]), timeout=10)
+                "details": f"{command} no encontrado en PATH ni en rutas conocidas"}
+    rc, out, err = _run([path] + (args or ["--version"]), timeout=10)
     blob = out or err
     if rc != 0 and not blob:
         return {"name": "binary-version", "status": "fail",
