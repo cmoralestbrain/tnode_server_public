@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.87.1"
+TNODE_SETUP_VERSION="1.87.2"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -22894,7 +22894,12 @@ scripts_dir = openclaw_home / "scripts"
 def extract_ver(p):
     if not p.exists(): return None
     try:
-        for line in p.read_text().splitlines()[:60]:
+        # Fichero entero, no un prefijo: los headers __VERSION__ de los
+        # daemons ya viven por debajo de la linea 60 (chat-sync 124,
+        # config-sync 356, telemetry 66). Con el limite anterior este
+        # manifiesto grababa "unknown" para los tres y la deteccion de
+        # drift quedaba ciega en toda la flota.
+        for line in p.read_text().splitlines():
             if line.startswith('__VERSION__ = "'):
                 return line.split('"')[1]
     except Exception:

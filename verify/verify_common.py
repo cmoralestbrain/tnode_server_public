@@ -24,7 +24,7 @@ Exit codes:
 Stdlib only (Python 3.9+). Diseñado para correr en Mac/Linux sin deps externas.
 """
 from __future__ import annotations
-__VERSION__ = "1.0.1"
+__VERSION__ = "1.0.2"
 
 import hashlib
 import json
@@ -127,22 +127,30 @@ def check_script_sha256(script_path: Path, expected_sha: Optional[str]) -> Check
 
 
 def check_script_version(script_path: Path, expected_version: str) -> CheckResult:
-    """Extrae __VERSION__ del header del script y compara."""
+    """Extrae __VERSION__ del header del script y compara.
+
+    Escanea el fichero ENTERO, no un prefijo. Hasta v1.0.2 sólo se miraban
+    las primeras 60 líneas y los daemons habían crecido por encima de ese
+    límite (chat-sync 124, config-sync 356, telemetry 66), así que los tres
+    reportaban "unknown" / fail en nodos perfectamente al día — y con ello
+    la detección de drift quedaba ciega para todos los daemons. El regex
+    está anclado a inicio de línea, y gana la primera coincidencia, así que
+    el header a nivel de módulo siempre se resuelve antes que cualquier
+    aparición posterior dentro de un string.
+    """
     if not script_path.exists():
         return {"name": "script-version", "status": "fail",
                 "details": f"script not found: {script_path}"}
     actual = None
     with script_path.open() as f:
-        for i, line in enumerate(f):
-            if i > 60:
-                break
+        for line in f:
             m = re.match(r'^__VERSION__\s*=\s*"([^"]+)"\s*$', line)
             if m:
                 actual = m.group(1)
                 break
     if actual is None:
         return {"name": "script-version", "status": "fail",
-                "details": "no __VERSION__ header in first 60 lines"}
+                "details": "no __VERSION__ header found"}
     if actual == expected_version:
         return {"name": "script-version", "status": "ok",
                 "details": f"version={actual} matches expected"}
