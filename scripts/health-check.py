@@ -30,7 +30,7 @@ Exit codes:
 """
 from __future__ import annotations
 
-__VERSION__ = "1.0.0"
+__VERSION__ = "1.1.0"
 
 import argparse
 import json
@@ -150,7 +150,8 @@ def aggregate(
     verify_dir: Path,
 ) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
-    summary = {"total": 0, "ok": 0, "warn": 0, "fail": 0, "skipped": 0, "drift": 0}
+    summary = {"total": 0, "ok": 0, "warn": 0, "fail": 0, "skipped": 0,
+               "drift": 0, "manifestStale": 0}
 
     for comp in local_components:
         comp_id = comp.get("id")
@@ -158,7 +159,7 @@ def aggregate(
             continue
         summary["total"] += 1
 
-        actual_v = comp.get("version", "unknown")
+        manifest_v = comp.get("version", "unknown")
         kind = comp.get("kind", "unknown")
         drift_allowed = bool(comp.get("driftAllowed", False))
 
@@ -166,26 +167,56 @@ def aggregate(
         if expected_index is not None:
             expected_v = (expected_index.get(comp_id) or {}).get("version")
 
-        drift_label, drift_severity = compute_drift(actual_v, expected_v, drift_allowed)
-        if drift_label not in ("none", "unknown"):
-            summary["drift"] += 1
-
+        # El verify corre ANTES de calcular el drift, a propósito: mide lo que
+        # hay en disco AHORA, mientras que el manifiesto sólo dice lo que había
+        # la última vez que corrió el installer. Cuando algo actualiza los
+        # daemons sin regenerarlo —un sync externo, una copia a mano— el
+        # manifiesto queda obsoleto y el drift calculado sobre él es ficción.
+        # Visto en clawpi el 2026-07-27: manifiesto del 21 de mayo con 1.12.0 /
+        # 1.4.0 / 1.9.0, ficheros del 24 de julio con 1.33.0 / 1.59.0 / 1.19.0,
+        # y el health-check reportando "outdated" en tres daemons que estaban
+        # perfectamente al día.
         verify_result = run_verify(verify_dir, comp_id)
         vs = verify_result["verifyStatus"]
         summary[vs if vs in summary else "skipped"] += 1
 
-        rows.append(
-            {
-                "id":              comp_id,
-                "kind":            kind,
-                "versionActual":   actual_v,
-                "versionExpected": expected_v,
-                "drift":           drift_label,
-                "driftSeverity":   drift_severity,
-                "verifyStatus":    vs,
-                "verify":          verify_result,
-            }
+        measured_v = (verify_result.get("raw") or {}).get("versionActual") or "unknown"
+
+        # Manda lo medido; el manifiesto es fuente de segunda mano.
+        actual_v = measured_v if measured_v != "unknown" else manifest_v
+
+        # Un manifiesto desincronizado es un problema real y se reporta como tal,
+        # en vez de dejar que se disfrace de drift. Sólo se marca cuando ambas
+        # versiones son reales y distintas: "system" / "latest" / "unknown" en el
+        # manifiesto son valores por diseño (cloudflared, qrencode), no
+        # desincronía.
+        placeholders = ("unknown", "system", "latest", "")
+        manifest_stale = (
+            manifest_v not in placeholders
+            and measured_v not in placeholders
+            and manifest_v != measured_v
         )
+        if manifest_stale:
+            summary["manifestStale"] = summary.get("manifestStale", 0) + 1
+
+        drift_label, drift_severity = compute_drift(actual_v, expected_v, drift_allowed)
+        if drift_label not in ("none", "unknown"):
+            summary["drift"] += 1
+
+        row = {
+            "id":              comp_id,
+            "kind":            kind,
+            "versionActual":   actual_v,
+            "versionExpected": expected_v,
+            "drift":           drift_label,
+            "driftSeverity":   drift_severity,
+            "verifyStatus":    vs,
+            "verify":          verify_result,
+        }
+        if manifest_stale:
+            row["manifestStale"] = True
+            row["versionManifest"] = manifest_v
+        rows.append(row)
 
     return {"components": rows, "summary": summary}
 
@@ -193,7 +224,12 @@ def aggregate(
 def overall_exit_code(summary: dict[str, int]) -> int:
     if summary.get("fail", 0) > 0:
         return 2
-    if summary.get("warn", 0) > 0 or summary.get("drift", 0) > 0:
+    # manifestStale entra como warn: no es una caída, pero es accionable —se
+    # arregla con un `curl update.tbrain.app/update.sh | bash`, que regenera el
+    # manifiesto— y silenciarlo es lo que dejaba pasar el drift ficticio.
+    if (summary.get("warn", 0) > 0
+            or summary.get("drift", 0) > 0
+            or summary.get("manifestStale", 0) > 0):
         return 1
     return 0
 
