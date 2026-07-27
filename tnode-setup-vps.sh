@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.90.0"
+TNODE_SETUP_VERSION="1.91.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -22946,6 +22946,8 @@ install_verify_scripts() {
         verify_plugin-npm.py
         verify_plugin-skill.py
         verify_tnode-llm-config-watcher.py
+        verify_openclaw-cli.py
+        verify_qrencode.py
     )
     local ok=0 fail=0
     for f in "${files[@]}"; do
