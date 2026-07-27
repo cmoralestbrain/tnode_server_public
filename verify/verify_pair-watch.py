@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """verify_pair-watch — health check del auto-approver de device pairing."""
 from __future__ import annotations
-__VERSION__ = "1.0.0"
+__VERSION__ = "1.1.0"
 
 import sys
 from pathlib import Path
@@ -16,7 +16,13 @@ from verify_common import (  # noqa: E402
 )
 
 COMPONENT_ID = "pair-watch"
-SERVICE_NAME = "pair-watch"
+# En Linux lo que debe estar activo es la .path, no la .service: la service es
+# un oneshot que dispara la path cuando cambia pending.json, y su estado en
+# reposo es `inactive` (viene además `disabled`, porque la que se habilita es
+# la path). Mirar la .service daba fail permanente en nodos Linux sanos.
+# En Mac es un LaunchAgent único con WatchPaths, así que ahí vale el label.
+SERVICE_NAME = "pair-watch.path"
+DARWIN_LABEL = "com.tbrain.pair-watch"
 SCRIPT_PATH = Path.home() / ".openclaw" / "scripts" / "pair_watch.py"
 CONFIG_PATH = Path.home() / ".openclaw" / "pair-watch.json"
 
@@ -26,7 +32,7 @@ def main() -> int:
     expected = entry.get("version") if entry else "unknown"
 
     checks = [
-        check_service_active(SERVICE_NAME),
+        check_service_active(SERVICE_NAME, darwin_label=DARWIN_LABEL),
         check_script_version(SCRIPT_PATH, expected),
         check_json_valid(CONFIG_PATH),
     ]

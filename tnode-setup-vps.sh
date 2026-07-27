@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.87.2"
+TNODE_SETUP_VERSION="1.88.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -22928,9 +22928,13 @@ for comp_id, fname in [
         "source": f"scripts/{fname}",
     })
 
+# El installer hace `npm install -g openclaw@<pin>`: UN solo package que
+# provee gateway y CLI. Los nombres `@openclaw/gateway` / `@openclaw/cli`
+# no existen en el registry, asi que npm_ver() devolvia None y este
+# manifiesto grababa "unknown" para ambos en todos los nodos.
 for comp_id, npm_name in [
-    ("openclaw-gateway", "@openclaw/gateway"),
-    ("openclaw-cli",     "@openclaw/cli"),
+    ("openclaw-gateway", "openclaw"),
+    ("openclaw-cli",     "openclaw"),
 ]:
     components.append({
         "id": comp_id, "kind": "binary-npm",

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """verify_tnode-telemetry — health check del sidecar WebSocket proxy + telemetry."""
 from __future__ import annotations
-__VERSION__ = "1.0.1"
+__VERSION__ = "1.1.0"
 
 import sys
 from pathlib import Path
@@ -20,7 +20,13 @@ from verify_common import (  # noqa: E402
 COMPONENT_ID = "tnode-telemetry"
 SERVICE_NAME = "tnode-telemetry"
 SCRIPT_PATH = Path.home() / ".openclaw" / "scripts" / "tnode_telemetry.py"
-LOG_PATH = Path.home() / ".openclaw" / "logs" / "tnode-telemetry.log"
+# La unit redirige stdout/stderr a .out.log / .err.log y el daemon no
+# escribe un `tnode-telemetry.log` propio, así que el path único daba
+# "log file not found" en nodos vivos. Se queda con el más reciente.
+_LOGS = Path.home() / ".openclaw" / "logs"
+LOG_PATH = [_LOGS / "tnode-telemetry.log",
+            _LOGS / "tnode-telemetry.err.log",
+            _LOGS / "tnode-telemetry.out.log"]
 TELEMETRY_WS_URL = "ws://127.0.0.1:18790"
 
 

@@ -24,7 +24,7 @@ Exit codes:
 Stdlib only (Python 3.9+). Diseñado para correr en Mac/Linux sin deps externas.
 """
 from __future__ import annotations
-__VERSION__ = "1.0.2"
+__VERSION__ = "1.1.0"
 
 import hashlib
 import json
@@ -79,14 +79,27 @@ def find_self(component_id: str, manifest_path: Optional[Path] = None) -> Option
 
 
 def check_service_active(service_name: str,
-                         darwin_label: Optional[str] = None) -> CheckResult:
+                         darwin_label: Optional[str] = None,
+                         soft: bool = False) -> CheckResult:
     """Linux: `systemctl --user is-active <service_name>`.
     macOS: `launchctl print gui/<uid>/<darwin_label>` (LaunchAgents live in
     the user-level domain, not system/). If darwin_label is None, default
     to `com.tbrain.<service_name>` — the convention for TBrain daemons.
     Pass an explicit label for non-TBrain services like cloudflared
     (`com.cloudflare.cloudflared`) or openclaw-gateway (`ai.openclaw.gateway`).
+
+    soft=True es para componentes que pueden legítimamente no tener unit y
+    cuya liveness la demuestra otro check — el gateway lo arranca el CLI de
+    openclaw, no una unit nuestra, y ahí el probe al WS es la señal que vale.
+    En ese modo se distingue no-existe de existe-pero-muerta:
+
+      - unit ausente  → ok   (arquitectura esperada, no hay nada que reportar)
+      - unit presente pero inactive → fail (eso sí es un problema real)
+
+    Sin la distinción quedaba un warn perpetuo en cada nodo Linux, que es
+    otra forma de ruido: enseña a ignorar el check igual que un fail fijo.
     """
+    miss = "warn" if soft else "fail"
     if sys.platform == "darwin":
         import os
         label = darwin_label or f"com.tbrain.{service_name}"
@@ -94,7 +107,7 @@ def check_service_active(service_name: str,
         if rc == 0 and "state = running" in out:
             return {"name": "service-active", "status": "ok",
                     "details": f"launchd: {label} running"}
-        return {"name": "service-active", "status": "fail",
+        return {"name": "service-active", "status": miss,
                 "details": f"launchd: {label} not running (rc={rc})"}
     # Linux: try user service first (matches install_*_systemd in installer),
     # fall back to system service for legacy installs.
@@ -106,7 +119,18 @@ def check_service_active(service_name: str,
     if rc == 0 and out == "active":
         return {"name": "service-active", "status": "ok",
                 "details": f"systemd: {service_name} active"}
-    return {"name": "service-active", "status": "fail",
+    if soft:
+        # ¿Existe siquiera la unit? `systemctl cat` falla con "No files found"
+        # cuando no hay fichero, tanto en --user como en system.
+        absent = all(_run(scope + ["cat", service_name])[0] != 0
+                     for scope in (["systemctl", "--user"], ["systemctl"]))
+        if absent:
+            return {"name": "service-active", "status": "ok",
+                    "details": f"systemd: sin unit {service_name} "
+                               "(gestionado por el CLI de openclaw)"}
+        return {"name": "service-active", "status": "fail",
+                "details": f"systemd: {service_name} existe pero status={out or 'unknown'}"}
+    return {"name": "service-active", "status": miss,
             "details": f"systemd: {service_name} status={out or 'unknown'}"}
 
 
@@ -206,11 +230,23 @@ def check_json_valid(path: Path) -> CheckResult:
                 "details": f"{path} parse error: {e}"}
 
 
-def check_log_progress(log_path: Path, max_age_seconds: int = 120) -> CheckResult:
-    """Verifica que el log file haya sido escrito en los últimos N segundos."""
-    if not log_path.exists():
+def check_log_progress(log_path, max_age_seconds: int = 120) -> CheckResult:
+    """Verifica que el log file haya sido escrito en los últimos N segundos.
+
+    Acepta un Path o una lista de candidatos. Con lista se queda con el más
+    reciente de los que existan: no todos los daemons escriben su propio
+    `<id>.log` — telemetry, por ejemplo, sólo tiene los `.out.log` / `.err.log`
+    que redirige la unit, y buscar un único nombre fijo daba "log file not
+    found" en nodos perfectamente vivos.
+    """
+    candidates = [log_path] if isinstance(log_path, Path) else list(log_path)
+    existing = [p for p in candidates if p.exists()]
+    if existing:
+        log_path = max(existing, key=lambda p: p.stat().st_mtime)
+    else:
+        shown = ", ".join(str(p) for p in candidates)
         return {"name": "log-progress", "status": "warn",
-                "details": f"log file not found: {log_path}"}
+                "details": f"log file not found: {shown}"}
     age = time.time() - log_path.stat().st_mtime
     if age <= max_age_seconds:
         return {"name": "log-progress", "status": "ok",
@@ -238,6 +274,31 @@ def check_npm_version(package_name: str) -> CheckResult:
     except json.JSONDecodeError as e:
         return {"name": "npm-version", "status": "fail",
                 "details": f"npm ls JSON parse error: {e}"}
+
+
+def check_binary_version(command: str, args: Optional[list] = None) -> CheckResult:
+    """Versión de un binario suelto, vía `<command> --version`.
+
+    Para lo que no viene de un package manager. cloudflared se instala
+    descargando el binario de GitHub Releases a /usr/local/bin, así que
+    dpkg-query nunca lo encuentra y `check_apt_version` avisaba de que "no
+    está instalado" en todos los nodos Linux, con el túnel corriendo.
+    """
+    path = shutil.which(command)
+    if path is None:
+        return {"name": "binary-version", "status": "fail",
+                "details": f"{command} no encontrado en PATH"}
+    rc, out, err = _run([command] + (args or ["--version"]), timeout=10)
+    blob = out or err
+    if rc != 0 and not blob:
+        return {"name": "binary-version", "status": "fail",
+                "details": f"{command} --version falló (rc={rc})"}
+    m = re.search(r"\d+\.\d+\.\d+", blob)
+    if not m:
+        return {"name": "binary-version", "status": "warn",
+                "details": f"{path}: sin versión reconocible en {blob[:60]!r}"}
+    return {"name": "binary-version", "status": "ok",
+            "details": f"{command}={m.group(0)} ({path})"}
 
 
 def check_apt_version(package_name: str) -> CheckResult:
