@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.89.0"
+TNODE_SETUP_VERSION="1.89.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -23235,18 +23235,59 @@ run_smoke_test_one() {
         warn "smoke test $comp: python3 no disponible, skip"
         return 0
     fi
+# Resume por que fallo un verify, para la linea de resultado del smoke test.
+#
+# Los verify_<comp>.py imprimen JSON con indent=2, asi que el `tail -1` que
+# habia aqui devolvia literalmente "}" — la salida decia `warn — }` y no
+# informaba de nada, justo cuando algo iba mal y hacia falta leerla.
+#
+# Lista los checks que no estan en ok/skipped, con su nombre y detalle. Es
+# tolerante: el verify se captura con 2>&1, asi que la salida puede llevar
+# ruido de stderr por delante del JSON; se busca la primera llave y se parsea
+# desde ahi, y si aun asi no hay JSON valido se cae a la ultima linea con
+# contenido, que es lo mejor disponible.
+_smoke_reason() {
+    local raw="$1"
+    local parsed
+    parsed="$(printf '%s' "$raw" | python3 -c '
+import json, sys
+raw = sys.stdin.read()
+i = raw.find("{")
+if i >= 0:
+    try:
+        d = json.loads(raw[i:])
+        bad = [c for c in d.get("checks", [])
+               if c.get("status") not in ("ok", "skipped")]
+        if bad:
+            print("; ".join("%s: %s" % (c.get("name", "?"), c.get("details", ""))
+                            for c in bad))
+        else:
+            print(d.get("error") or "status=%s" % d.get("status", "?"))
+        sys.exit(0)
+    except Exception:
+        pass
+sys.exit(1)
+' 2>/dev/null)" || parsed=""
+
+    if [[ -n "$parsed" ]]; then
+        printf '%s' "$parsed"
+    else
+        printf '%s' "$(printf '%s' "$raw" | grep -v '^[[:space:]]*$' | tail -1)"
+    fi
+}
+
     info "Smoke test: $comp"
     local out rc=0
     out="$(run_as_tnode python3 "$script" 2>&1)" || rc=$?
     case "$rc" in
         0) success "smoke $comp: OK"; return 0 ;;
-        1) warn    "smoke $comp: warn — $(echo "$out" | tail -1)"; return 0 ;;
+        1) warn    "smoke $comp: warn — $(_smoke_reason "$out")"; return 0 ;;
         *)
             if [[ "$abort_on_fail" == "1" ]]; then
                 echo "$out" >&2
                 die "smoke $comp: FAIL (exit $rc). Re-run con --no-smoke-test para forzar."
             fi
-            warn "smoke $comp: FAIL (exit $rc) — $(echo "$out" | tail -1)"
+            warn "smoke $comp: FAIL (exit $rc) — $(_smoke_reason "$out")"
             return "$rc"
             ;;
     esac
