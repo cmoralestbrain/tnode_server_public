@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.88.0"
+TNODE_SETUP_VERSION="1.88.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -5226,8 +5226,19 @@ cfd_write_restart_dropin() {
     # tienen y no queremos dejarles un drop-in huérfano).
     [[ -f /etc/systemd/system/cloudflared.service ]] || return 0
 
-    mkdir -p /etc/systemd/system/cloudflared.service.d
-    cat > /etc/systemd/system/cloudflared.service.d/restart-always.conf <<'CFDOVERRIDE'
+    # El drop-in vive en /etc: sin root no hay nada que hacer. Las instalaciones
+    # a nivel de usuario (installer lanzado sin sudo, con TNODE_USER=$USER y las
+    # units en ~/.config/systemd/user) llegan aqui con la unit de SISTEMA de
+    # cloudflared presente pero sin permiso de escritura sobre ella. Sin este
+    # guard el `mkdir` denegado aborta el update entero por `set -e`.
+    if [[ "$(id -u)" != "0" ]]; then
+        warn "cloudflared: el drop-in de restart requiere root — re-lanza con sudo para aplicarlo"
+        return 0
+    fi
+
+    local _cfd_tmp
+    _cfd_tmp="$(mktemp)" || return 0
+    cat > "$_cfd_tmp" <<'CFDOVERRIDE'
 [Unit]
 StartLimitIntervalSec=0
 
@@ -5235,6 +5246,13 @@ StartLimitIntervalSec=0
 Restart=always
 RestartSec=5s
 CFDOVERRIDE
+    if ! mkdir -p /etc/systemd/system/cloudflared.service.d 2>/dev/null ||
+       ! mv "$_cfd_tmp" /etc/systemd/system/cloudflared.service.d/restart-always.conf 2>/dev/null; then
+        rm -f "$_cfd_tmp"
+        warn "cloudflared: no se pudo escribir el drop-in de restart"
+        return 0
+    fi
+    chmod 0644 /etc/systemd/system/cloudflared.service.d/restart-always.conf 2>/dev/null || true
     systemctl daemon-reload 2>/dev/null || true
 }
 
