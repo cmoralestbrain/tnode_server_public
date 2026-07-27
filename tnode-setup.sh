@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.88.1"
+TNODE_SETUP_VERSION="1.88.2"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -5256,6 +5256,70 @@ CFDOVERRIDE
     systemctl daemon-reload 2>/dev/null || true
 }
 
+# Drop-in que desactiva el burst guard de las units de pair-watch.
+#
+# pair-watch.service es un oneshot disparado por pair-watch.path cuando cambia
+# pending.json, asi que arrancar varias veces seguidas es su operacion normal.
+# Con el limite por defecto de systemd (5 arranques / 10s) una tanda de
+# escrituras lo tumba:
+#
+#   pair-watch.service: Start request repeated too quickly.
+#   pair-watch.service: Failed with result 'start-limit-hit'.
+#   pair-watch.path:    Failed with result 'unit-start-limit-hit'.
+#
+# ...y a partir de ahi el auto-approver de pairing queda muerto hasta que
+# alguien hace `reset-failed`. Observado en clawpi el 2026-07-27, disparado
+# por el propio restart del update.
+#
+# Se escribe como drop-in y no reescribiendo la unit porque `--update-only`
+# nunca regenera ficheros de unit (_systemd_update_only_handled solo hace
+# daemon-reload + restart): sin esto, los nodos ya desplegados no recibirian
+# el arreglo del heredoc jamas. Idempotente; cubre los dos layouts que
+# existen en la flota — units de sistema (installer como root) y units de
+# usuario (installer sin sudo, p.ej. el Pi).
+pw_write_burst_dropin() {
+    [[ "$OS" == "Linux" ]] || return 0
+
+    local base reload_scope
+    if [[ -f "${HOME}/.config/systemd/user/pair-watch.service" ]]; then
+        base="${HOME}/.config/systemd/user"
+        reload_scope="user"
+    elif [[ -f /etc/systemd/system/pair-watch.service ]]; then
+        base="/etc/systemd/system"
+        reload_scope="system"
+        if [[ "$(id -u)" != "0" ]]; then
+            warn "pair-watch: el burst guard requiere root — re-lanza con sudo para aplicarlo"
+            return 0
+        fi
+    else
+        return 0
+    fi
+
+    local unit
+    for unit in pair-watch.service pair-watch.path; do
+        [[ -f "$base/$unit" ]] || continue
+        local tmp
+        tmp="$(mktemp)" || return 0
+        cat > "$tmp" <<'PWBURST'
+[Unit]
+StartLimitIntervalSec=0
+PWBURST
+        if ! mkdir -p "$base/$unit.d" 2>/dev/null ||
+           ! mv "$tmp" "$base/$unit.d/burst.conf" 2>/dev/null; then
+            rm -f "$tmp"
+            warn "pair-watch: no se pudo escribir el drop-in de $unit"
+            return 0
+        fi
+        chmod 0644 "$base/$unit.d/burst.conf" 2>/dev/null || true
+    done
+
+    if [[ "$reload_scope" == "user" ]]; then
+        XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user daemon-reload 2>/dev/null || true
+    else
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+}
+
 # ═════════════════════════════════════════════
 # PHASE 4: Tailscale
 # ═════════════════════════════════════════════
@@ -6217,6 +6281,11 @@ install_pair_watch_systemd() {
 [Unit]
 Description=OpenClaw pair-watch auto-approver (oneshot)
 After=network.target
+# Oneshot disparado por pair-watch.path: arrancar en rafaga es su modo normal
+# de operacion, no un caso raro. Con el limite por defecto (5 arranques/10s)
+# una tanda de escrituras a pending.json lo tumba con 'start-limit-hit' y se
+# lleva por delante a la .path con 'unit-start-limit-hit'.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -6236,6 +6305,9 @@ SVCUNIT
 [Unit]
 Description=Watch OpenClaw pending.json and trigger pair-watch.service
 After=network.target
+# Ver pair-watch.service: sin esto la .path cae por 'unit-start-limit-hit'
+# en cuanto la service agota su propio limite de arranques.
+StartLimitIntervalSec=0
 
 [Path]
 PathModified=${OPENCLAW_HOME}/devices/pending.json
@@ -23639,12 +23711,13 @@ main() {
         # provisioning / tailscale. Kernel + cloudflared refresh is delegated
         # to `--component=<id>` so operators choose explicitly when to bump.
         info "modo --update-only: skip ollama / openclaw / tunnel / tailscale"
-        # Excepción: reescribir el drop-in de restart de cloudflared. Es sólo
-        # config systemd (no toca binarios ni secretos), y es la ÚNICA vía por
-        # la que los nodos ya desplegados reciben la corrección de
-        # StartLimitIntervalSec ([Unit], no [Service]) — phase_tunnel entera
-        # se salta en este modo. No-op si el nodo no tiene cloudflared.
+        # Excepción: reescribir los drop-ins de systemd. Es sólo config (no
+        # toca binarios ni secretos), y es la ÚNICA vía por la que los nodos ya
+        # desplegados los reciben: phase_tunnel entera se salta en este modo, y
+        # _systemd_update_only_handled no regenera ficheros de unit. Ambas
+        # funciones son no-op si el componente no está presente.
         cfd_write_restart_dropin
+        pw_write_burst_dropin
     fi
     phase_helpers
     # In update-only mode, phase_helpers refreshes pair-watch + tnode-config-sync
