@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.87.0"
+TNODE_SETUP_VERSION="1.87.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -5231,6 +5231,43 @@ openclaw_configure_as_tnode() {
     fi
 }
 
+# Escribe (o reescribe) el drop-in que endurece el reinicio de cloudflared.
+#
+# Override Restart=on-failure (default from `cloudflared service install`)
+# → Restart=always. Cloudflare sometimes terminates connectors cleanly with
+# exit 0 (e.g. "no more connections active and exiting" after a control-stream
+# failure on the CF edge side), and on-failure does NOT retry exit 0. Without
+# this override the tunnel stays dead until a human runs
+# `systemctl start cloudflared`. Drop-in survives future
+# `cloudflared service install` re-runs.
+#
+# StartLimitIntervalSec va en [Unit], NO en [Service]: systemd la ignora ahí
+# ("Unknown key name 'StartLimitIntervalSec' in section 'Service', ignoring")
+# y el burst guard se queda en el default (5 arranques / 10s) — justo lo que
+# este drop-in intenta desactivar.
+#
+# Idempotente y sin efectos sobre secretos: se llama en la instalación fresca
+# (4c), en cada re-run sobre un nodo ya provisionado, y en --update-only —
+# los nodos desplegados con la versión mala del drop-in (<= v1.87.0) sólo se
+# reparan por esta vía (tnode-rollout-syncer sólo sincroniza daemons Python).
+cfd_write_restart_dropin() {
+    [[ "$OS" == "Linux" ]] || return 0
+    # Sólo si el nodo tiene de verdad el servicio (nodos --no-tunnel no lo
+    # tienen y no queremos dejarles un drop-in huérfano).
+    [[ -f /etc/systemd/system/cloudflared.service ]] || return 0
+
+    mkdir -p /etc/systemd/system/cloudflared.service.d
+    cat > /etc/systemd/system/cloudflared.service.d/restart-always.conf <<'CFDOVERRIDE'
+[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+Restart=always
+RestartSec=5s
+CFDOVERRIDE
+    systemctl daemon-reload 2>/dev/null || true
+}
+
 # ═════════════════════════════════════════════
 # PHASE 4: Tailscale
 # ═════════════════════════════════════════════
@@ -5303,6 +5340,11 @@ phase_tunnel() {
             success "Tunnel ya provisionado: $TUNNEL_DOMAIN"
             # Reconfigure gateway to loopback for tunnel mode
             configure_gateway_bind "1" >/dev/null 2>&1
+            # Re-escribe el drop-in de restart. Este return se salta la fase
+            # 4c completa, así que sin esto los nodos ya provisionados nunca
+            # recibirían la corrección de StartLimitIntervalSec ([Unit], no
+            # [Service] — ver cfd_write_restart_dropin).
+            cfd_write_restart_dropin
             return 0
         fi
     fi
@@ -5421,22 +5463,9 @@ with open('$tunnel_json', 'w') as f:
             # Install as system service (runs as root, tunnel handles its own permissions)
             "$cfd_bin" service install "$TUNNEL_TOKEN" 2>/dev/null || true
 
-            # Override Restart=on-failure (default from `cloudflared service
-            # install`) → Restart=always. Cloudflare sometimes terminates
-            # connectors cleanly with exit 0 (e.g. "no more connections
-            # active and exiting" after a control-stream failure on the
-            # CF edge side), and on-failure does NOT retry exit 0.
-            # Without this override the tunnel stays dead until a human
-            # runs `systemctl start cloudflared`. Drop-in survives future
-            # `cloudflared service install` re-runs.
-            mkdir -p /etc/systemd/system/cloudflared.service.d
-            cat > /etc/systemd/system/cloudflared.service.d/restart-always.conf <<'CFDOVERRIDE'
-[Service]
-Restart=always
-RestartSec=5s
-StartLimitIntervalSec=0
-CFDOVERRIDE
-            systemctl daemon-reload 2>/dev/null || true
+            # Restart=always + burst guard desactivado. Ver
+            # cfd_write_restart_dropin() para el porqué de cada llave.
+            cfd_write_restart_dropin
 
             if systemctl is-active --quiet cloudflared 2>/dev/null; then
                 success "Servicio cloudflared activo"
@@ -23634,6 +23663,12 @@ main() {
         # provisioning / tailscale. Kernel + cloudflared refresh is delegated
         # to `--component=<id>` so operators choose explicitly when to bump.
         info "modo --update-only: skip ollama / openclaw / tunnel / tailscale"
+        # Excepción: reescribir el drop-in de restart de cloudflared. Es sólo
+        # config systemd (no toca binarios ni secretos), y es la ÚNICA vía por
+        # la que los nodos ya desplegados reciben la corrección de
+        # StartLimitIntervalSec ([Unit], no [Service]) — phase_tunnel entera
+        # se salta en este modo. No-op si el nodo no tiene cloudflared.
+        cfd_write_restart_dropin
     fi
     phase_helpers
     # In update-only mode, phase_helpers refreshes pair-watch + tnode-config-sync
