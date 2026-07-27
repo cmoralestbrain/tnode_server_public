@@ -24,7 +24,7 @@ Exit codes:
 Stdlib only (Python 3.9+). Diseñado para correr en Mac/Linux sin deps externas.
 """
 from __future__ import annotations
-__VERSION__ = "1.1.0"
+__VERSION__ = "1.2.0"
 
 import hashlib
 import json
@@ -274,6 +274,44 @@ def check_npm_version(package_name: str) -> CheckResult:
     except json.JSONDecodeError as e:
         return {"name": "npm-version", "status": "fail",
                 "details": f"npm ls JSON parse error: {e}"}
+
+
+def check_start_limit_disabled(unit: str) -> CheckResult:
+    """Verifica que el burst guard de systemd esté desactivado en la unit.
+
+    Con el default (StartLimitIntervalSec=10s / StartLimitBurst=5) systemd se
+    rinde tras 5 arranques en 10s y deja la unit muerta hasta que alguien haga
+    `reset-failed`. En cloudflared eso deja el túnel caído; en pair-watch, que
+    es un oneshot disparado por una .path, basta una tanda de escrituras a
+    pending.json para tumbarlo — ocurrió en clawpi el 2026-07-27.
+
+    Los arreglos viven en drop-ins (v1.87.1 cloudflared, v1.88.2 pair-watch), y
+    un drop-in se puede perder: `cloudflared service install` reescribe la unit,
+    una reinstalación puede no repetir el drop-in, alguien lo borra. Sin este
+    check nada delata la regresión — la unit sigue `active` y el resto de
+    comprobaciones en verde hasta el día que se cae y no vuelve.
+
+    warn, no fail: es un defecto de resiliencia, no una caída. El servicio
+    está funcionando; lo que falta es la red de seguridad.
+    """
+    if sys.platform == "darwin":
+        return {"name": f"start-limit:{unit}", "status": "skipped",
+                "details": "launchd no tiene equivalente a StartLimitIntervalSec"}
+    for scope in (["systemctl", "--user"], ["systemctl"]):
+        if _run(scope + ["cat", unit])[0] != 0:
+            continue
+        rc, out, _ = _run(scope + ["show", unit, "-p", "StartLimitIntervalUSec"])
+        value = out.split("=", 1)[1].strip() if "=" in out else ""
+        if value == "0":
+            return {"name": f"start-limit:{unit}", "status": "ok",
+                    "details": f"{unit}: burst guard desactivado (StartLimitIntervalUSec=0)"}
+        return {"name": f"start-limit:{unit}", "status": "warn",
+                "details": f"{unit}: burst guard ACTIVO "
+                           f"(StartLimitIntervalUSec={value or 'desconocido'}) — "
+                           "falta el drop-in; la unit puede quedarse muerta tras "
+                           "varios arranques seguidos"}
+    return {"name": f"start-limit:{unit}", "status": "skipped",
+            "details": f"no existe la unit {unit}"}
 
 
 def check_binary_version(command: str, args: Optional[list] = None) -> CheckResult:

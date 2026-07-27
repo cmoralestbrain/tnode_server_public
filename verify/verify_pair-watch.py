@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """verify_pair-watch — health check del auto-approver de device pairing."""
 from __future__ import annotations
-__VERSION__ = "1.1.0"
+__VERSION__ = "1.2.0"
 
 import sys
 from pathlib import Path
@@ -11,6 +11,7 @@ from verify_common import (  # noqa: E402
     check_json_valid,
     check_script_version,
     check_service_active,
+    check_start_limit_disabled,
     find_self,
     report,
 )
@@ -33,6 +34,10 @@ def main() -> int:
 
     checks = [
         check_service_active(SERVICE_NAME, darwin_label=DARWIN_LABEL),
+        # Las dos units necesitan el guard: la .service es la que agota el
+        # límite de arranques, y la .path cae detrás por unit-start-limit-hit.
+        check_start_limit_disabled("pair-watch.service"),
+        check_start_limit_disabled(SERVICE_NAME),
         check_script_version(SCRIPT_PATH, expected),
         check_json_valid(CONFIG_PATH),
     ]
