@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.92.0"
+TNODE_SETUP_VERSION="1.92.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -106,6 +106,12 @@ OPENCLAW_WA_PLUGIN_VERSION="${OPENCLAW_WA_PLUGIN_VERSION-2026.5.19}"
 # que update_plugins_if_stale pueda compararlo: el installer se ejecuta via
 # `curl | bash`, asi que $0 es "bash" y no se puede releer el propio fichero.
 OPENCLAW_WS_PLUGIN_VERSION="${OPENCLAW_WS_PLUGIN_VERSION-0.2.2}"
+# Lo pone update_plugins_if_stale cuando reinstala algun plugin, para que
+# ensure_openclaw_gateway_fresh reinicie el gateway. Un plugin nuevo en disco no
+# lo carga el proceso en marcha —el propio CLI lo dice: "Restart the gateway to
+# load plugins"—, asi que sin esto el update reportaba "1 actualizado" mientras
+# el gateway seguia ejecutando el codigo viejo.
+PLUGINS_CHANGED=0
 TNODE_USER="tnode"
 TNODE_HOME=""      # set in setup_tnode_user()
 OPENCLAW_HOME=""   # set in setup_tnode_user()
@@ -5109,7 +5115,8 @@ update_plugins_if_stale() {
 
     if [[ "$updated" -gt 0 ]]; then
         chown "$TNODE_USER":"$TNODE_USER" "$OPENCLAW_HOME/openclaw.json" 2>/dev/null || true
-        success "plugins: $updated actualizado(s)"
+        PLUGINS_CHANGED=1
+        success "plugins: $updated actualizado(s) — el gateway se reiniciará para cargarlos"
     else
         success "plugins al dia ($checked comprobados)"
     fi
@@ -23320,14 +23327,18 @@ ensure_openclaw_gateway_fresh() {
     [[ -z "$daemon_start_ts" ]] && return 0
     daemon_start_epoch="$(date -d "$daemon_start_ts" +%s 2>/dev/null)" || return 0
 
-    if [[ "$pkg_mtime" -le "$daemon_start_epoch" ]]; then
+    if [[ "$pkg_mtime" -le "$daemon_start_epoch" ]] && [[ "${PLUGINS_CHANGED:-0}" != "1" ]]; then
         info "openclaw-gateway al día (paquete sin cambios desde último start)"
         return 0
     fi
 
     local installed_ver
     installed_ver="$(openclaw --version 2>/dev/null | awk '{print $2}')"
-    warn "openclaw-gateway corre binary obsoleto (paquete actualizado tras start del daemon)"
+    if [[ "${PLUGINS_CHANGED:-0}" == "1" ]]; then
+        info "Reiniciando openclaw-gateway para cargar los plugins actualizados..."
+    else
+        warn "openclaw-gateway corre binary obsoleto (paquete actualizado tras start del daemon)"
+    fi
     info "Reiniciando openclaw-gateway para cargar ${installed_ver:-versión instalada}..."
     _gw_systemctl daemon-reload 2>/dev/null || true
     _gw_systemctl restart openclaw-gateway 2>/dev/null || true
