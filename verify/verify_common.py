@@ -24,7 +24,7 @@ Exit codes:
 Stdlib only (Python 3.9+). Diseñado para correr en Mac/Linux sin deps externas.
 """
 from __future__ import annotations
-__VERSION__ = "1.3.0"
+__VERSION__ = "1.4.0"
 
 import hashlib
 import json
@@ -107,6 +107,20 @@ def check_service_active(service_name: str,
         if rc == 0 and "state = running" in out:
             return {"name": "service-active", "status": "ok",
                     "details": f"launchd: {label} running"}
+        # Un LaunchAgent con WatchPaths y SIN KeepAlive sólo corre cuando el
+        # fichero vigilado cambia: `state = not running` es su reposo correcto,
+        # no una caída. Es el equivalente macOS del oneshot disparado por .path
+        # que se arregló para Linux en v1.88.0 — allí se mira la .path, aquí se
+        # mira si el agente está CARGADO y no ha salido con error.
+        # Visto en el mini (2026-07-28): pair-watch daba fail permanente con
+        # WatchPaths sobre devices/pending.json y "last exit code (never exited)".
+        if rc == 0 and "WatchPaths" in out and "KeepAlive" not in out:
+            if "last exit code = 0" in out or "never exited" in out:
+                return {"name": "service-active", "status": "ok",
+                        "details": f"launchd: {label} cargado, en espera "
+                                   "(WatchPaths sin KeepAlive)"}
+            return {"name": "service-active", "status": miss,
+                    "details": f"launchd: {label} en espera pero salió con error"}
         return {"name": "service-active", "status": miss,
                 "details": f"launchd: {label} not running (rc={rc})"}
     # Linux: try user service first (matches install_*_systemd in installer),

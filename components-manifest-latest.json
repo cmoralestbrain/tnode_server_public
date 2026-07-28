@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-07-28T03:02:32.731536+00:00",
-  "tag": "tnode-setup-v1.95.1",
+  "generatedAt": "2026-07-28T03:18:12.471992+00:00",
+  "tag": "tnode-setup-v1.96.0",
   "components": [
     {
       "id": "tnode-chat-sync",

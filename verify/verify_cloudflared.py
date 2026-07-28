@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """verify_cloudflared — health check del túnel Cloudflare (driftAllowed=true)."""
 from __future__ import annotations
-__VERSION__ = "1.2.0"
+__VERSION__ = "1.3.0"
 
 import sys
 from pathlib import Path
@@ -30,7 +30,18 @@ def main() -> int:
     # Releases a /usr/local/bin, así que dpkg-query nunca lo encuentra y
     # apt-version avisaba de "not installed" con el túnel corriendo. El
     # binario manda; apt queda como fallback para instalaciones vía .deb.
-    ver_check = check_binary_version(PACKAGE_NAME)
+    # Rutas donde vive de verdad segun como se instalo. En Linux es el binario
+    # de GitHub Releases en /usr/local/bin; en macOS lo pone Homebrew y el
+    # LaunchAgent apunta al path versionado de la cellar
+    # (/opt/homebrew/opt/cloudflared/bin/cloudflared), que NO esta en el PATH de
+    # una sesion SSH — ni tampoco `brew`, asi que el fallback tambien fallaba y
+    # el mini reportaba warn con el tunel corriendo (2026-07-28).
+    extra = [
+        Path("/usr/local/bin") / PACKAGE_NAME,
+        Path("/opt/homebrew/bin") / PACKAGE_NAME,
+        Path("/opt/homebrew/opt") / PACKAGE_NAME / "bin" / PACKAGE_NAME,
+    ]
+    ver_check = check_binary_version(PACKAGE_NAME, extra_paths=extra)
     if ver_check["status"] != "ok":
         ver_check = check_apt_version(PACKAGE_NAME)
 
