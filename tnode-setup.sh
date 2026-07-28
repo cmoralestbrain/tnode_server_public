@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.91.2"
+TNODE_SETUP_VERSION="1.92.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -102,6 +102,10 @@ OPENCLAW_PIN_VERSION="${OPENCLAW_PIN_VERSION-2026.6.10}"
 # pide >= 2026.7.1) y el core está clavado arriba. Bumpear SOLO junto con
 # OPENCLAW_PIN_VERSION, nunca por separado.
 OPENCLAW_WA_PLUGIN_VERSION="${OPENCLAW_WA_PLUGIN_VERSION-2026.5.19}"
+# Pin del plugin web-search. Global (no local de install_websearch_plugin) para
+# que update_plugins_if_stale pueda compararlo: el installer se ejecuta via
+# `curl | bash`, asi que $0 es "bash" y no se puede releer el propio fichero.
+OPENCLAW_WS_PLUGIN_VERSION="${OPENCLAW_WS_PLUGIN_VERSION-0.2.2}"
 TNODE_USER="tnode"
 TNODE_HOME=""      # set in setup_tnode_user()
 OPENCLAW_HOME=""   # set in setup_tnode_user()
@@ -5006,6 +5010,81 @@ materialize_pathb_plugins() {
 }
 # <<< END PATH B PLUGINS
 
+# Lee la version de un plugin desde su package.json. Vacio si no existe.
+_plugin_pkg_version() {
+    local d="$1"
+    [[ -f "$d/package.json" ]] || return 0
+    python3 -c "
+import json,sys
+try: print(json.load(open('$d/package.json')).get('version') or '')
+except Exception: pass" 2>/dev/null || true
+}
+
+# Refresca los plugins embebidos SOLO si su version difiere de la instalada.
+#
+# materialize_pathb_plugins() hace `openclaw plugins install --force` de los
+# cuatro sin comparar nada. Es correcto en instalacion fresca, pero caro en cada
+# update: cuatro instalaciones por el SDK, cada una con su escaneo de codigo
+# peligroso, y con el gateway ya corriendo. Aqui se desempaqueta (barato) y solo
+# se reinstala lo que cambio de verdad.
+#
+# Existe porque `--update-only` se salta phase_openclaw entera, que es de donde
+# cuelga materialize_pathb_plugins: hasta v1.92.0 los plugins NUNCA se
+# actualizaban en un update, solo en instalacion completa. Misma forma de
+# problema que los drop-ins de systemd (v1.87.1, v1.88.2): la funcion existia,
+# nadie la invocaba desde la rama de update.
+update_plugins_if_stale() {
+    local ext_dir="$OPENCLAW_HOME/extensions"
+    [[ -d "$ext_dir" ]] || return 0
+
+    local stage_dir="$OPENCLAW_HOME/.pathb-stage"
+    rm -rf "$stage_dir"; mkdir -p "$stage_dir"
+    if ! _pathb_plugins_b64 | base64 -d | tar xz -C "$stage_dir" 2>/dev/null; then
+        warn "plugins: no se pudo desempacar el bundle embebido"
+        rm -rf "$stage_dir"
+        return 0
+    fi
+    chown -R "$TNODE_USER":"$TNODE_USER" "$stage_dir" 2>/dev/null || true
+
+    local pid emb inst updated=0 checked=0
+    for pid in tbrain-context-engine tnode tnode-transport tnode-wake; do
+        emb="$(_plugin_pkg_version "$stage_dir/$pid")"
+        [[ -n "$emb" ]] || continue
+        checked=$((checked+1))
+        inst="$(_plugin_pkg_version "$ext_dir/$pid")"
+        if [[ "$emb" == "$inst" ]]; then
+            continue
+        fi
+        info "plugin $pid: ${inst:-ausente} → $emb"
+        if run_as_tnode openclaw plugins install "$stage_dir/$pid" --force </dev/null; then
+            run_as_tnode openclaw plugins enable "$pid" </dev/null \
+                || warn "plugin $pid: enable fallo"
+            updated=$((updated+1))
+        else
+            warn "plugin $pid: install fallo"
+        fi
+    done
+    rm -rf "$stage_dir"
+
+    # web-search no va en el bundle Path B (se empaqueta de npm y se transpila),
+    # asi que se compara contra el pin de install_websearch_plugin.
+    local ws_pin="$OPENCLAW_WS_PLUGIN_VERSION"
+    if [[ -n "$ws_pin" ]]; then
+        inst="$(_plugin_pkg_version "$ext_dir/openclaw-web-search")"
+        if [[ -n "$inst" && "$inst" != "$ws_pin" ]]; then
+            info "plugin openclaw-web-search: $inst → $ws_pin"
+            install_websearch_plugin && updated=$((updated+1)) || warn "web-search: update fallo"
+        fi
+    fi
+
+    if [[ "$updated" -gt 0 ]]; then
+        chown "$TNODE_USER":"$TNODE_USER" "$OPENCLAW_HOME/openclaw.json" 2>/dev/null || true
+        success "plugins: $updated actualizado(s)"
+    else
+        success "plugins al dia ($checked comprobados)"
+    fi
+}
+
 # Path B: enable the materialized plugins on every provision. materialize_pathb_plugins
 # INSTALLS them into ~/.openclaw/extensions/ with provenance, but cleanup-pre-snapshot
 # deletes openclaw.json so the snapshot ships NO plugins.entries; phase_tunnel then
@@ -5050,7 +5129,7 @@ enable_pathb_plugins() {
 # bundled inside OpenClaw (no new deps), and install from the staged dir.
 # Bump WS_VER after verifying the new tarball still has a bare index.ts entry.
 install_websearch_plugin() {
-    local ws_pkg="@ollama/openclaw-web-search" ws_ver="0.2.2"
+    local ws_pkg="@ollama/openclaw-web-search" ws_ver="$OPENCLAW_WS_PLUGIN_VERSION"
     local stage_dir="$OPENCLAW_HOME/.websearch-stage"
     local ts_mod
     ts_mod="$(npm root -g 2>/dev/null)/openclaw/node_modules/typescript"
@@ -23788,6 +23867,11 @@ main() {
         # funciones son no-op si el componente no está presente.
         cfd_write_restart_dropin
         pw_write_burst_dropin
+        # Plugins: phase_openclaw se salta en este modo, y de ella cuelga
+        # materialize_pathb_plugins, así que hasta v1.92.0 los plugins nunca se
+        # actualizaban en un update. Con puerta de versión: no reinstala nada si
+        # ya están al día.
+        update_plugins_if_stale
     fi
     phase_helpers
     # In update-only mode, phase_helpers refreshes pair-watch + tnode-config-sync
