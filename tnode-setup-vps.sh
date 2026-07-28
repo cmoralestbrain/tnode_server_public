@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.95.0"
+TNODE_SETUP_VERSION="1.95.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -23734,12 +23734,32 @@ ensure_openclaw_gateway_fresh() {
         info "Reiniciando openclaw-gateway para cargar los plugins actualizados..."
     else
         warn "openclaw-gateway corre binary obsoleto (paquete actualizado tras start del daemon)"
+        info "Reiniciando para cargar ${installed_ver:-versión instalada}..."
     fi
-    info "Reiniciando openclaw-gateway para cargar ${installed_ver:-versión instalada}..."
     _gw_systemctl daemon-reload 2>/dev/null || true
     _gw_systemctl restart openclaw-gateway 2>/dev/null || true
-    sleep 2
-    success "openclaw-gateway reiniciado (ahora corre ${installed_ver:-binary nuevo})"
+
+    # Esperar a que el gateway ACEPTE conexiones, no un tiempo fijo. Con
+    # `sleep 2` el smoke test posterior probaba el puerto antes de que hubiera
+    # terminado de arrancar y reportaba un FAIL falso: visto en el droplet DO
+    # 68.183.48.167 (2GB) el 2026-07-28 — "tcp connect to 127.0.0.1:18789
+    # failed: Connection refused" sobre un gateway que segundos despues estaba
+    # perfectamente activo. En la fase 4 ese falso fallo cuenta como intento y
+    # puede llegar a agotar el freno de reintentos de un nodo sano.
+    local _gw_wait=0
+    while [[ "$_gw_wait" -lt 30 ]]; do
+        if (exec 3<>/dev/tcp/127.0.0.1/18789) 2>/dev/null; then
+            exec 3>&- 2>/dev/null || true
+            break
+        fi
+        sleep 1
+        _gw_wait=$((_gw_wait+1))
+    done
+    if [[ "$_gw_wait" -ge 30 ]]; then
+        warn "openclaw-gateway reiniciado pero :18789 no responde tras 30s"
+    else
+        success "openclaw-gateway reiniciado en ${_gw_wait}s (ahora corre ${installed_ver:-binary nuevo})"
+    fi
 }
 
 # Refresh cloudflared binary by re-downloading the latest release + restart
