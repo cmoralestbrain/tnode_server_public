@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.94.1"
+TNODE_SETUP_VERSION="1.94.2"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -7164,7 +7164,7 @@ from __future__ import annotations
 #          System) — el agente interactivo solo confirma. Mata el doble
 #          envío al proveedor (outbox "APRUEBO…" + tarjeta del motor).
 #          Espejos byte-iguales en tools_sync.ts (editar AMBOS).
-__VERSION__ = "1.61.0"
+__VERSION__ = "1.62.0"
 
 import hashlib
 import hmac
@@ -7560,18 +7560,38 @@ def _detect_layout() -> str:
 
 
 def read_update_policy(token: dict) -> dict | None:
-    """Lee users/{uid}/nodes/{nodeId}/policy/update. None si no existe."""
-    uid, node_id = token["uid"], token["nodeId"]
-    url = f"{_firestore_base()}/users/{uid}/nodes/{node_id}/policy/update"
-    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    """Lee la politica de update del campo `updatePolicyJson` del node doc.
+
+    Va como CAMPO del node doc, no como documento de subcoleccion, por dos
+    razones concretas:
+
+    1) Coste. El daemon ya lee campos del node doc con `_prime_node_fields`,
+       una GET enmascarada que trae varios de golpe ("priming them in ONE
+       masked GET turns 5+ reads into 1"). Un documento aparte no se puede
+       batchear con ese prime y seria una lectura ADICIONAL por pase — que es
+       justo lo que owner-kb-command-trigger-design.md §2 queria evitar al
+       quitar el poll: "a escala (miles de nodos) ese poll idle = lecturas
+       Firestore constantes aunque nadie haga nada".
+    2) Reglas. El nodo YA puede leer su propio node doc, asi que esto no
+       necesita ninguna regla nueva de Firestore. Solo la escritura del
+       inventario la necesita.
+
+    Mismo patron que `inventoryCronJson`, que ya vive asi.
+    """
     try:
-        doc = _http_request("GET", url, None, headers)
+        raw = _firestore_get_node_field(token, "updatePolicyJson")
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None
         raise
-    fields = (doc or {}).get("fields") or {}
-    return {k: _fs_decode(v) for k, v in fields.items()}
+    if not raw:
+        return None
+    try:
+        doc = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        _log("fleet: updatePolicyJson no parsea como JSON")
+        return None
+    return doc if isinstance(doc, dict) else None
 
 
 def _policy_verdict(policy: dict | None, installer_version: str) -> dict:
@@ -9441,7 +9461,7 @@ _AGENDA_MANIFEST = r'''{
 _AGENDA_PY = r'''#!/usr/bin/env python3
 """agenda — consulta y reserva citas contra el calendario del nodo.
 
-__VERSION__ = "1.61.0"
+__VERSION__ = "1.62.0"
 
 Thin client del endpoint `agendaApi` (Cloud Function, HMAC con el
 nodeSecret de tnode-chat-sync.json — mismo flujo que pullLLMConfig, con el
@@ -9697,7 +9717,7 @@ _DRIVE_MANIFEST = r'''{
 _DRIVE_PY = r'''#!/usr/bin/env python3
 """drive — lee la carpeta de Google Drive que el dueño compartió con el nodo.
 
-__VERSION__ = "1.61.0"
+__VERSION__ = "1.62.0"
 
 Thin client del endpoint `driveReadApi` (Cloud Function, HMAC con el
 nodeSecret de tnode-chat-sync.json; la firma incluye el namespace y el
@@ -9986,7 +10006,7 @@ _POLL_MANIFEST = r'''{
 _POLL_PY = r'''#!/usr/bin/env python3
 """poll — difunde una encuesta del dueño a todos los invitados del nodo.
 
-__VERSION__ = "1.61.0"
+__VERSION__ = "1.62.0"
 
 Thin client del endpoint `pollApi` (Cloud Function, HMAC con el nodeSecret de
 tnode-chat-sync.json; la firma incluye namespace + action:
@@ -10208,7 +10228,7 @@ _TNODE_DELEGATE_MANIFEST = r'''{
 _TNODE_DELEGATE_PY = r'''#!/usr/bin/env python3
 """tnode-delegate — delega una tarea a OTRO de los TNodes del dueño.
 
-__VERSION__ = "1.61.0"
+__VERSION__ = "1.62.0"
 
 El agente de ESTE nodo (A) le pasa una tarea al agente de otro nodo enlazado
 (B, un "peer" configurado en el widget Equipo de la app) y lee su respuesta.
@@ -10241,7 +10261,7 @@ import os
 import subprocess
 import sys
 
-__VERSION__ = "1.61.0"
+__VERSION__ = "1.62.0"
 
 
 def _ensure_websockets() -> None:
@@ -10585,7 +10605,7 @@ _INVENTARIO_MANIFEST = r'''{
 _INVENTARIO_PY = r'''#!/usr/bin/env python3
 """inventario — lee el sheet del inventario y estampa el tracking de órdenes.
 
-__VERSION__ = "1.61.0"
+__VERSION__ = "1.62.0"
 
 Thin client del endpoint `inventoryApi` (Cloud Function, HMAC con el
 nodeSecret de tnode-chat-sync.json; la firma es
