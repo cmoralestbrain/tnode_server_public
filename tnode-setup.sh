@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.93.0"
+TNODE_SETUP_VERSION="1.94.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -7116,7 +7116,7 @@ from __future__ import annotations
 #          System) — el agente interactivo solo confirma. Mata el doble
 #          envío al proveedor (outbox "APRUEBO…" + tarjeta del motor).
 #          Espejos byte-iguales en tools_sync.ts (editar AMBOS).
-__VERSION__ = "1.60.0"
+__VERSION__ = "1.61.0"
 
 import hashlib
 import hmac
@@ -7454,6 +7454,149 @@ def update_command(token: dict, cmd_id: str, patch: dict) -> None:
     )
     headers = {"Authorization": f"Bearer {token['idToken']}"}
     _http_request("PATCH", url, _fs_fields(patch), headers)
+
+
+# ── Fase 2/3: inventario de flota + politica de update ─────────
+#
+# El nodo REPORTA lo que tiene (inventory/current) y LEE lo que se quiere de el
+# (policy/update). La nube nunca escribe en la cola de commands: eso preserva la
+# premisa verificada en owner-kb-command-trigger-design.md §2 (cero escritores
+# de nube en commands/), asi que el modelo wake-on-navegacion sigue en pie.
+#
+# Aqui NO se ejecuta ningun update. Fase 3 solo calcula el veredicto y lo
+# publica; aplicar la politica es fase 4 y esta bloqueada por la decision de
+# sudoers (ver docs/fleet-inventory-update-orchestration-design.md §6.2).
+
+FLEET_REPORT_EVERY_S = float(
+    os.environ.get("TNODE_CONFIG_SYNC_FLEET_REPORT_S", "86400")
+)
+_HEALTHCHECK_PATH = OPENCLAW_DIR / "scripts" / "health-check.py"
+
+
+def _run_fleet_health_check() -> dict | None:
+    """Corre health-check.py local y devuelve su JSON. None si no se puede.
+
+    Se usa la copia EN el nodo, no un curl a health.tbrain.app: el reporte no
+    debe depender de la red mas alla de la subida a Firestore, y el CDN de raw
+    .githubusercontent sirve hasta ~4 minutos de contenido cacheado, lo que
+    haria reportar un inventario medido con verifies viejos.
+    """
+    if not _HEALTHCHECK_PATH.is_file():
+        return None
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(_HEALTHCHECK_PATH), "--no-pretty"],
+            capture_output=True, text=True, timeout=180, check=False,
+        )
+    except Exception as e:  # noqa: BLE001
+        _log(f"fleet: health-check no ejecutable: {e}")
+        return None
+    if not proc.stdout.strip():
+        _log(f"fleet: health-check sin salida (rc={proc.returncode})")
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        _log(f"fleet: health-check no devolvio JSON: {e}")
+        return None
+
+
+def _detect_layout() -> str:
+    """`tnode` si la instalacion es del usuario dedicado, `self` si es del
+    usuario que corre el daemon. Determina el privilegio que necesitaria un
+    update, y por eso viaja en el inventario."""
+    try:
+        return "tnode" if Path.home().name == "tnode" else "self"
+    except Exception:  # noqa: BLE001
+        return "self"
+
+
+def read_update_policy(token: dict) -> dict | None:
+    """Lee users/{uid}/nodes/{nodeId}/policy/update. None si no existe."""
+    uid, node_id = token["uid"], token["nodeId"]
+    url = f"{_firestore_base()}/users/{uid}/nodes/{node_id}/policy/update"
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    try:
+        doc = _http_request("GET", url, None, headers)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+    fields = (doc or {}).get("fields") or {}
+    return {k: _fs_decode(v) for k, v in fields.items()}
+
+
+def _policy_verdict(policy: dict | None, installer_version: str) -> dict:
+    """Compara el nodo contra la politica. NO ejecuta nada.
+
+    `pending` significa que el tag deseado no coincide con el instalado, o sea
+    que este nodo esta a la espera de update. Es lo que permite ver la flota
+    contra un objetivo desde la consola sin haber implementado la fase 4.
+    """
+    if not policy:
+        return {"state": "unmanaged", "reason": "sin policy/update"}
+    mode = str(policy.get("mode") or "hold")
+    target = str(policy.get("targetTag") or "")
+    scope = str(policy.get("scope") or "safe")
+    if not target:
+        return {"state": "unmanaged", "reason": "policy sin targetTag",
+                "mode": mode, "scope": scope}
+    current_tag = f"tnode-setup-v{installer_version}" if installer_version else ""
+    if current_tag and current_tag == target:
+        state = "up-to-date"
+    else:
+        state = "pending"
+    return {"state": state, "mode": mode, "scope": scope,
+            "targetTag": target, "currentTag": current_tag or "unknown"}
+
+
+def write_fleet_inventory(token: dict, inventory: dict) -> None:
+    """Upsert users/{uid}/nodes/{nodeId}/inventory/current."""
+    uid, node_id = token["uid"], token["nodeId"]
+    url = f"{_firestore_base()}/users/{uid}/nodes/{node_id}/inventory/current"
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    _http_request("PATCH", url, _fs_fields(inventory), headers)
+
+
+def report_fleet_inventory(token: dict) -> bool:
+    """Mide, calcula el veredicto y publica. True si subio algo."""
+    hc = _run_fleet_health_check()
+    if hc is None:
+        return False
+
+    # La version del installer sale del components-manifest.json, que se
+    # regenera en cada update. El nodo no la guardaba en ningun sitio antes de
+    # v1.94.0 — sin ella no se puede comparar contra el targetTag de la
+    # politica, asi que write_components_manifest la estampa ahora.
+    installer_version = ""
+    try:
+        m = json.loads((OPENCLAW_DIR / "components-manifest.json").read_text())
+        installer_version = str(m.get("installerVersion") or "")
+    except Exception:  # noqa: BLE001
+        pass
+
+    policy = None
+    try:
+        policy = read_update_policy(token)
+    except Exception as e:  # noqa: BLE001
+        _log(f"fleet: no se pudo leer policy/update: {e}")
+
+    inventory = {
+        "reportedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "installerVersion": installer_version or "unknown",
+        "layout": _detect_layout(),
+        "summary": hc.get("summary") or {},
+        "components": hc.get("components") or [],
+        "policy": _policy_verdict(policy, installer_version),
+    }
+    write_fleet_inventory(token, inventory)
+    s = inventory["summary"]
+    _log(
+        "fleet: inventario publicado — ok=%s warn=%s fail=%s drift=%s stale=%s policy=%s"
+        % (s.get("ok"), s.get("warn"), s.get("fail"), s.get("drift"),
+           s.get("manifestStale"), inventory["policy"].get("state"))
+    )
+    return True
 
 
 def write_state(token: dict, state: dict) -> None:
@@ -9250,7 +9393,7 @@ _AGENDA_MANIFEST = r'''{
 _AGENDA_PY = r'''#!/usr/bin/env python3
 """agenda — consulta y reserva citas contra el calendario del nodo.
 
-__VERSION__ = "1.60.0"
+__VERSION__ = "1.61.0"
 
 Thin client del endpoint `agendaApi` (Cloud Function, HMAC con el
 nodeSecret de tnode-chat-sync.json — mismo flujo que pullLLMConfig, con el
@@ -9506,7 +9649,7 @@ _DRIVE_MANIFEST = r'''{
 _DRIVE_PY = r'''#!/usr/bin/env python3
 """drive — lee la carpeta de Google Drive que el dueño compartió con el nodo.
 
-__VERSION__ = "1.60.0"
+__VERSION__ = "1.61.0"
 
 Thin client del endpoint `driveReadApi` (Cloud Function, HMAC con el
 nodeSecret de tnode-chat-sync.json; la firma incluye el namespace y el
@@ -9795,7 +9938,7 @@ _POLL_MANIFEST = r'''{
 _POLL_PY = r'''#!/usr/bin/env python3
 """poll — difunde una encuesta del dueño a todos los invitados del nodo.
 
-__VERSION__ = "1.60.0"
+__VERSION__ = "1.61.0"
 
 Thin client del endpoint `pollApi` (Cloud Function, HMAC con el nodeSecret de
 tnode-chat-sync.json; la firma incluye namespace + action:
@@ -10017,7 +10160,7 @@ _TNODE_DELEGATE_MANIFEST = r'''{
 _TNODE_DELEGATE_PY = r'''#!/usr/bin/env python3
 """tnode-delegate — delega una tarea a OTRO de los TNodes del dueño.
 
-__VERSION__ = "1.60.0"
+__VERSION__ = "1.61.0"
 
 El agente de ESTE nodo (A) le pasa una tarea al agente de otro nodo enlazado
 (B, un "peer" configurado en el widget Equipo de la app) y lee su respuesta.
@@ -10050,7 +10193,7 @@ import os
 import subprocess
 import sys
 
-__VERSION__ = "1.60.0"
+__VERSION__ = "1.61.0"
 
 
 def _ensure_websockets() -> None:
@@ -10394,7 +10537,7 @@ _INVENTARIO_MANIFEST = r'''{
 _INVENTARIO_PY = r'''#!/usr/bin/env python3
 """inventario — lee el sheet del inventario y estampa el tracking de órdenes.
 
-__VERSION__ = "1.60.0"
+__VERSION__ = "1.61.0"
 
 Thin client del endpoint `inventoryApi` (Cloud Function, HMAC con el
 nodeSecret de tnode-chat-sync.json; la firma es
@@ -15310,6 +15453,7 @@ def main() -> int:
     # Push initial state on startup so Firestore reflects current openclaw.json
     # even if the file hasn't changed since last boot.
     startup_pushed = False
+    _last_fleet_report: float | None = None
 
     while True:
         try:
@@ -15336,6 +15480,29 @@ def main() -> int:
                         token = None
                         continue
                     _log(f"startup push failed: {e.code} {e.reason}")
+
+            # Inventario de flota: al arrancar y luego cada FLEET_REPORT_EVERY_S
+            # (24h por defecto). Al arrancar porque un nodo que vuelve de estar
+            # apagado debe reflejarse enseguida; el timer porque la consola tiene
+            # que envejecer poco. Best-effort: un fallo aqui NUNCA debe frenar el
+            # drenado de comandos, que es la funcion primaria del daemon.
+            if (_last_fleet_report is None
+                    or (time.time() - _last_fleet_report) >= FLEET_REPORT_EVERY_S):
+                try:
+                    if report_fleet_inventory(token):
+                        _last_fleet_report = time.time()
+                    else:
+                        # Sin health-check.py no se reintenta cada tick.
+                        _last_fleet_report = time.time()
+                except urllib.error.HTTPError as e:
+                    if e.code == 401:
+                        token = None
+                        continue
+                    _log(f"fleet: reporte fallido: {e.code} {e.reason}")
+                    _last_fleet_report = time.time()
+                except Exception as e:  # noqa: BLE001
+                    _log(f"fleet: reporte fallido: {e}")
+                    _last_fleet_report = time.time()
 
             # Drena la cola (BACKSTOP). El camino primario es el WAKE: el app
             # dispara el drain-oneshot (DRAIN_ONESHOT) al pasar Dashboard→Chat.
@@ -23064,6 +23231,10 @@ PAIR_WATCH_CLI_EOF
 # updates.tbrain.app). Override with VERIFY_BASE_URL=... if a path-preserving
 # CDN is set up later (Pro plan + Page Rule for install.tbrain.app/verify/*).
 VERIFY_BASE_URL="${VERIFY_BASE_URL:-https://raw.githubusercontent.com/cmoralestbrain/tnode_server_public/main/verify}"
+# health-check.py se instala EN el nodo (no solo se ejecuta por curl desde
+# health.tbrain.app) para que tnode-config-sync pueda correrlo sin depender de
+# la red en cada reporte de inventario. Fase 2 del plan de flota.
+HEALTHCHECK_URL="${HEALTHCHECK_URL:-https://raw.githubusercontent.com/cmoralestbrain/tnode_server_public/main/scripts/health-check.py}"
 
 install_verify_scripts() {
     info "Instalando verify scripts a \$OPENCLAW_HOME/verify/..."
@@ -23083,6 +23254,22 @@ install_verify_scripts() {
         verify_openclaw-cli.py
         verify_qrencode.py
     )
+    # health-check.py va a scripts/, no a verify/: lo consume tnode-config-sync
+    # para el reporte de inventario, y health.tbrain.app lo sigue sirviendo
+    # aparte para uso manual.
+    local hc_dest="$OPENCLAW_HOME/scripts/health-check.py"
+    local hc_tmp; hc_tmp="$(mktemp)"
+    if curl -fsSL --max-time 10 "$HEALTHCHECK_URL" -o "$hc_tmp" 2>/dev/null; then
+        run_as_tnode mkdir -p "$OPENCLAW_HOME/scripts"
+        mv "$hc_tmp" "$hc_dest"
+        chmod +x "$hc_dest"
+        chown "$TNODE_USER":"$TNODE_USER" "$hc_dest" 2>/dev/null || true
+        success "health-check.py instalado en $hc_dest"
+    else
+        rm -f "$hc_tmp"
+        warn "health-check.py no se pudo descargar (el reporte de inventario quedará inactivo)"
+    fi
+
     local ok=0 fail=0
     for f in "${files[@]}"; do
         local url="${VERIFY_BASE_URL}/$f"
@@ -23220,6 +23407,10 @@ if ext_dir.is_dir():
 manifest_path.write_text(json.dumps({
     "schemaVersion": 1,
     "generatedAt":   datetime.now(timezone.utc).isoformat(),
+    # Version del installer que escribio este manifiesto. La necesita
+    # tnode-config-sync para comparar el nodo contra el targetTag de
+    # policy/update: hasta v1.94.0 el nodo no la registraba en ningun sitio.
+    "installerVersion": "$TNODE_SETUP_VERSION",
     "components":    components,
 }, indent=2) + "\n")
 print(f"OK: wrote {len(components)} components → {manifest_path}")
