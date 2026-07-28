@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.92.1"
+TNODE_SETUP_VERSION="1.93.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -112,6 +112,11 @@ OPENCLAW_WS_PLUGIN_VERSION="${OPENCLAW_WS_PLUGIN_VERSION-0.2.2}"
 # load plugins"—, asi que sin esto el update reportaba "1 actualizado" mientras
 # el gateway seguia ejecutando el codigo viejo.
 PLUGINS_CHANGED=0
+# Alcance del update. `safe` (default) toca lo de bajo riesgo: daemons, plugins,
+# verify scripts y drop-ins de systemd. `full` anade el bump del kernel openclaw,
+# que el installer excluye de --update-only a proposito para que el operador
+# elija cuando hacerlo. Cloudflared sigue siendo explicito via --component.
+UPDATE_SCOPE="safe"
 TNODE_USER="tnode"
 TNODE_HOME=""      # set in setup_tnode_user()
 OPENCLAW_HOME=""   # set in setup_tnode_user()
@@ -727,6 +732,11 @@ parse_args() {
                 ;;
             --verbose)       VERBOSE=1 ;;
             --update-only)   UPDATE_ONLY=1 ;;
+            --scope)
+                UPDATE_SCOPE="${2:?--scope requiere safe|full}"
+                shift
+                ;;
+            --scope=*)       UPDATE_SCOPE="${1#*=}" ;;
             --component)
                 COMPONENT="${2:?--component requires a value (e.g. tnode-chat-sync)}"
                 UPDATE_ONLY=1
@@ -741,6 +751,13 @@ parse_args() {
         esac
         shift
     done
+
+    if [[ "$UPDATE_SCOPE" != "safe" && "$UPDATE_SCOPE" != "full" ]]; then
+        die "--scope inválido: '$UPDATE_SCOPE'. Valores: safe | full"
+    fi
+    if [[ "$UPDATE_SCOPE" == "full" && "$UPDATE_ONLY" != "1" ]]; then
+        die "--scope sólo aplica con --update-only (una instalación completa ya incluye el kernel)"
+    fi
 
     # Validate --component against the supported list
     if [[ -n "$COMPONENT" ]]; then
@@ -780,6 +797,10 @@ Options:
   --update-only       Refresh scripts/binaries without rotating secrets.
                       Aborts if required state (tunnel.json, gateway token)
                       is missing instead of regenerating it.
+  --scope <safe|full> Alcance del --update-only (default: safe).
+                      safe = daemons + plugins + verify + drop-ins systemd.
+                      full = lo anterior + bump del kernel openclaw.
+                      cloudflared sigue aparte: --component cloudflared.
   --component <name>  Only install/refresh the named component (implies
                       --update-only). Supported: openclaw-gateway,
                       tnode-chat-sync, tnode-config-sync, tnode-telemetry,
@@ -23174,6 +23195,15 @@ if skills_dir.is_dir():
 ext_dir = openclaw_home / "extensions"
 if ext_dir.is_dir():
     for d in sorted(ext_dir.iterdir()):
+        # Saltar backups de intervenciones manuales. openclaw plugins install
+        # renombra el directorio anterior (tbrain-context-engine.bak-pre0142,
+        # tnode.bak-pre-envfix-rel...) y esas copias conservan su package.json,
+        # asi que se colaban en el manifiesto: en clawpi generaban TRES entradas
+        # con id @tbrain/openclaw-context-engine y drift "outdated" fantasma,
+        # sobre un nodo cuyos plugins reales estaban todos al dia. No son
+        # componentes instalados; son restos.
+        if ".bak" in d.name or d.name.endswith((".old", ".disabled")) or d.name.startswith("."):
+            continue
         pkg = d / "package.json"
         if not pkg.is_file(): continue
         try:
@@ -23883,6 +23913,15 @@ main() {
         # actualizaban en un update. Con puerta de versión: no reinstala nada si
         # ya están al día.
         update_plugins_if_stale
+        if [[ "$UPDATE_SCOPE" == "full" ]]; then
+            # El kernel va aparte a propósito: bumpear el gateway es la
+            # operación arriesgada del update, así que sólo con --scope full.
+            # Va DESPUÉS de los plugins para que ensure_openclaw_gateway_fresh
+            # —que corre luego— vea el paquete npm nuevo y reinicie una sola
+            # vez, en vez de reiniciar por plugins y otra por el binario.
+            info "--scope full: actualizando también el kernel openclaw"
+            update_openclaw_gateway_only
+        fi
     fi
     phase_helpers
     # In update-only mode, phase_helpers refreshes pair-watch + tnode-config-sync
