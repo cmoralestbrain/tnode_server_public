@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.94.0"
+TNODE_SETUP_VERSION="1.94.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -23295,13 +23295,16 @@ install_verify_scripts() {
 write_components_manifest() {
     info "Generando components-manifest.json (auto-discovery + extracted versions)..."
     local manifest="$OPENCLAW_HOME/components-manifest.json"
-    run_as_tnode python3 - "$manifest" "$OPENCLAW_HOME" <<'COMPMANIFEST_PYEOF'
+    run_as_tnode python3 - "$manifest" "$OPENCLAW_HOME" "$TNODE_SETUP_VERSION" <<'COMPMANIFEST_PYEOF'
 import json, sys, subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 manifest_path = Path(sys.argv[1])
 openclaw_home = Path(sys.argv[2])
+# El heredoc va entrecomillado (<<'COMPMANIFEST_PYEOF'), asi que el shell NO
+# expande variables dentro: la version tiene que llegar como argumento.
+installer_version = sys.argv[3] if len(sys.argv) > 3 else "unknown"
 scripts_dir = openclaw_home / "scripts"
 
 def extract_ver(p):
@@ -23410,7 +23413,7 @@ manifest_path.write_text(json.dumps({
     # Version del installer que escribio este manifiesto. La necesita
     # tnode-config-sync para comparar el nodo contra el targetTag de
     # policy/update: hasta v1.94.0 el nodo no la registraba en ningun sitio.
-    "installerVersion": "$TNODE_SETUP_VERSION",
+    "installerVersion": installer_version,
     "components":    components,
 }, indent=2) + "\n")
 print(f"OK: wrote {len(components)} components → {manifest_path}")
