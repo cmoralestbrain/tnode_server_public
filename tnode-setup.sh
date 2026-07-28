@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.94.2"
+TNODE_SETUP_VERSION="1.95.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -7116,7 +7116,7 @@ from __future__ import annotations
 #          System) — el agente interactivo solo confirma. Mata el doble
 #          envío al proveedor (outbox "APRUEBO…" + tarjeta del motor).
 #          Espejos byte-iguales en tools_sync.ts (editar AMBOS).
-__VERSION__ = "1.62.0"
+__VERSION__ = "1.63.0"
 
 import hashlib
 import hmac
@@ -7125,6 +7125,7 @@ import os
 import platform
 import re
 import secrets as py_secrets
+import shlex
 import shutil
 import socket
 import signal
@@ -7570,6 +7571,157 @@ def _policy_verdict(policy: dict | None, installer_version: str) -> dict:
             "targetTag": target, "currentTag": current_tag or "unknown"}
 
 
+# ── Fase 4: aplicar la politica ────────────────────────────────
+#
+# Tres protecciones vienen del diseno (§6.1, §6.2, §6.3) y una CUARTA no estaba
+# en el: el freno de reintentos. Sin el, un targetTag que no arranca convierte la
+# politica en un bucle de updates en TODA la flota a la vez. Es el fallo que mas
+# dano haria de los cuatro, asi que va con contador persistente en disco.
+
+FLEET_APPLY_ENABLED = os.environ.get("TNODE_CONFIG_SYNC_FLEET_APPLY", "1") != "0"
+_FLEET_STATE_PATH = OPENCLAW_DIR / ".fleet-update-state.json"
+_FLEET_MAX_ATTEMPTS = 2
+_FLEET_COOLDOWN_S = 3600.0
+# El tag se valida contra este patron y la URL se construye AQUI, en el nodo.
+# La politica NUNCA transporta una URL: si lo hiciera, un documento de Firestore
+# comprometido —o unas reglas mal puestas— serian ejecucion remota de codigo en
+# toda la flota con una sola escritura.
+_FLEET_TAG_RE = re.compile(r"^tnode-setup-v\d+\.\d+\.\d+$")
+_FLEET_BASE_URL = "https://raw.githubusercontent.com/cmoralestbrain/tnode_server_public"
+
+
+def _fleet_state_read() -> dict:
+    try:
+        return json.loads(_FLEET_STATE_PATH.read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _fleet_state_write(state: dict) -> None:
+    try:
+        _FLEET_STATE_PATH.write_text(json.dumps(state, indent=2))
+    except Exception as e:  # noqa: BLE001
+        _log(f"fleet: no se pudo guardar el estado de update: {e}")
+
+
+def _fleet_can_execute() -> tuple:
+    """(puede, prefijo_privilegio, motivo). Fail-safe: ante la duda, NO ejecuta.
+
+    En layout `self` el daemon corre como dueno de la instalacion y puede correr
+    el installer tal cual, sin privilegio extra.
+
+    En layout `tnode` el daemon corre como el usuario `tnode`, que no es root.
+    El installer SIN root cae silenciosamente al usuario actual y crea una
+    instalacion paralela en el home equivocado (tnode-setup.sh:280), asi que
+    ejecutarlo a pelo seria peor que no hacer nada. Pero el propio installer
+    deja `/etc/sudoers.d/tnode` con `tnode ALL=(ALL) NOPASSWD: ALL` en cada
+    provision — verificado el 2026-07-28 en los tres droplets DO y en los dos
+    Oracle— asi que el privilegio YA existe.
+
+    Se COMPRUEBA con `sudo -n true` en vez de darlo por hecho: un nodo que no lo
+    tenga (sudoers recortado a mano, o una imagen distinta) se niega en vez de
+    intentarlo y romper la instalacion.
+    """
+    if _detect_layout() == "self":
+        return True, "", ""
+    try:
+        if os.geteuid() == 0:
+            return True, "", ""
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        rc = subprocess.run(
+            ["sudo", "-n", "true"], capture_output=True, timeout=10, check=False
+        ).returncode
+    except Exception as e:  # noqa: BLE001
+        return False, "", f"no se pudo comprobar sudo: {e}"
+    if rc == 0:
+        return True, "sudo -n ", ""
+    return False, "", "layout tnode y `sudo -n` no disponible — no se ejecuta"
+
+
+def apply_update_policy(policy: dict | None, verdict: dict) -> dict:
+    """Aplica la politica si toca. Devuelve el veredicto, posiblemente anotado.
+
+    NO espera a que el update termine: el installer reinicia config-sync, asi que
+    esperar significaria que el proceso muere a mitad y el resultado no se
+    escribe nunca. Se lanza desprendido y la senal de fin es el SIGUIENTE reporte
+    de inventario, ya del daemon reiniciado.
+    """
+    if not FLEET_APPLY_ENABLED:
+        return verdict
+    if verdict.get("state") != "pending":
+        return verdict
+    if str((policy or {}).get("mode") or "hold") != "auto":
+        return verdict
+
+    tag = str(verdict.get("targetTag") or "")
+    if not _FLEET_TAG_RE.match(tag):
+        verdict["state"] = "blocked"
+        verdict["reason"] = f"targetTag con formato invalido: {tag!r}"
+        _log(f"fleet: {verdict['reason']}")
+        return verdict
+
+    can, priv, why = _fleet_can_execute()
+    if not can:
+        verdict["state"] = "blocked"
+        verdict["reason"] = why
+        return verdict
+
+    st = _fleet_state_read()
+    now = time.time()
+    if st.get("tag") == tag:
+        attempts = int(st.get("attempts") or 0)
+        last = float(st.get("lastAttemptAt") or 0)
+        if attempts >= _FLEET_MAX_ATTEMPTS:
+            verdict["state"] = "blocked"
+            verdict["reason"] = (
+                f"{attempts} intentos fallidos con {tag} — parado para no "
+                "entrar en bucle; revisar a mano"
+            )
+            return verdict
+        if (now - last) < _FLEET_COOLDOWN_S:
+            verdict["state"] = "cooldown"
+            verdict["reason"] = (
+                f"reintento en {int(_FLEET_COOLDOWN_S - (now - last))}s"
+            )
+            return verdict
+        st["attempts"] = attempts + 1
+    else:
+        st = {"tag": tag, "attempts": 1}
+    st["lastAttemptAt"] = now
+    _fleet_state_write(st)
+
+    scope = str(verdict.get("scope") or "safe")
+    if scope not in ("safe", "full"):
+        scope = "safe"
+    url = f"{_FLEET_BASE_URL}/{tag}/tnode-setup.sh"
+    # curl corre SIN privilegio y solo el bash lo recibe: descargar como root
+    # no aporta nada y amplia la superficie innecesariamente.
+    cmd = (
+        f"curl -fsSL {shlex.quote(url)} | "
+        f"{priv}bash -s -- --update-only --yes --scope {shlex.quote(scope)}"
+    )
+    try:
+        subprocess.Popen(
+            ["bash", "-c", cmd],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        verdict["state"] = "blocked"
+        verdict["reason"] = f"no se pudo lanzar el update: {e}"
+        _log(f"fleet: {verdict['reason']}")
+        return verdict
+
+    verdict["state"] = "updating"
+    verdict["reason"] = f"update a {tag} (scope={scope}) lanzado en background"
+    _log(f"fleet: {verdict['reason']} — intento {st.get('attempts')}")
+    return verdict
+
+
 def write_fleet_inventory(token: dict, inventory: dict) -> None:
     """Upsert users/{uid}/nodes/{nodeId}/inventory/current."""
     uid, node_id = token["uid"], token["nodeId"]
@@ -7607,7 +7759,7 @@ def report_fleet_inventory(token: dict) -> bool:
         "layout": _detect_layout(),
         "summary": hc.get("summary") or {},
         "components": hc.get("components") or [],
-        "policy": _policy_verdict(policy, installer_version),
+        "policy": apply_update_policy(policy, _policy_verdict(policy, installer_version)),
     }
     write_fleet_inventory(token, inventory)
     s = inventory["summary"]
@@ -9413,7 +9565,7 @@ _AGENDA_MANIFEST = r'''{
 _AGENDA_PY = r'''#!/usr/bin/env python3
 """agenda — consulta y reserva citas contra el calendario del nodo.
 
-__VERSION__ = "1.62.0"
+__VERSION__ = "1.63.0"
 
 Thin client del endpoint `agendaApi` (Cloud Function, HMAC con el
 nodeSecret de tnode-chat-sync.json — mismo flujo que pullLLMConfig, con el
@@ -9669,7 +9821,7 @@ _DRIVE_MANIFEST = r'''{
 _DRIVE_PY = r'''#!/usr/bin/env python3
 """drive — lee la carpeta de Google Drive que el dueño compartió con el nodo.
 
-__VERSION__ = "1.62.0"
+__VERSION__ = "1.63.0"
 
 Thin client del endpoint `driveReadApi` (Cloud Function, HMAC con el
 nodeSecret de tnode-chat-sync.json; la firma incluye el namespace y el
@@ -9958,7 +10110,7 @@ _POLL_MANIFEST = r'''{
 _POLL_PY = r'''#!/usr/bin/env python3
 """poll — difunde una encuesta del dueño a todos los invitados del nodo.
 
-__VERSION__ = "1.62.0"
+__VERSION__ = "1.63.0"
 
 Thin client del endpoint `pollApi` (Cloud Function, HMAC con el nodeSecret de
 tnode-chat-sync.json; la firma incluye namespace + action:
@@ -10180,7 +10332,7 @@ _TNODE_DELEGATE_MANIFEST = r'''{
 _TNODE_DELEGATE_PY = r'''#!/usr/bin/env python3
 """tnode-delegate — delega una tarea a OTRO de los TNodes del dueño.
 
-__VERSION__ = "1.62.0"
+__VERSION__ = "1.63.0"
 
 El agente de ESTE nodo (A) le pasa una tarea al agente de otro nodo enlazado
 (B, un "peer" configurado en el widget Equipo de la app) y lee su respuesta.
@@ -10213,7 +10365,7 @@ import os
 import subprocess
 import sys
 
-__VERSION__ = "1.62.0"
+__VERSION__ = "1.63.0"
 
 
 def _ensure_websockets() -> None:
@@ -10557,7 +10709,7 @@ _INVENTARIO_MANIFEST = r'''{
 _INVENTARIO_PY = r'''#!/usr/bin/env python3
 """inventario — lee el sheet del inventario y estampa el tracking de órdenes.
 
-__VERSION__ = "1.62.0"
+__VERSION__ = "1.63.0"
 
 Thin client del endpoint `inventoryApi` (Cloud Function, HMAC con el
 nodeSecret de tnode-chat-sync.json; la firma es
