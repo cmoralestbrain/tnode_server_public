@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.97.0"
+TNODE_SETUP_VERSION="1.98.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -16875,7 +16875,19 @@ from __future__ import annotations
 #          (cita fila|ausencia) y pre-flight de evidencia (validar) antes
 #          de awmf_result. El protocolo vive en la tarjeta; lo mecánico
 #          se vuelve script (config-sync >=1.64.0 materializa el skill).
-__VERSION__ = "1.36.0"
+# 1.37.0 — FAIL-FAST de tarjetas huérfanas (incidente qwen 2026-08-08): una
+#          tarjeta entregada cuyo turno murió sin awmf_result (timeout del
+#          modelo, crash del gateway) quedaba esperando el lease de 1h del
+#          motor. Ahora el sweep detecta el caso con las señales locales del
+#          gateway (sin `.jsonl.lock` vivo = ningún turno corriendo;
+#          awmf_result es síncrono dentro del turno ⇒ turno terminado +
+#          tarjeta aún pending = resultado inexistente, sin carrera), borra
+#          los markers (delivered + sesión) y re-entrega la MISMA emisión en
+#          el mismo sweep — automatiza la receta manual del incidente.
+#          Gracia de 90s post-entrega (ventana accept→lock) y tope de 2
+#          fail-fasts por (cardId, attempt): a la 3ª muerte el problema no es
+#          transitorio y se cede al lease del motor.
+__VERSION__ = "1.37.0"
 
 import hashlib
 import hmac
@@ -18795,8 +18807,18 @@ def process_task_commands(
 AWMF_DIR = OPENCLAW_DIR / "awmf"
 AWMF_DELIVERED_DIR = AWMF_DIR / "delivered"
 AWMF_SESSIONS_DIR = AWMF_DIR / "sessions"
+AWMF_FAILFAST_DIR = AWMF_DIR / "failfast"
 AWMF_POLL_HOT_S = float(os.environ.get("TNODE_CHAT_SYNC_AWMF_HOT_S", "10.0"))
 AWMF_POLL_IDLE_S = float(os.environ.get("TNODE_CHAT_SYNC_AWMF_IDLE_S", "30.0"))
+# Fail-fast (1.37.0): gracia post-entrega antes de juzgar el turno muerto
+# (cubre la ventana chat.send accept → creación del .jsonl.lock) y tope de
+# re-entregas por (cardId, attempt) antes de ceder al lease del motor.
+AWMF_FAILFAST_GRACE_S = float(
+    os.environ.get("TNODE_CHAT_SYNC_AWMF_FAILFAST_GRACE_S", "90.0")
+)
+AWMF_FAILFAST_MAX = int(os.environ.get("TNODE_CHAT_SYNC_AWMF_FAILFAST_MAX", "2"))
+# Mismo umbral de locks huérfanos que _outbox_gate (gateway crash).
+AWMF_LOCK_ORPHAN_S = 600.0
 
 
 def _fs_unwrap_any(v):
@@ -18903,6 +18925,105 @@ def _awmf_stripped_session(card_id: str) -> str:
 def _awmf_marker_path(card_id: str) -> Path:
     safe = re.sub(r"[^a-z0-9._-]", "_", _awmf_stripped_session(card_id))
     return AWMF_SESSIONS_DIR / f"{safe}.json"
+
+
+def _awmf_failfast_counter_path(card_id: str) -> Path:
+    safe = re.sub(r"[^a-zA-Z0-9._-]", "_", card_id)
+    return AWMF_FAILFAST_DIR / f"{safe}.json"
+
+
+def _awmf_turn_alive(agent_id: str, card_id: str) -> bool:
+    """True si hay evidencia de un turno EN CURSO para la sesión de la
+    tarjeta: `<sessionId>.jsonl.lock` vivo (nace al accept, muere al terminar
+    — misma señal que _outbox_gate). Fail-closed: cualquier error leyendo el
+    estado del gateway se reporta como 'vivo' — mejor esperar otro sweep que
+    re-entregar encima de un turno corriendo."""
+    try:
+        full_key = f"agent:{agent_id}:{_awmf_stripped_session(card_id)}"
+        for d in resolve_all_sessions_dirs():
+            idx = d / "sessions.json"
+            if not idx.is_file():
+                continue
+            try:
+                index = json.loads(idx.read_text())
+            except (OSError, ValueError):
+                return True
+            sid = (index.get(full_key) or {}).get("sessionId")
+            if not sid:
+                continue
+            lock = d / f"{sid}.jsonl.lock"
+            if lock.exists():
+                try:
+                    age = time.time() - lock.stat().st_mtime
+                except OSError:
+                    return True
+                if age < AWMF_LOCK_ORPHAN_S:
+                    return True
+        return False
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _awmf_failfast(card_id: str, agent_id: str, card: dict) -> bool:
+    """Fail-fast (1.37.0): tarjeta ya entregada cuyo turno murió sin
+    awmf_result. awmf_result es un tool call SÍNCRONO dentro del turno
+    (el plugin espera la CF antes de devolver), así que «turno terminado +
+    tarjeta aún pending en el motor» implica que el resultado no existió —
+    sin carrera. Borra los markers (delivered + sesión) para que ESTE mismo
+    sweep re-entregue la MISMA emisión (mismo attempt — reemisión conforme,
+    la tarjeta ya lo advierte). Devuelve True cuando procede re-entregar.
+
+    Tope AWMF_FAILFAST_MAX por (cardId, attempt): a la siguiente muerte el
+    problema ya no es transitorio y se cede al lease del motor."""
+    marker = AWMF_DELIVERED_DIR / card_id
+    try:
+        age = time.time() - marker.stat().st_mtime
+    except OSError:
+        return False
+    if age < AWMF_FAILFAST_GRACE_S:
+        return False  # ventana accept→lock: el turno puede no haber arrancado
+    if _awmf_turn_alive(agent_id, card_id):
+        return False
+    attempt = card.get("attempt")
+    counter = _awmf_failfast_counter_path(card_id)
+    try:
+        st = json.loads(counter.read_text())
+    except (OSError, ValueError):
+        st = {}
+    if not isinstance(st, dict) or st.get("attempt") != attempt:
+        st = {"attempt": attempt, "count": 0}
+    if st.get("count", 0) >= AWMF_FAILFAST_MAX:
+        if not st.get("capped"):
+            st["capped"] = True
+            try:
+                counter.write_text(json.dumps(st))
+            except OSError:
+                pass
+            _log(
+                f"awmf: card {card_id} murió sin awmf_result tras "
+                f"{AWMF_FAILFAST_MAX} fail-fasts — agotado, queda al lease "
+                "del motor"
+            )
+        return False
+    st["count"] = st.get("count", 0) + 1
+    try:
+        AWMF_FAILFAST_DIR.mkdir(parents=True, exist_ok=True)
+        counter.write_text(json.dumps(st))
+    except OSError as e:
+        # Sin contador persistido no hay tope — no arriesgar un loop.
+        _log(f"awmf: failfast counter failed for {card_id}: {e}")
+        return False
+    for p in (marker, _awmf_marker_path(card_id)):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+    _log(
+        f"awmf: card {card_id} entregada hace {int(age)}s, turno muerto sin "
+        f"awmf_result — fail-fast {st['count']}/{AWMF_FAILFAST_MAX}, "
+        "re-entrega"
+    )
+    return True
 
 
 def _awmf_source_lines(sources) -> list:
@@ -19131,12 +19252,12 @@ def process_awmf_inbox(token: dict, project_id: str) -> bool:
     for entry in pending:
         card_id = entry["cardId"]
         card = entry["card"]
-        marker = AWMF_DELIVERED_DIR / card_id
-        if marker.exists():
-            continue
         if _awmf_expired(card):
             continue  # el sweep del motor reemite; entregarla solo genera ruido
         agent_id = entry["agentId"].strip().lower()
+        marker = AWMF_DELIVERED_DIR / card_id
+        if marker.exists() and not _awmf_failfast(card_id, agent_id, card):
+            continue
         session_key = f"agent:{agent_id}:{_awmf_stripped_session(card_id)}"
         # Marker de sesión ANTES de inyectar: el plugin lo necesita en el
         # primer tool call del turno (identidad + perímetro + allowedTools).
