@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.98.0"
+TNODE_SETUP_VERSION="1.99.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -16839,7 +16839,16 @@ from __future__ import annotations
 #          Gracia de 90s post-entrega (ventana accept→lock) y tope de 2
 #          fail-fasts por (cardId, attempt): a la 3ª muerte el problema no es
 #          transitorio y se cede al lease del motor.
-__VERSION__ = "1.37.0"
+# 1.38.0 — FIX leak de espejo (2026-08-16, HEB β): el texto interno de una
+#          Task Card AWMF de `recepcion` apareció en el chat del owner. El
+#          jsonl LEGACY de la sesión se taileó (race de nacimiento vs el
+#          shadow del trajectory), sus entries no traen sessionKey, y el
+#          compat "sin sessionKey sigue fluyendo" (pensado para OpenClaw
+#          ≤2026.4.x mono-agente) lo mandó al hilo del owner por default.
+#          Fix: el tailer enhebra el agente dueño del archivo (srcAgent) en
+#          cada turno y flush_turn NO espeja turnos sin sessionKey de
+#          agentes ≠ main. Familia de [[chat_sync_delivery_mirror_leak]].
+__VERSION__ = "1.38.0"
 
 import hashlib
 import hmac
@@ -19811,8 +19820,16 @@ class SessionTailer:
             except OSError:
                 continue
             self.offsets[key] = new_offset
+            # 1.38.0: el agente dueño del archivo viaja con cada línea —
+            # `agents/<agentId>/sessions/<f>.jsonl` → agentId; layouts legacy
+            # (~/.openclaw/sessions, pre-agentes) → None (equivale a main).
+            src_agent = (
+                path.parent.parent.name
+                if path.parent.parent.parent.name == "agents"
+                else None
+            )
             for line in chunk.splitlines():
-                yield line
+                yield src_agent, line
 
 
 def resolve_sessions_dir() -> Path:
@@ -20744,6 +20761,20 @@ def main() -> int:
         ):
             _log(f"skip {mid}: channel session, not mirrored to app thread")
             return
+        # 1.38.0 — leak del 2026-08-16 (turno de una sesión AWMF de
+        # `recepcion` espejado al chat del owner): el compat "sin sessionKey
+        # sigue fluyendo" es legítimo SOLO para main/layouts pre-agentes
+        # (OpenClaw ≤2026.4.x, era mono-agente). Un turno sin sessionKey
+        # nacido en el dir de sesiones de cualquier otro agente (recepcion/
+        # guest/workflow-author/…) entró por el camino legacy (jsonl sin
+        # shadow por race de nacimiento) y NUNCA debe caer al hilo del owner.
+        src_agent = t.get("srcAgent")
+        if not isinstance(sk, str) and src_agent not in (None, "main"):
+            _log(
+                f"skip {mid}: no sessionKey from agent '{src_agent}' — "
+                "not mirrored to app thread"
+            )
+            return
         # Shared-agent guests get their reply in their OWN space; everyone
         # else (owner / non-guest sessions) lands in the owner's space.
         # Privacy guard: if this is a guest session but we couldn't decode
@@ -20959,7 +20990,7 @@ def main() -> int:
                     hot=(now_f < hot_until) or _app_present(now_f),
                 )
 
-            for line in tailer.read_new_lines():
+            for src_agent, line in tailer.read_new_lines():
                 # Any trajectory activity means the user is around — keep
                 # the outbox poll on the hot clock so a WS-down message
                 # lands within a few seconds instead of the idle interval.
@@ -20982,6 +21013,7 @@ def main() -> int:
                 # turnId. No buffering / timeout wait.
                 turn = assistant_turn_from_trajectory(entry)
                 if turn is not None:
+                    turn["srcAgent"] = src_agent
                     try:
                         flush_turn(turn)
                     except urllib.error.HTTPError as e:
@@ -20998,6 +21030,7 @@ def main() -> int:
                 # combined text+media bubble.
                 media_turn = media_turn_from_trajectory(entry)
                 if media_turn is not None:
+                    media_turn["srcAgent"] = src_agent
                     try:
                         flush_turn(media_turn, is_media=True)
                     except urllib.error.HTTPError as e:
@@ -21009,6 +21042,7 @@ def main() -> int:
                 # Case A: assistant message → buffer waiting for runId.
                 turn = assistant_turn_from(entry)
                 if turn is not None:
+                    turn["srcAgent"] = src_agent
                     if turn.get("turnId"):
                         # Legacy build: runId was on the message itself.
                         try:
