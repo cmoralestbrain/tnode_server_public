@@ -89,14 +89,14 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.100.0"
+TNODE_SETUP_VERSION="1.101.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
 # even with a valid Ed25519 signature + master token, blocking cloud
 # provisioning E2E. Override with `OPENCLAW_PIN_VERSION=` (empty) to take
 # whatever is current.
-OPENCLAW_PIN_VERSION="${OPENCLAW_PIN_VERSION-2026.6.10}"
+OPENCLAW_PIN_VERSION="${OPENCLAW_PIN_VERSION-2026.7.1-2}"
 # Canal WhatsApp Personal (Baileys). El pin SIGUE al del core: cada release del
 # plugin sube su peerDependency (2026.6.33 pide openclaw >= 2026.6.33, 2026.7.1
 # pide >= 2026.7.1) y el core está clavado arriba. Bumpear SOLO junto con
