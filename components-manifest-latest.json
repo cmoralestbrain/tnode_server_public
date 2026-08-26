@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-08-19T23:02:49.004668+00:00",
-  "tag": "tnode-setup-v1.101.0",
+  "generatedAt": "2026-08-26T13:08:07.027908+00:00",
+  "tag": "tnode-setup-v1.102.0",
   "components": [
     {
       "id": "tnode-chat-sync",
@@ -62,7 +62,7 @@
     {
       "id": "@tbrain/openclaw-context-engine",
       "kind": "plugin-extension",
-      "version": "0.25.0",
+      "version": "0.26.1",
       "source": "extensions/tbrain-context-engine/"
     },
     {
