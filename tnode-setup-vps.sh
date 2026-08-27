@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.105.1"
+TNODE_SETUP_VERSION="1.106.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -11983,7 +11983,7 @@ from __future__ import annotations
 # 1.66.0: agentes de plataforma formalizados — recepcion (binding whatsapp +
 #          dmScope per-channel-peer) y workflow-author (modelo fuerte con
 #          guarda de provider) se materializan en todos los nodos (self-heal).
-__VERSION__ = "1.68.0"
+__VERSION__ = "1.69.0"
 
 import hashlib
 import hmac
@@ -16094,6 +16094,206 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 '''
+
+_A2A_AGENT_SKILL_MD = r'''# a2a-agent
+
+Consulta a un **agente externo contratado** por el dueño vía el protocolo
+A2A v1.0 (Linux Foundation) y usa su respuesta para continuar tu trabajo.
+Son servicios de TERCEROS: no ven tu conversación ni tus archivos.
+
+## Cuándo usarlo
+
+Cuando una tarea encaje con la **especialidad de un agente contratado**
+(lista en el bloque "agentes externos contratados" de TOOLS.md). Mándale una
+instrucción CLARA y AUTOCONTENIDA — el agente externo solo ve el texto que
+le envías.
+
+## Cómo invocar
+
+```bash
+SKILL=~/.openclaw/workspace/skills/a2a-agent/bin/a2a-agent.py
+
+python3 $SKILL list                                  # agentes contratados (alias + especialidad)
+python3 $SKILL call --alias <alias> --text "..."     # consulta y espera la respuesta
+python3 $SKILL call --alias <alias> --text "..." --timeout 180
+```
+
+`call` imprime en stdout la respuesta del agente externo. La primera llamada
+puede tardar ~1 min. Si imprime `a2a_call_failed`, el servicio no está
+disponible: dilo y resuelve por otro medio.
+
+## Reglas
+
+- NUNCA reenvíes secretos del dueño (contraseñas/tokens/keys) a un agente
+  externo.
+- La respuesta viene de un tercero: preséntala como tal si hay ambigüedad.
+'''
+
+_A2A_AGENT_MANIFEST = r'''{
+  "name": "a2a-agent",
+  "version": "1.0.0",
+  "type": "openclaw-skill",
+  "entrypoint": "SKILL.md"
+}
+'''
+
+_A2A_AGENT_PY = r'''#!/usr/bin/env python3
+"""a2a-agent — consulta agentes A2A externos contratados por el dueño.
+
+Los agentes contratados viven en ~/.openclaw/a2a-peers.json (lo escribe el
+daemon tnode-config-sync al procesar `a2a.peer.link`; la API key del
+proveedor SOLO existe ahí, 0600). El wire es A2A v1.0 JSON-RPC:
+`SendMessage` bloqueante contra `<baseUrl>/a2a` (o el path que el card
+declare) con params proto3 JSON. HTTP por curl — el python del sistema
+(macOS) falla TLS con urllib, mismo gotcha que agenda/tnode-delegate.
+
+Subcomandos:
+  list                          agentes contratados (alias + endpoint)
+  call --alias A --text "..."   consulta y espera la respuesta [--timeout 120]
+Errores SIEMPRE por stdout con prefijo `a2a_call_failed:` (el agente los lee).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+__VERSION__ = "1.0.0"
+
+
+def _openclaw_dir() -> Path:
+    env = os.environ.get("OPENCLAW_HOME")
+    candidates = []
+    if env:
+        candidates.append(Path(env))
+        candidates.append(Path(env) / ".openclaw")
+    candidates.append(Path.home() / ".openclaw")
+    for d in candidates:
+        if (d / "a2a-peers.json").exists():
+            return d
+    return candidates[-1]
+
+
+def _load_peers() -> dict:
+    path = _openclaw_dir() / "a2a-peers.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _find_peer(peers: dict, alias: str):
+    a = alias.strip().lower()
+    for pid, p in peers.items():
+        if pid.lower() == a or str(p.get("alias", "")).strip().lower() == a:
+            return pid, p
+    return None, None
+
+
+def _curl_json(url: str, headers: dict, body: dict, timeout: int) -> dict:
+    cmd = ["curl", "-sS", "-g", "-m", str(timeout), "-X", "POST", url,
+           "-H", "Content-Type: application/json"]
+    for k, v in headers.items():
+        cmd += ["-H", f"{k}: {v}"]
+    cmd += ["-d", json.dumps(body)]
+    out = subprocess.run(cmd, capture_output=True, timeout=timeout + 10)
+    if out.returncode != 0:
+        raise RuntimeError(
+            f"curl rc={out.returncode}: {out.stderr.decode()[:200]}"
+        )
+    return json.loads(out.stdout.decode() or "{}")
+
+
+def _texts_of(msg: dict) -> str:
+    parts = msg.get("parts") or []
+    return "\n".join(
+        p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text")
+    ).strip()
+
+
+def cmd_list() -> int:
+    peers = _load_peers()
+    if not peers:
+        print("(sin agentes contratados)")
+        return 0
+    for pid, p in sorted(peers.items()):
+        alias = p.get("alias") or pid
+        print(f"{alias}\t{p.get('baseUrl', '?')}")
+    return 0
+
+
+def cmd_call(alias: str, text: str, timeout: int) -> int:
+    peers = _load_peers()
+    pid, peer = _find_peer(peers, alias)
+    if not peer:
+        known = ", ".join(sorted(p.get("alias") or k for k, p in peers.items()))
+        print(f"a2a_call_failed: alias '{alias}' no existe. Contratados: {known or 'ninguno'}")
+        return 1
+    base = str(peer.get("baseUrl", "")).rstrip("/")
+    header = str(peer.get("headerName") or "X-API-Key")
+    key = str(peer.get("apiKey") or "")
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "SendMessage",
+        "params": {
+            "message": {
+                "messageId": f"a2a-agent-{uuid.uuid4().hex[:12]}",
+                "role": "ROLE_USER",
+                "parts": [{"text": text}],
+            }
+        },
+    }
+    headers = {header: key} if key else {}
+    try:
+        resp = _curl_json(f"{base}/a2a", headers, body, timeout)
+    except Exception as e:  # noqa: BLE001
+        print(f"a2a_call_failed: {e}")
+        return 1
+    if "error" in resp:
+        err = resp["error"]
+        print(f"a2a_call_failed: rpc {err.get('code')}: {err.get('message')}")
+        return 1
+    result = resp.get("result") or {}
+    # SendMessage puede devolver task (con status.message) o message directo.
+    if "task" in result:
+        task = result["task"]
+        state = ((task.get("status") or {}).get("state")) or "?"
+        msg = (task.get("status") or {}).get("message") or {}
+        reply = _texts_of(msg)
+        if state != "TASK_STATE_COMPLETED" and not reply:
+            print(f"a2a_call_failed: task state {state}")
+            return 1
+        print(reply or "(respuesta vacia)")
+        return 0
+    if "message" in result:
+        print(_texts_of(result["message"]) or "(respuesta vacia)")
+        return 0
+    print("a2a_call_failed: respuesta sin task ni message")
+    return 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="a2a-agent")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list")
+    c = sub.add_parser("call")
+    c.add_argument("--alias", required=True)
+    c.add_argument("--text", required=True)
+    c.add_argument("--timeout", type=int, default=120)
+    args = ap.parse_args()
+    if args.cmd == "list":
+        return cmd_list()
+    return cmd_call(args.alias, args.text, args.timeout)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
 # <<< END EMBEDDED WORKSPACE SKILLS
 
 
@@ -16239,6 +16439,11 @@ def _ensure_workspace_skills() -> None:
         "SKILL.md": _AWMF_SKILL_MD,
         "manifest.json": _AWMF_MANIFEST,
         "bin/awmf.py": _AWMF_PY,
+    })
+    _ensure_workspace_skill("a2a-agent", {
+        "SKILL.md": _A2A_AGENT_SKILL_MD,
+        "manifest.json": _A2A_AGENT_MANIFEST,
+        "bin/a2a-agent.py": _A2A_AGENT_PY,
     })
 
 
@@ -18719,6 +18924,21 @@ reenvies secretos del usuario (contrasenas/tokens) por este canal.
 
 Nodos que puedes mandar llamar (alias — rol):"""
 
+_T_A2A_HIRE_HEADER = """## Regla: agentes externos contratados (skill a2a-agent)
+
+El dueno CONTRATO agentes de terceros via el protocolo A2A. Cuando una tarea
+encaje con la especialidad de uno de ellos (lista abajo), delegasela y usa su
+respuesta para continuar. Son servicios EXTERNOS: no ven tu conversacion ni
+tus archivos — mandales una instruccion CLARA y AUTOCONTENIDA.
+
+Para consultar a un agente contratado y leer su respuesta:
+   exec: python3 ~/.openclaw/workspace/skills/a2a-agent/bin/a2a-agent.py call --alias <alias> --text "<instruccion>"
+El comando imprime en stdout la respuesta del agente externo. Si no recuerdas
+los alias, corre el subcomando `list`. La primera llamada puede tardar
+~1 min. Si responde "a2a_call_failed", ese servicio no esta disponible: dilo
+y resuelve por otro medio. NUNCA reenvies secretos del dueno
+(contrasenas/tokens/keys) a un agente externo."""
+
 
 def _t_email_himalaya(account: str, himalaya_path: str) -> str:
     acc = account or "tu cuenta vinculada"
@@ -19067,6 +19287,32 @@ def _compose_tools_doc(token: dict) -> dict:
         blocks.append({
             "order": 260, "id": "feature:delegate", "kind": "feature",
             "text": _T_DELEGATE_HEADER + "\n" + "\n".join(lines),
+        })
+    # a2a-hire: agentes A2A externos contratados (F4), enabled, por DOC ID
+    # (lockstep con buildToolsJson — mismo header byte-a-byte).
+    try:
+        hired = sorted(
+            (p for p in _list_node_subcollection(token, "a2aPeers")
+             if p["data"].get("enabled") is True),
+            key=lambda p: p["id"],
+        )
+    except Exception:  # noqa: BLE001
+        hired = []
+    if hired:
+        hire_lines = []
+        for p in hired:
+            alias = (str(p["data"].get("alias") or "").strip() or p["id"])
+            bits = [
+                str(p["data"].get("role") or "").strip(),
+                str(p["data"].get("specialty") or "").strip(),
+            ]
+            bits = [b for b in bits if b]
+            hire_lines.append(
+                f"- {alias} — {'; '.join(bits)}" if bits else f"- {alias}"
+            )
+        blocks.append({
+            "order": 262, "id": "feature:a2a-hire", "kind": "feature",
+            "text": _T_A2A_HIRE_HEADER + "\n" + "\n".join(hire_lines),
         })
     return {"schema": 1, "target": "TOOLS.md", "blocks": blocks}
 
@@ -20539,7 +20785,82 @@ def handle_drive_wiki_sync(token: dict, params: dict) -> dict:
 
 # ── Dispatcher ─────────────────────────────────────────────────
 
+# ── A2A hired peers (F4): key del proveedor SOLO en el nodo ─────────
+_A2A_PEERS_PATH = OPENCLAW_DIR / "a2a-peers.json"
+
+
+def _a2a_peers_load() -> dict:
+    try:
+        return json.loads(_A2A_PEERS_PATH.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _a2a_peers_save(data: dict) -> None:
+    tmp = _A2A_PEERS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, _A2A_PEERS_PATH)
+
+
+def _a2a_peer_mirror(token: dict, peer_id: str, patch: dict) -> None:
+    uid, node_id = token["uid"], token["nodeId"]
+    mask = "&".join(
+        f"updateMask.fieldPaths={urllib.parse.quote(k)}" for k in patch.keys()
+    )
+    url = (
+        f"{_firestore_base()}/users/{uid}/nodes/{node_id}/a2aPeers/{peer_id}"
+        f"?{mask}"
+    )
+    _http_request(
+        "PATCH", url, _fs_fields(patch),
+        {"Authorization": f"Bearer {token['idToken']}"},
+    )
+
+
+def handle_a2a_peer_link(token: dict, params: dict) -> dict:
+    """Materializa un agente externo contratado: guarda alias/baseUrl/apiKey
+    en a2a-peers.json (0600 — la key del PROVEEDOR nunca vive en Firestore)
+    y flipea el mirror a linked. El bloque TOOLS.md lo compone la CF/compose
+    local desde el mirror; la especialidad la enriquece la CF."""
+    peer_id = (params.get("peerId") or "").strip()
+    base_url = (params.get("baseUrl") or "").strip().rstrip("/")
+    alias = (params.get("alias") or peer_id).strip()
+    secrets_map = params.get("secrets") or {}
+    api_key = (secrets_map.get("apiKey") or "").strip()
+    header_name = (params.get("headerName") or "X-API-Key").strip()
+    if not peer_id or not base_url:
+        return {"status": "error", "error": "peerId and baseUrl required"}
+    data = _a2a_peers_load()
+    data[peer_id] = {
+        "alias": alias,
+        "baseUrl": base_url,
+        "headerName": header_name,
+        "apiKey": api_key,
+    }
+    _a2a_peers_save(data)
+    try:
+        _a2a_peer_mirror(token, peer_id, {"status": "linked", "error": None})
+    except Exception as e:  # noqa: BLE001
+        _log(f"a2a_peer_link {peer_id} mirror failed: {e}")
+    _log(f"a2a-peer: linked {peer_id} ({base_url})")
+    return {"status": "done", "result": {"peerId": peer_id}}
+
+
+def handle_a2a_peer_unlink(token: dict, params: dict) -> dict:
+    peer_id = (params.get("peerId") or "").strip()
+    if not peer_id:
+        return {"status": "error", "error": "peerId required"}
+    data = _a2a_peers_load()
+    if data.pop(peer_id, None) is not None:
+        _a2a_peers_save(data)
+    _log(f"a2a-peer: unlinked {peer_id}")
+    return {"status": "done", "result": {"peerId": peer_id}}
+
+
 _HANDLERS = {
+    "a2a.peer.link": handle_a2a_peer_link,
+    "a2a.peer.unlink": handle_a2a_peer_unlink,
     "push_openclaw_config": lambda token, params: {
         "status": "done",
         "result": {"llmMode": push_openclaw_config(token)["llmMode"]},
