@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.102.0"
+TNODE_SETUP_VERSION="1.103.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -21548,6 +21548,12 @@ local openclaw-gateway (127.0.0.1:18789) so the mobile client keeps a
 single logical WebSocket per node, and injects telemetry events defined in
 skills/TELEMETRY.md.
 
+Since v1.20.0 the public port is a TCP dispatcher: WebSocket upgrades go to
+the internal WS server (loopback :18791 by default) and plain HTTP whose
+path starts with an allowlisted prefix (/.well-known/, /a2a — the tnode-a2a
+plugin endpoints) is byte-piped to the gateway, which serves it. Anything
+else gets a 404.
+
 Iteration 1: one stream → `usage`.
   - Snapshot on client connect (best-effort, marked stale until OR roundtrip).
   - Delta per agent turn-end, parsed from the session jsonl files the
@@ -21605,7 +21611,7 @@ from __future__ import annotations
 #          mtime (stat local, gratis) y mantiene sus polls de Firestore en
 #          cadencia rápida solo mientras el archivo esté fresco. Sin
 #          clientes → sin touch → chat-sync cae a backstops idle.
-__VERSION__ = "1.19.0"
+__VERSION__ = "1.20.0"
 
 import argparse
 import asyncio
@@ -21648,6 +21654,29 @@ LISTEN_HOST = os.environ.get("TNODE_TELEMETRY_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("TNODE_TELEMETRY_PORT", "18790"))
 UPSTREAM_URI = os.environ.get(
     "TNODE_TELEMETRY_UPSTREAM", "ws://127.0.0.1:18789"
+)
+
+# ── HTTP passthrough (v1.20.0, F1.5 del arco A2A) ────────────────────
+# El túnel CF del nodo apunta AQUÍ (:18790), así que el HTTP plano de los
+# endpoints A2A del gateway (plugin tnode-a2a: Agent Card + JSON-RPC) moría
+# en este proxy, que solo hablaba WebSocket. Desde 1.20.0 el puerto público
+# lo atiende un dispatcher TCP: los upgrades WebSocket se pipean al server
+# WS interno (loopback, LISTEN_PORT+1 por default) y el HTTP plano cuyo
+# path arranque con uno de los prefijos del allowlist se pipea BYTE-A-BYTE
+# al gateway (:18789), que sí lo sirve. Todo lo demás: 404 y cierre.
+WS_INTERNAL_HOST = "127.0.0.1"
+WS_INTERNAL_PORT = int(
+    os.environ.get("TNODE_TELEMETRY_WS_INTERNAL_PORT", str(LISTEN_PORT + 1))
+)
+_gw = UPSTREAM_URI.split("://", 1)[-1]
+GATEWAY_HTTP_HOST = _gw.split(":", 1)[0] or "127.0.0.1"
+GATEWAY_HTTP_PORT = int(_gw.split(":", 1)[1]) if ":" in _gw else 18789
+HTTP_PASSTHROUGH_PREFIXES = tuple(
+    p.strip()
+    for p in os.environ.get(
+        "TNODE_TELEMETRY_HTTP_PASSTHROUGH", "/.well-known/,/a2a"
+    ).split(",")
+    if p.strip()
 )
 
 OPENCLAW_HOME = Path(
@@ -23737,6 +23766,98 @@ class ClientSession:
         return True
 
 
+# ── Front TCP dispatcher (v1.20.0) ───────────────────────────────────
+# Olfatea la primera ráfaga del cliente (hasta el fin de headers) y decide:
+# upgrade WebSocket → pipe crudo al server WS interno; HTTP plano con path
+# en el allowlist → pipe crudo al gateway; otro → 404. El pipe es
+# protocol-agnóstico (POST con body, SSE futuro, etc. pasan intactos).
+
+_MAX_SNIFF_BYTES = 16 * 1024
+_SNIFF_TIMEOUT_SEC = 10.0
+
+
+async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        while True:
+            chunk = await reader.read(65536)
+            if not chunk:
+                break
+            writer.write(chunk)
+            await writer.drain()
+    except (ConnectionError, asyncio.CancelledError, OSError):
+        pass
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+async def _relay(
+    head: bytes,
+    client_r: asyncio.StreamReader,
+    client_w: asyncio.StreamWriter,
+    host: str,
+    port: int,
+) -> None:
+    up_r, up_w = await asyncio.open_connection(host, port)
+    up_w.write(head)
+    await up_w.drain()
+    await asyncio.gather(_pipe(client_r, up_w), _pipe(up_r, client_w))
+
+
+def _sniff_route(head: bytes) -> str:
+    """Return 'ws' | 'http' | 'reject' for the buffered request head."""
+    try:
+        headers_blob = head.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+    except Exception:
+        return "reject"
+    lines = headers_blob.split("\r\n")
+    request_line = lines[0] if lines else ""
+    parts = request_line.split(" ")
+    path = parts[1] if len(parts) >= 2 else ""
+    for line in lines[1:]:
+        if line.lower().startswith("upgrade:") and "websocket" in line.lower():
+            return "ws"
+    if any(path.startswith(p) for p in HTTP_PASSTHROUGH_PREFIXES):
+        return "http"
+    return "reject"
+
+
+async def _dispatch_conn(
+    client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter
+) -> None:
+    try:
+        head = b""
+        while b"\r\n\r\n" not in head and len(head) < _MAX_SNIFF_BYTES:
+            chunk = await asyncio.wait_for(
+                client_r.read(4096), timeout=_SNIFF_TIMEOUT_SEC
+            )
+            if not chunk:
+                break
+            head += chunk
+        route = _sniff_route(head) if head else "reject"
+        if route == "ws":
+            await _relay(head, client_r, client_w, WS_INTERNAL_HOST, WS_INTERNAL_PORT)
+        elif route == "http":
+            await _relay(head, client_r, client_w, GATEWAY_HTTP_HOST, GATEWAY_HTTP_PORT)
+        else:
+            client_w.write(
+                b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n"
+                b"Content-Length: 0\r\n\r\n"
+            )
+            await client_w.drain()
+    except (asyncio.TimeoutError, ConnectionError, OSError):
+        pass
+    except Exception as exc:  # noqa: BLE001 — nunca tumbar el listener
+        logging.debug("dispatcher error: %s", exc)
+    finally:
+        try:
+            client_w.close()
+        except Exception:
+            pass
+
+
 # ── Entrypoint ────────────────────────────────────────────────────────
 
 async def _serve(proxy: TelemetryProxy) -> None:
@@ -23758,16 +23879,30 @@ async def _serve(proxy: TelemetryProxy) -> None:
             # Windows/some containers — fall back to default handlers.
             pass
 
-    async with websockets.serve(
-        _handler,
-        LISTEN_HOST,
-        LISTEN_PORT,
-        ping_interval=20,
-        ping_timeout=20,
-        max_size=None,
-    ):
-        await stop
-        await proxy.stop_background()
+    # v1.20.0: el server WS vive en loopback interno; el puerto público lo
+    # atiende el dispatcher TCP (WS → interno, HTTP allowlist → gateway).
+    dispatcher = await asyncio.start_server(
+        _dispatch_conn, LISTEN_HOST, LISTEN_PORT
+    )
+    logging.info(
+        "dispatcher on %s:%s (ws→%s:%s, http %s→%s:%s)",
+        LISTEN_HOST, LISTEN_PORT, WS_INTERNAL_HOST, WS_INTERNAL_PORT,
+        ",".join(HTTP_PASSTHROUGH_PREFIXES), GATEWAY_HTTP_HOST, GATEWAY_HTTP_PORT,
+    )
+    try:
+        async with websockets.serve(
+            _handler,
+            WS_INTERNAL_HOST,
+            WS_INTERNAL_PORT,
+            ping_interval=20,
+            ping_timeout=20,
+            max_size=None,
+        ):
+            await stop
+            await proxy.stop_background()
+    finally:
+        dispatcher.close()
+        await dispatcher.wait_closed()
 
 
 def main() -> None:
