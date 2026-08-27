@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.103.0"
+TNODE_SETUP_VERSION="1.104.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -7185,7 +7185,7 @@ from __future__ import annotations
 # 1.66.0: agentes de plataforma formalizados — recepcion (binding whatsapp +
 #          dmScope per-channel-peer) y workflow-author (modelo fuerte con
 #          guarda de provider) se materializan en todos los nodos (self-heal).
-__VERSION__ = "1.67.0"
+__VERSION__ = "1.68.0"
 
 import hashlib
 import hmac
@@ -15813,7 +15813,123 @@ def _write_inventory_cron_hash(value: str) -> None:
         pass
 
 
+# ── A2A declarativo (F3 del arco TNode A2A, v1.68.0) ─────────────────
+# El compositor CF (a2a_sync.ts) cachea a2aJson/a2aHash en el node doc a
+# partir de config/a2aCard (card curada por el owner) + a2aClients/ (solo
+# sha256 de las keys — el plaintext nunca sale del device del owner). Aquí
+# se materializa hash-gated en plugins.entries.tnode-a2a.config, SOLO si el
+# plugin tnode-a2a está instalado en el nodo. En cambio efectivo se hace
+# restart blocking del gateway: el plugin lee su pluginConfig al cargar y
+# el hot-reload del file-watcher no re-corre register() de plugins (mismo
+# criterio que la primera activación de key, ver _restart_gateway_blocking).
+_A2A_HASH_PATH = OPENCLAW_DIR / ".tnode-a2a-hash"
+_A2A_PLUGIN_DIR = OPENCLAW_DIR / "extensions" / "tnode-a2a"
+
+
+def _read_a2a_hash() -> str:
+    try:
+        return _A2A_HASH_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _write_a2a_hash(value: str) -> None:
+    try:
+        _A2A_HASH_PATH.write_text(value, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _update_openclaw_config_for_a2a(doc: dict) -> bool:
+    """Escribe la config declarativa del plugin tnode-a2a en openclaw.json.
+    Retorna True si el archivo cambio. Escritura atomica via
+    _write_openclaw_json; no toca nada fuera de plugins.entries.tnode-a2a."""
+    cfg = read_openclaw_json()
+    if not isinstance(cfg, dict):
+        _log("a2a: openclaw.json unreadable — skip")
+        return False
+    plugins = cfg.setdefault("plugins", {})
+    if not isinstance(plugins, dict):
+        _log("a2a: plugins section is not a dict — skip")
+        return False
+    entries = plugins.setdefault("entries", {})
+    if not isinstance(entries, dict):
+        _log("a2a: plugins.entries is not a dict — skip")
+        return False
+    entry = entries.setdefault("tnode-a2a", {})
+    if not isinstance(entry, dict):
+        _log("a2a: plugins.entries.tnode-a2a is not a dict — skip")
+        return False
+
+    new_config = {"enabled": bool(doc.get("enabled"))}
+    for key in ("agentName", "agentDescription", "agentId"):
+        val = doc.get(key)
+        if isinstance(val, str) and val.strip():
+            new_config[key] = val.strip()
+    skills = doc.get("skills")
+    if isinstance(skills, list) and skills:
+        new_config["skills"] = [
+            {
+                k: v
+                for k, v in s.items()
+                if k in ("id", "name", "description", "tags", "examples")
+            }
+            for s in skills
+            if isinstance(s, dict) and s.get("id")
+        ]
+    clients = doc.get("clients")
+    new_config["clients"] = [
+        {"id": str(c.get("id")), "keySha256": str(c.get("keySha256"))}
+        for c in (clients if isinstance(clients, list) else [])
+        if isinstance(c, dict) and c.get("id") and c.get("keySha256")
+    ]
+
+    if entry.get("config") == new_config and entry.get("enabled") is True:
+        return False
+    entry["enabled"] = True
+    entry["config"] = new_config
+    _write_openclaw_json(cfg)
+    return True
+
+
+def _sync_a2a(token: dict) -> None:
+    """Materializa la config A2A declarada (hash-gated). El hash local solo
+    se estampa en exito — gateway caido reintenta al proximo pase."""
+    if not _A2A_PLUGIN_DIR.exists():
+        return  # plugin no instalado en este nodo — nada que materializar
+    try:
+        remote_hash = _firestore_get_node_field(token, "a2aHash")
+    except Exception as e:  # noqa: BLE001
+        _log(f"a2a: hash read failed: {e}")
+        return
+    if not remote_hash or remote_hash == _read_a2a_hash():
+        return
+    try:
+        raw = _firestore_get_node_field(token, "a2aJson")
+        doc = json.loads(raw) if raw else None
+    except Exception as e:  # noqa: BLE001
+        _log(f"a2a: json read/parse failed: {e}")
+        return
+    if not isinstance(doc, dict):
+        return
+    try:
+        changed = _update_openclaw_config_for_a2a(doc)
+        if changed:
+            n = len(doc.get("clients") or [])
+            _log(
+                f"a2a: materialized config (enabled={doc.get('enabled')}, "
+                f"clients={n}, hash {remote_hash[:12]}) — restarting gateway"
+            )
+            if not _restart_gateway_blocking():
+                _log("a2a: gateway restart did not confirm — hash NOT stamped")
+                return
+        _write_a2a_hash(remote_hash)
+    except Exception as e:  # noqa: BLE001
+        _log(f"a2a: materialize failed: {e}")
+
+
 _GATEWAY_WS_URL = "ws://127.0.0.1:18789"
+
 
 
 def _gateway_rpc(method: str, params: dict, timeout: float = 20.0) -> dict:
@@ -16122,6 +16238,7 @@ def _run_declarative_sync(token: dict) -> None:
         [
             "toolsHash", "soulHash", "identityHash", "userHash",
             "teamIndexHash", "inventoryCronHash", "workflowCronsHash",
+            "a2aHash",
         ],
     )
     # Reflect channel state to Firestore + the one-time v1.1 migration, then
@@ -16164,6 +16281,9 @@ def _run_declarative_sync(token: dict) -> None:
     # (throttled 30 min — colgado de aquí, sin timer propio).
     _sync_workflow_crons(token)
     _workflow_sweep_maybe()
+    # A2A: config declarativa del plugin tnode-a2a (hash-gated; solo si el
+    # plugin esta instalado en el nodo).
+    _sync_a2a(token)
     # Guest workspace SOUL.md: render the owner's Business Profile so the guest
     # agent knows the business it represents (needs the token to read the
     # node-scoped config/businessProfile doc).
