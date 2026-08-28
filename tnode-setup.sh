@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.107.0"
+TNODE_SETUP_VERSION="1.108.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -22132,7 +22132,14 @@ from __future__ import annotations
 #          Fix: el tailer enhebra el agente dueño del archivo (srcAgent) en
 #          cada turno y flush_turn NO espeja turnos sin sessionKey de
 #          agentes ≠ main. Familia de [[chat_sync_delivery_mirror_leak]].
-__VERSION__ = "1.39.0"
+# 1.39.1 — cierra el lag de enforcement F5a (E2E 2026-08-27): el decl-refresh
+#          event-driven solo disparaba con sesiones NUEVAS, así que un cliente
+#          A2A repitiendo el mismo contextId no provocaba refresh y el
+#          `exhausted` derivado por la CF tardaba hasta el backstop. Ahora
+#          _a2a_sync_usage dispara _trigger_declarative_refresh tras subir
+#          usage, con delay (~8s, TNODE_CHAT_SYNC_A2A_DECL_DELAY_S) para que
+#          la CF recomponga a2aHash ANTES de que el oneshot lea el node doc.
+__VERSION__ = "1.39.1"
 
 import hashlib
 import hmac
@@ -22145,6 +22152,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -24970,12 +24978,19 @@ DECL_TRIGGER_THROTTLE_S = float(
 _last_decl_trigger = 0.0
 
 
-def _trigger_declarative_refresh() -> None:
+def _trigger_declarative_refresh(delay_s: float = 0.0) -> None:
     """Spawn tnode-config-sync in DECL_ONESHOT mode to refresh the workspace
     .md files. Fire-and-forget, best-effort, throttled: a burst of sessions
     coalesces into one refresh (config changes are rare), and any failure is
-    swallowed so chat mirroring is never affected."""
+    swallowed so chat mirroring is never affected. With delay_s > 0 the spawn
+    happens on a daemon Timer; the throttle is evaluated at fire time, so
+    delayed triggers coalesce with immediate ones."""
     global _last_decl_trigger
+    if delay_s > 0:
+        timer = threading.Timer(delay_s, _trigger_declarative_refresh)
+        timer.daemon = True
+        timer.start()
+        return
     now = time.time()
     if now - _last_decl_trigger < DECL_TRIGGER_THROTTLE_S:
         return
@@ -24991,7 +25006,7 @@ def _trigger_declarative_refresh() -> None:
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        _log("decl-refresh: spawned config-sync DECL_ONESHOT (new session)")
+        _log("decl-refresh: spawned config-sync DECL_ONESHOT")
     except Exception as e:  # noqa: BLE001
         _log(f"decl-refresh trigger failed (non-fatal): {e}")
 
@@ -25977,6 +25992,13 @@ def process_outbox(token: dict, project_id: str, state: dict) -> bool:
 
 A2A_USAGE_STATE_PATH = OPENCLAW_DIR / "a2a-usage-state.json"
 A2A_USAGE_CHECK_INTERVAL_S = 60
+# After uploading usage, refresh the declarative config so the CF-derived
+# status (e.g. "exhausted") reaches the plugin without waiting for a new
+# session or the backstop poll (v1.39.1). The delay gives the a2a_sync CF
+# time to recompose a2aHash into the node doc BEFORE the oneshot reads it.
+A2A_DECL_REFRESH_DELAY_S = float(
+    os.environ.get("TNODE_CHAT_SYNC_A2A_DECL_DELAY_S", "8.0")
+)
 
 _a2a_sessmap_cache: dict = {}  # sessions.json path -> (mtime, {sessionId: clientId})
 
@@ -26104,6 +26126,7 @@ def _a2a_sync_usage(token: dict, project_id: str, state: dict) -> None:
     deleted client deleted (404 → drop silently)."""
     month = time.strftime("%Y-%m", time.gmtime())
     base = _firestore_base(project_id)
+    uploaded_any = False
     for client_id, months in list(state["clients"].items()):
         bucket = months.get(month) or {
             "calls": 0, "tokensIn": 0, "tokensOut": 0, "costUsd": 0.0,
@@ -26133,6 +26156,7 @@ def _a2a_sync_usage(token: dict, project_id: str, state: dict) -> None:
         try:
             _http_patch_json(url, body, headers)
             state["uploaded"][client_id] = snapshot
+            uploaded_any = True
             _log(
                 f"a2a-usage: {client_id} {month} calls={bucket['calls']} "
                 f"costUsd={round(bucket['costUsd'], 4)}"
@@ -26148,6 +26172,11 @@ def _a2a_sync_usage(token: dict, project_id: str, state: dict) -> None:
             _log(f"a2a-usage: PATCH {client_id} failed: {e.code}")
         except Exception as e:  # noqa: BLE001
             _log(f"a2a-usage: PATCH {client_id} failed: {e}")
+    if uploaded_any:
+        # Fresh usage may flip the CF-derived status (80%/exhausted); a
+        # client re-using the same contextId never opens a new session, so
+        # without this the new status waits for the backstop poll.
+        _trigger_declarative_refresh(delay_s=A2A_DECL_REFRESH_DELAY_S)
 
 
 def main() -> int:
