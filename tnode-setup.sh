@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.110.0"
+TNODE_SETUP_VERSION="1.111.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -12012,7 +12012,12 @@ from __future__ import annotations
 # 1.66.0: agentes de plataforma formalizados — recepcion (binding whatsapp +
 #          dmScope per-channel-peer) y workflow-author (modelo fuerte con
 #          guarda de provider) se materializan en todos los nodos (self-heal).
-__VERSION__ = "1.70.0"
+# 1.71.0: skill a2a-agent 1.1.0 re-embebido — bitácora de llamadas a
+#          contratados (`a2a-peer-dialog.jsonl`, la espeja chat-sync 1.41.0
+#          como recentTurns en a2aPeers = F5c transparencia consumidor) +
+#          normaliza baseUrl con sufijo de card + fix crash en errores
+#          JSON-RPC string.
+__VERSION__ = "1.71.0"
 
 import hashlib
 import hmac
@@ -16180,6 +16185,11 @@ Subcomandos:
   list                          agentes contratados (alias + endpoint)
   call --alias A --text "..."   consulta y espera la respuesta [--timeout 120]
 Errores SIEMPRE por stdout con prefijo `a2a_call_failed:` (el agente los lee).
+
+Cada `call` deja bitácora en ~/.openclaw/a2a-peer-dialog.jsonl (enviado +
+respuesta, 0600): chat-sync la espeja a a2aPeers/{peerId}.recentTurns para
+que el DUEÑO vea desde la app qué manda su agente a terceros y qué le
+contestan. La bitácora es del dueño, no del modelo — el agente no la lee.
 """
 from __future__ import annotations
 
@@ -16188,10 +16198,14 @@ import json
 import os
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
-__VERSION__ = "1.0.0"
+__VERSION__ = "1.1.0"
+
+DIALOG_LOG_MAX_BYTES = 256 * 1024
+DIALOG_LOG_KEEP_LINES = 200
 
 
 def _openclaw_dir() -> Path:
@@ -16221,6 +16235,41 @@ def _find_peer(peers: dict, alias: str):
         if pid.lower() == a or str(p.get("alias", "")).strip().lower() == a:
             return pid, p
     return None, None
+
+
+def _normalize_base(raw: str) -> str:
+    """El endpoint RPC es `<origen>/a2a`. Los dueños suelen pegar la URL de
+    la CARD (…/.well-known/agent-card.json) como baseUrl — recórtala para no
+    llamar a `…/agent-card.json/a2a` (que por match prefix devuelve la card
+    en vez del RPC)."""
+    base = raw.strip().rstrip("/")
+    suffix = "/.well-known/agent-card.json"
+    if base.endswith(suffix):
+        base = base[: -len(suffix)]
+    return base.rstrip("/")
+
+
+def _log_dialog(pid: str, alias: str, sent: str, reply: str, ok: bool) -> None:
+    """Bitácora local best-effort para el espejo de chat-sync. Jamás rompe
+    la llamada; rota simple cuando crece de más."""
+    try:
+        path = _openclaw_dir() / "a2a-peer-dialog.jsonl"
+        line = json.dumps({
+            "peerId": pid,
+            "alias": alias,
+            "sent": sent,
+            "reply": reply,
+            "ok": ok,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }, ensure_ascii=False)
+        if path.exists() and path.stat().st_size > DIALOG_LOG_MAX_BYTES:
+            tail = path.read_text(encoding="utf-8").splitlines()[-DIALOG_LOG_KEEP_LINES:]
+            path.write_text("\n".join(tail) + "\n", encoding="utf-8")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        os.chmod(path, 0o600)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _curl_json(url: str, headers: dict, body: dict, timeout: int) -> dict:
@@ -16262,9 +16311,10 @@ def cmd_call(alias: str, text: str, timeout: int) -> int:
         known = ", ".join(sorted(p.get("alias") or k for k, p in peers.items()))
         print(f"a2a_call_failed: alias '{alias}' no existe. Contratados: {known or 'ninguno'}")
         return 1
-    base = str(peer.get("baseUrl", "")).rstrip("/")
+    base = _normalize_base(str(peer.get("baseUrl", "")))
     header = str(peer.get("headerName") or "X-API-Key")
     key = str(peer.get("apiKey") or "")
+    peer_alias = str(peer.get("alias") or pid)
     body = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -16281,11 +16331,19 @@ def cmd_call(alias: str, text: str, timeout: int) -> int:
     try:
         resp = _curl_json(f"{base}/a2a", headers, body, timeout)
     except Exception as e:  # noqa: BLE001
+        _log_dialog(pid, peer_alias, text, f"a2a_call_failed: {e}", ok=False)
         print(f"a2a_call_failed: {e}")
         return 1
     if "error" in resp:
         err = resp["error"]
-        print(f"a2a_call_failed: rpc {err.get('code')}: {err.get('message')}")
+        # El error JSON-RPC puede venir como objeto {code,message} o como
+        # string plano (algunos servers) — nunca truenes formateándolo.
+        if isinstance(err, dict):
+            detail = f"rpc {err.get('code')}: {err.get('message')}"
+        else:
+            detail = f"rpc: {err}"
+        _log_dialog(pid, peer_alias, text, f"a2a_call_failed: {detail}", ok=False)
+        print(f"a2a_call_failed: {detail}")
         return 1
     result = resp.get("result") or {}
     # SendMessage puede devolver task (con status.message) o message directo.
@@ -16295,13 +16353,18 @@ def cmd_call(alias: str, text: str, timeout: int) -> int:
         msg = (task.get("status") or {}).get("message") or {}
         reply = _texts_of(msg)
         if state != "TASK_STATE_COMPLETED" and not reply:
+            _log_dialog(pid, peer_alias, text, f"a2a_call_failed: task state {state}", ok=False)
             print(f"a2a_call_failed: task state {state}")
             return 1
+        _log_dialog(pid, peer_alias, text, reply or "(respuesta vacia)", ok=True)
         print(reply or "(respuesta vacia)")
         return 0
     if "message" in result:
-        print(_texts_of(result["message"]) or "(respuesta vacia)")
+        reply = _texts_of(result["message"]) or "(respuesta vacia)"
+        _log_dialog(pid, peer_alias, text, reply, ok=True)
+        print(reply)
         return 0
+    _log_dialog(pid, peer_alias, text, "a2a_call_failed: respuesta sin task ni message", ok=False)
     print("a2a_call_failed: respuesta sin task ni message")
     return 1
 
@@ -22208,7 +22271,13 @@ from __future__ import annotations
 #          múltiple) o solo-dialog; fingerprint aparte (dialogs_uploaded).
 #          El sess_map ahora también matchea keys agent-prefijadas
 #          (`agent:<id>:a2a-…`) y expone el contextId.
-__VERSION__ = "1.40.0"
+# 1.41.0 — F5c transparencia lado CONSUMIDOR (pedido de tobal): espejo de la
+#          bitácora `a2a-peer-dialog.jsonl` que escribe el skill a2a-agent
+#          1.1.0 en cada `call` a un contratado → `recentTurns` en
+#          a2aPeers/{peerId} (mismo shape capped que el lado vendedor; role
+#          user = NUESTRO agente, assistant = el tercero). El dueño ve desde
+#          Equipo qué manda su agente a terceros y qué le contestan.
+__VERSION__ = "1.41.0"
 
 import hashlib
 import hmac
@@ -26082,12 +26151,16 @@ def _a2a_load_state() -> dict:
             st.setdefault("uploaded", {})
             st.setdefault("dialogs", {})
             st.setdefault("dialogs_uploaded", {})
+            st.setdefault("peer_dialogs", {})
+            st.setdefault("peer_dialogs_uploaded", {})
+            st.setdefault("peer_log_offset", 0)
             return st
     except (OSError, ValueError):
         pass
     return {
         "offsets": {}, "clients": {}, "uploaded": {},
         "dialogs": {}, "dialogs_uploaded": {},
+        "peer_dialogs": {}, "peer_dialogs_uploaded": {}, "peer_log_offset": 0,
     }
 
 
@@ -26237,6 +26310,84 @@ def _a2a_collect(state: dict) -> bool:
                     pass
                 changed = True
     return changed
+
+
+A2A_PEER_LOG_PATH = OPENCLAW_DIR / "a2a-peer-dialog.jsonl"
+
+
+def _a2a_collect_peer_dialogs(state: dict) -> bool:
+    """F5c (lado CONSUMIDOR): tail de la bitácora que el skill a2a-agent
+    escribe en cada `call` a un agente contratado — qué mandó NUESTRO agente
+    y qué respondió el tercero. Mismo shape de turnos que el lado vendedor:
+    role "user" = nuestro agente, "assistant" = el contratado."""
+    try:
+        st = A2A_PEER_LOG_PATH.stat()
+    except OSError:
+        return False
+    offset = int(state.get("peer_log_offset") or 0)
+    if st.st_size < offset:
+        offset = 0  # el skill rotó el log
+    if st.st_size == offset:
+        return False
+    try:
+        with open(A2A_PEER_LOG_PATH) as f:
+            f.seek(offset)
+            chunk = f.read()
+            state["peer_log_offset"] = f.tell()
+    except OSError:
+        return False
+    changed = False
+    for line in chunk.splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        pid = str(e.get("peerId") or "")
+        if not pid:
+            continue
+        ts = str(e.get("ts") or "")
+        turns = state["peer_dialogs"].setdefault(pid, [])
+        for role, txt in (("user", e.get("sent")), ("assistant", e.get("reply"))):
+            txt = str(txt or "").strip()
+            if not txt:
+                continue
+            if len(txt) > A2A_DIALOG_MAX_CHARS:
+                txt = txt[: A2A_DIALOG_MAX_CHARS - 1] + "…"
+            turns.append({"role": role, "text": txt, "ts": ts, "ctx": ""})
+        del turns[:-A2A_DIALOG_MAX_TURNS]
+        changed = True
+    return changed
+
+
+def _a2a_sync_peer_dialogs(token: dict, project_id: str, state: dict) -> None:
+    """PATCH recentTurns en a2aPeers/{peerId} (doc espejo del contratado,
+    owner-RW). `exists=true`: un peer des-contratado no resucita."""
+    base = _firestore_base(project_id)
+    for pid, turns in list(state["peer_dialogs"].items()):
+        if not turns:
+            continue
+        fp = f"{len(turns)}:{turns[-1]['ts']}"
+        if state["peer_dialogs_uploaded"].get(pid) == fp:
+            continue
+        url = (
+            f"{base}/users/{token['uid']}/nodes/{token['nodeId']}"
+            f"/a2aPeers/{pid}"
+            "?updateMask.fieldPaths=recentTurns&currentDocument.exists=true"
+        )
+        headers = {"Authorization": f"Bearer {token['idToken']}"}
+        try:
+            _http_patch_json(url, _fs_fields({"recentTurns": turns}), headers)
+            state["peer_dialogs_uploaded"][pid] = fp
+            _log(f"a2a-peer-dialog: {pid} turns={len(turns)}")
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                state["peer_dialogs_uploaded"][pid] = fp
+                continue
+            if e.code == 401:
+                raise
+            _log(f"a2a-peer-dialog: PATCH {pid} failed: {e.code}")
+        except Exception as e:  # noqa: BLE001
+            _log(f"a2a-peer-dialog: PATCH {pid} failed: {e}")
 
 
 def _a2a_sync_usage(token: dict, project_id: str, state: dict) -> None:
@@ -26878,6 +27029,10 @@ def main() -> int:
                     if _a2a_collect(a2a_state):
                         _a2a_save_state(a2a_state)
                     _a2a_sync_usage(token, project_id, a2a_state)
+                    _a2a_collect_peer_dialogs(a2a_state)
+                    # fingerprint-gated adentro: reintenta PATCHes fallidos
+                    # aunque no haya líneas nuevas en la bitácora.
+                    _a2a_sync_peer_dialogs(token, project_id, a2a_state)
                     _a2a_save_state(a2a_state)
                 except urllib.error.HTTPError as e:
                     if e.code == 401:
