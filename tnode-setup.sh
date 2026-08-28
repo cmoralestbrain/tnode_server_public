@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.109.0"
+TNODE_SETUP_VERSION="1.110.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -22199,7 +22199,16 @@ from __future__ import annotations
 #          _a2a_sync_usage dispara _trigger_declarative_refresh tras subir
 #          usage, con delay (~8s, TNODE_CHAT_SYNC_A2A_DECL_DELAY_S) para que
 #          la CF recomponga a2aHash ANTES de que el oneshot lea el node doc.
-__VERSION__ = "1.39.1"
+# 1.40.0 — F5b transparencia del Medidor (pedido de tobal 2026-08-28): el
+#          mini-tailer A2A captura también los TURNOS (user + assistant, solo
+#          bloques text — nunca thinking) y los espeja como `recentTurns` en
+#          a2aClients/{clientId}: array capped (30 turnos × 400 chars, con
+#          ctx corto + ts) en el MISMO doc que ya lee la pantalla del Medidor
+#          — cero rules/índices nuevos. PATCH combinado con usage (updateMask
+#          múltiple) o solo-dialog; fingerprint aparte (dialogs_uploaded).
+#          El sess_map ahora también matchea keys agent-prefijadas
+#          (`agent:<id>:a2a-…`) y expone el contextId.
+__VERSION__ = "1.40.0"
 
 import hashlib
 import hmac
@@ -26071,10 +26080,15 @@ def _a2a_load_state() -> dict:
             st.setdefault("offsets", {})
             st.setdefault("clients", {})
             st.setdefault("uploaded", {})
+            st.setdefault("dialogs", {})
+            st.setdefault("dialogs_uploaded", {})
             return st
     except (OSError, ValueError):
         pass
-    return {"offsets": {}, "clients": {}, "uploaded": {}}
+    return {
+        "offsets": {}, "clients": {}, "uploaded": {},
+        "dialogs": {}, "dialogs_uploaded": {},
+    }
 
 
 def _a2a_save_state(state: dict) -> None:
@@ -26088,8 +26102,10 @@ def _a2a_save_state(state: dict) -> None:
 
 
 def _a2a_session_map() -> dict:
-    """sessionId -> clientId for every `a2a-<clientId>__*` key across all
-    agents' `sessions.json` stores (mtime-cached per store)."""
+    """sessionId -> {"client", "ctx"} for every `a2a-<clientId>__<ctx>` key
+    across all agents' `sessions.json` stores (mtime-cached per store).
+    Keys appear bare (`a2a-…`) or agent-prefixed (`agent:<id>:a2a-…`) —
+    both map to the same session file, sid-keyed dedupe handles overlap."""
     out: dict = {}
     for d in resolve_all_sessions_dirs():
         sj = d / "sessions.json"
@@ -26108,25 +26124,51 @@ def _a2a_session_map() -> dict:
             continue
         m: dict = {}
         for key, v in (data.items() if isinstance(data, dict) else ()):
-            if not (isinstance(key, str) and key.startswith("a2a-") and "__" in key):
+            if not isinstance(key, str):
+                continue
+            tail = key.rsplit(":", 1)[-1]
+            if not (tail.startswith("a2a-") and "__" in tail):
                 continue
             sid = (v or {}).get("sessionId") if isinstance(v, dict) else None
             if isinstance(sid, str) and sid:
-                m[sid] = key[len("a2a-"):].split("__", 1)[0]
+                client, ctx = tail[len("a2a-"):].split("__", 1)
+                m[sid] = {"client": client, "ctx": ctx}
         _a2a_sessmap_cache[str(sj)] = (mtime, m)
         out.update(m)
     return out
 
 
+A2A_DIALOG_MAX_TURNS = 30
+A2A_DIALOG_MAX_CHARS = 400
+
+
+def _a2a_dialog_text(content) -> str:
+    """Visible text of a session-jsonl message: user content is a plain str,
+    assistant content is a block list — keep only `text` blocks (never
+    `thinking`, that is internal reasoning the client never saw)."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [
+            str(b.get("text") or "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        return "\n".join(p for p in parts if p).strip()
+    return ""
+
+
 def _a2a_collect(state: dict) -> bool:
     """Tail the `.jsonl` of every known a2a session; accumulate per-client
-    monthly counters. Returns True when any counter moved."""
+    monthly counters + the recent dialog turns the owner can inspect from
+    the app (F5b transparencia). Returns True when anything moved."""
     changed = False
     sess_map = _a2a_session_map()
     if not sess_map:
         return False
     for d in resolve_all_sessions_dirs():
-        for sid, client_id in sess_map.items():
+        for sid, sess in sess_map.items():
+            client_id = sess["client"]
             path = d / f"{sid}.jsonl"
             try:
                 st = path.stat()
@@ -26153,12 +26195,29 @@ def _a2a_collect(state: dict) -> bool:
                 if not isinstance(entry, dict) or entry.get("type") != "message":
                     continue
                 msg = entry.get("message") or {}
-                if (msg.get("role") or "").lower() != "assistant":
+                role = (msg.get("role") or "").lower()
+                ets = str(entry.get("timestamp") or msg.get("timestamp") or "")
+                # F5b: dialog capture — both sides of the exchange, capped.
+                if role in ("user", "assistant"):
+                    dtext = _a2a_dialog_text(msg.get("content"))
+                    if dtext:
+                        if len(dtext) > A2A_DIALOG_MAX_CHARS:
+                            dtext = dtext[: A2A_DIALOG_MAX_CHARS - 1] + "…"
+                        turns = state["dialogs"].setdefault(client_id, [])
+                        turns.append({
+                            "role": role,
+                            "text": dtext,
+                            "ts": ets,
+                            "ctx": sess["ctx"][:8],
+                        })
+                        del turns[:-A2A_DIALOG_MAX_TURNS]
+                        changed = True
+                if role != "assistant":
                     continue
                 usage = msg.get("usage")
                 if not isinstance(usage, dict):
                     continue
-                ts = str(entry.get("timestamp") or msg.get("timestamp") or "")
+                ts = ets
                 month = ts[:7] if len(ts) >= 7 and ts[4] == "-" else time.strftime(
                     "%Y-%m", time.gmtime()
                 )
@@ -26187,7 +26246,9 @@ def _a2a_sync_usage(token: dict, project_id: str, state: dict) -> None:
     month = time.strftime("%Y-%m", time.gmtime())
     base = _firestore_base(project_id)
     uploaded_any = False
-    for client_id, months in list(state["clients"].items()):
+    all_clients = set(state["clients"]) | set(state["dialogs"])
+    for client_id in sorted(all_clients):
+        months = state["clients"].get(client_id) or {}
         bucket = months.get(month) or {
             "calls": 0, "tokensIn": 0, "tokensOut": 0, "costUsd": 0.0,
         }
@@ -26195,37 +26256,58 @@ def _a2a_sync_usage(token: dict, project_id: str, state: dict) -> None:
             f"{month}:{bucket['calls']}:{bucket['tokensIn']}:"
             f"{bucket['tokensOut']}:{round(bucket['costUsd'], 6)}"
         )
-        if state["uploaded"].get(client_id) == snapshot:
-            continue
-        url = (
-            f"{base}/users/{token['uid']}/nodes/{token['nodeId']}"
-            f"/a2aClients/{client_id}"
-            "?updateMask.fieldPaths=usage&currentDocument.exists=true"
+        usage_dirty = state["uploaded"].get(client_id) != snapshot
+        turns = state["dialogs"].get(client_id) or []
+        dialog_fp = f"{len(turns)}:{turns[-1]['ts'] if turns else ''}"
+        dialog_dirty = bool(turns) and (
+            state["dialogs_uploaded"].get(client_id) != dialog_fp
         )
-        body = _fs_fields({
-            "usage": {
+        if not usage_dirty and not dialog_dirty:
+            continue
+        masks = []
+        fields: dict = {}
+        if usage_dirty:
+            masks.append("usage")
+            fields["usage"] = {
                 "windowStart": month,
                 "calls": int(bucket["calls"]),
                 "tokensIn": int(bucket["tokensIn"]),
                 "tokensOut": int(bucket["tokensOut"]),
                 "costUsd": round(float(bucket["costUsd"]), 6),
                 "updatedAt": {"__server_timestamp__": True},
-            },
-        })
+            }
+        if dialog_dirty:
+            # F5b: the owner's transparency window — last N exchanges of the
+            # public agent with this client, as a capped field on the client
+            # doc (no new rules/indexes; the meter screen already reads it).
+            masks.append("recentTurns")
+            fields["recentTurns"] = turns
+        url = (
+            f"{base}/users/{token['uid']}/nodes/{token['nodeId']}"
+            f"/a2aClients/{client_id}?"
+            + "&".join(f"updateMask.fieldPaths={m}" for m in masks)
+            + "&currentDocument.exists=true"
+        )
+        body = _fs_fields(fields)
         headers = {"Authorization": f"Bearer {token['idToken']}"}
         try:
             _http_patch_json(url, body, headers)
-            state["uploaded"][client_id] = snapshot
-            uploaded_any = True
-            _log(
-                f"a2a-usage: {client_id} {month} calls={bucket['calls']} "
-                f"costUsd={round(bucket['costUsd'], 4)}"
-            )
+            if usage_dirty:
+                state["uploaded"][client_id] = snapshot
+                _log(
+                    f"a2a-usage: {client_id} {month} calls={bucket['calls']} "
+                    f"costUsd={round(bucket['costUsd'], 4)}"
+                )
+            if dialog_dirty:
+                state["dialogs_uploaded"][client_id] = dialog_fp
+                _log(f"a2a-dialog: {client_id} turns={len(turns)}")
+            uploaded_any = uploaded_any or usage_dirty
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                # Client doc deleted (revoked) — remember the snapshot so we
+                # Client doc deleted (revoked) — remember the snapshots so we
                 # don't hammer Firestore every minute for a dead client.
                 state["uploaded"][client_id] = snapshot
+                state["dialogs_uploaded"][client_id] = dialog_fp
                 continue
             if e.code == 401:
                 raise
