@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.112.0"
+TNODE_SETUP_VERSION="1.113.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -12035,7 +12035,12 @@ from __future__ import annotations
 # 1.72.0: skill a2a-agent 1.2.0 re-embebido — captura el header x-a2a-usage
 #          (medidor del proveedor) en la bitácora para el espejo F5d de
 #          chat-sync 1.42.0.
-__VERSION__ = "1.72.0"
+# 1.73.0: F5e — bloque "Servicios anunciados por A2A" renderizado en el
+#          TOOLS.md del agente destino (marcadores a2a-public, fuente = la
+#          config materializada del plugin, cada pase, idempotente; se
+#          retira si A2A se apaga). Sin esto el agente enumera su tooling
+#          interno a terceros ante "¿qué sabes hacer?" (leak visto en E2E).
+__VERSION__ = "1.73.0"
 
 import hashlib
 import hmac
@@ -21182,6 +21187,98 @@ def _update_openclaw_config_for_a2a(doc: dict) -> bool:
     return True
 
 
+_A2A_WS_BEGIN = "<!-- a2a-public:begin -->"
+_A2A_WS_END = "<!-- a2a-public:end -->"
+
+
+def _a2a_target_workspace(agent_id: str):
+    """Workspace dir del agente destino A2A, desde agents.list de
+    openclaw.json (main = workspace raiz)."""
+    cfg = read_openclaw_json()
+    if not isinstance(cfg, dict):
+        return None
+    if agent_id == "main":
+        return OPENCLAW_DIR / "workspace"
+    for a in (cfg.get("agents", {}) or {}).get("list", []) or []:
+        if isinstance(a, dict) and a.get("id") == agent_id:
+            ws = a.get("workspace")
+            return Path(ws) if isinstance(ws, str) and ws else None
+    return None
+
+
+def _sync_a2a_workspace_block() -> None:
+    """F5e: el agente que SIRVE el canal A2A debe conocer su propia tarjeta.
+    Sin esto, ante "¿qué sabes hacer?" enumera su tooling interno de
+    plataforma a un tercero (leak de infraestructura, visto en el E2E
+    2026-08-28). Renderiza los skills anunciados de la card + la regla de
+    "nunca menciones herramientas internas" entre marcadores en el TOOLS.md
+    del agente destino. Fuente: la config YA materializada del plugin (local,
+    sin reads de Firestore); si A2A está apagado, el bloque se retira."""
+    cfg = read_openclaw_json()
+    if not isinstance(cfg, dict):
+        return
+    entry = ((cfg.get("plugins", {}) or {}).get("entries", {}) or {}).get("tnode-a2a")
+    if not isinstance(entry, dict):
+        return
+    pconf = entry.get("config") or {}
+    enabled = bool(pconf.get("enabled"))
+    skills = pconf.get("skills") if isinstance(pconf.get("skills"), list) else []
+    agent_id = str(pconf.get("agentId") or "recepcion")
+    ws = _a2a_target_workspace(agent_id)
+    if ws is None:
+        return
+    tools_md = ws / "TOOLS.md"
+    try:
+        txt = tools_md.read_text(encoding="utf-8") if tools_md.is_file() else ""
+    except OSError:
+        return
+    if enabled and skills:
+        lines = [
+            _A2A_WS_BEGIN,
+            "## Servicios anunciados por A2A (canal a2a)",
+            "",
+            "Cuando te consultan por el canal A2A (agentes de terceros que el",
+            "dueño autorizó con API key), TUS CAPACIDADES de cara a ellos son",
+            "EXACTAMENTE los servicios anunciados en la tarjeta pública:",
+            "",
+        ]
+        for s in skills:
+            if isinstance(s, dict) and s.get("name"):
+                lines.append(f"- **{s['name']}** — {s.get('description', '')}")
+        lines += [
+            "",
+            "Si te preguntan \"qué sabes hacer\", \"qué skills tienes\" o",
+            "similar: responde con ESTA lista, en lenguaje de negocio. NUNCA",
+            "enumeres ni menciones tus herramientas internas de plataforma",
+            "(nombres de tools, skills técnicos, integraciones) a nadie por",
+            "ningún canal — son infraestructura interna, no servicios.",
+            _A2A_WS_END,
+        ]
+        block = "\n".join(lines)
+        if _A2A_WS_BEGIN in txt and _A2A_WS_END in txt:
+            new = txt.split(_A2A_WS_BEGIN)[0] + block + txt.split(_A2A_WS_END, 1)[1]
+        else:
+            new = (txt.rstrip() + "\n\n" + block + "\n") if txt else block + "\n"
+    else:
+        if _A2A_WS_BEGIN not in txt:
+            return
+        pre = txt.split(_A2A_WS_BEGIN)[0].rstrip()
+        post = txt.split(_A2A_WS_END, 1)[1] if _A2A_WS_END in txt else ""
+        new = (pre + "\n" + post.lstrip("\n")).rstrip() + "\n"
+    if new == txt:
+        return
+    try:
+        tmp = tools_md.with_suffix(".md.tmp")
+        tmp.write_text(new, encoding="utf-8")
+        tmp.replace(tools_md)
+        _log(
+            f"a2a: workspace block ({agent_id}) "
+            f"{'rendered ' + str(len(skills)) + ' skills' if enabled and skills else 'removed'}"
+        )
+    except OSError as e:
+        _log(f"a2a: workspace block write failed: {e}")
+
+
 def _sync_a2a(token: dict) -> None:
     """Materializa la config A2A declarada (hash-gated). El hash local solo
     se estampa en exito — gateway caido reintenta al proximo pase."""
@@ -21574,6 +21671,9 @@ def _run_declarative_sync(token: dict) -> None:
     # A2A: config declarativa del plugin tnode-a2a (hash-gated; solo si el
     # plugin esta instalado en el nodo).
     _sync_a2a(token)
+    # A2A: bloque "servicios anunciados" en el TOOLS.md del agente destino —
+    # local (lee la config YA materializada), corre cada pase, idempotente.
+    _sync_a2a_workspace_block()
     # Guest workspace SOUL.md: render the owner's Business Profile so the guest
     # agent knows the business it represents (needs the token to read the
     # node-scoped config/businessProfile doc).
