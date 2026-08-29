@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.116.0"
+TNODE_SETUP_VERSION="1.116.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -12113,7 +12113,10 @@ from __future__ import annotations
 #          empaquetado (plugin 0.7.0 lo reporta en x-a2a-usage; el comprador
 #          ve valor consumido = usedPct × precio). Skill a2a-agent 1.5.0
 #          re-embebido (parsea priceUsd).
-__VERSION__ = "1.76.0"
+# 1.76.1: skill a2a-agent 1.5.1 re-embebido — el rechazo de peer disabled
+#          lista los aliases ACTIVOS (auto-corrección del agente con
+#          TOOLS.md cacheado) y deja bitácora del intento.
+__VERSION__ = "1.76.1"
 
 import hashlib
 import hmac
@@ -16298,7 +16301,7 @@ import time
 import uuid
 from pathlib import Path
 
-__VERSION__ = "1.5.0"
+__VERSION__ = "1.5.1"
 
 DIALOG_LOG_MAX_BYTES = 256 * 1024
 DIALOG_LOG_KEEP_LINES = 200
@@ -16450,8 +16453,20 @@ def cmd_call(alias: str, text: str, timeout: int) -> int:
         return 1
     # F6a-fix: el dueño apagó este contratado desde la app — la key sigue en
     # el archivo (re-habilitar no debe pedirla de nuevo) pero NO se usa.
+    # 1.5.1: el mensaje lista los aliases ACTIVOS para que el agente se
+    # auto-corrija (cazado E2E +237: sesión con TOOLS.md cacheado llamó al
+    # alias viejo y reportó al dueño que el contratado nuevo estaba caído).
     if peer.get("disabled"):
-        print(f"a2a_call_failed: el dueño deshabilitó al agente '{alias}'. No lo llames hasta que lo reactive.")
+        avail = ", ".join(sorted(
+            p.get("alias") or k for k, p in peers.items() if not p.get("disabled")
+        ))
+        msg = (
+            f"a2a_call_failed: el dueño deshabilitó al agente '{peer.get('alias') or alias}'."
+            + (f" Agentes contratados DISPONIBLES: {avail} — reintenta con uno de esos."
+               if avail else " No hay otros agentes contratados activos.")
+        )
+        _log_dialog(pid, str(peer.get("alias") or alias), text, msg, ok=False)
+        print(msg)
         return 1
     base = _normalize_base(str(peer.get("baseUrl", "")))
     header = str(peer.get("headerName") or "X-API-Key")
