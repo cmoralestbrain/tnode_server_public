@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.114.0"
+TNODE_SETUP_VERSION="1.115.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -12099,7 +12099,14 @@ from __future__ import annotations
 #          plugin (0.6.0): con paquete vendido, el header x-a2a-usage
 #          reporta cupo (usedPct) y omite costUsd/limitUsd del vendedor.
 #          Skill a2a-agent 1.3.0 re-embebido (parsea usedPct).
-__VERSION__ = "1.74.0"
+# 1.75.0: fixes del E2E F6a (2026-08-29): (a) comando `decl.refresh`
+#          (delayS cap 15s) — la app lo encola + wake tras cada mutación
+#          A2A ⇒ pausas/keys llegan al gateway en segundos, no una llamada
+#          tarde; (b) comando `a2a.peer.setEnabled` — el disable del tile
+#          ahora marca `disabled` en a2a-peers.json (antes la key seguía
+#          usable); (c) link normaliza baseUrl con sufijo de card; skill
+#          a2a-agent 1.4.0 re-embebido (rehúsa peers disabled).
+__VERSION__ = "1.75.0"
 
 import hashlib
 import hmac
@@ -16284,7 +16291,7 @@ import time
 import uuid
 from pathlib import Path
 
-__VERSION__ = "1.3.0"
+__VERSION__ = "1.4.0"
 
 DIALOG_LOG_MAX_BYTES = 256 * 1024
 DIALOG_LOG_KEEP_LINES = 200
@@ -16422,7 +16429,8 @@ def cmd_list() -> int:
         return 0
     for pid, p in sorted(peers.items()):
         alias = p.get("alias") or pid
-        print(f"{alias}\t{p.get('baseUrl', '?')}")
+        mark = "\t(deshabilitado por el dueño)" if p.get("disabled") else ""
+        print(f"{alias}\t{p.get('baseUrl', '?')}{mark}")
     return 0
 
 
@@ -16432,6 +16440,11 @@ def cmd_call(alias: str, text: str, timeout: int) -> int:
     if not peer:
         known = ", ".join(sorted(p.get("alias") or k for k, p in peers.items()))
         print(f"a2a_call_failed: alias '{alias}' no existe. Contratados: {known or 'ninguno'}")
+        return 1
+    # F6a-fix: el dueño apagó este contratado desde la app — la key sigue en
+    # el archivo (re-habilitar no debe pedirla de nuevo) pero NO se usa.
+    if peer.get("disabled"):
+        print(f"a2a_call_failed: el dueño deshabilitó al agente '{alias}'. No lo llames hasta que lo reactive.")
         return 1
     base = _normalize_base(str(peer.get("baseUrl", "")))
     header = str(peer.get("headerName") or "X-API-Key")
@@ -21040,6 +21053,11 @@ def handle_a2a_peer_link(token: dict, params: dict) -> dict:
     local desde el mirror; la especialidad la enriquece la CF."""
     peer_id = (params.get("peerId") or "").strip()
     base_url = (params.get("baseUrl") or "").strip().rstrip("/")
+    # Los dueños suelen pegar la URL de la CARD como baseUrl — normalízala
+    # aquí también (el skill ya lo hace al llamar; esto deja el DATO limpio).
+    _card_suffix = "/.well-known/agent-card.json"
+    if base_url.endswith(_card_suffix):
+        base_url = base_url[: -len(_card_suffix)].rstrip("/")
     alias = (params.get("alias") or peer_id).strip()
     secrets_map = params.get("secrets") or {}
     api_key = (secrets_map.get("apiKey") or "").strip()
@@ -21073,9 +21091,46 @@ def handle_a2a_peer_unlink(token: dict, params: dict) -> dict:
     return {"status": "done", "result": {"peerId": peer_id}}
 
 
+def handle_a2a_peer_set_enabled(token: dict, params: dict) -> dict:
+    """F6a-fix: el toggle del tile solo escribía el mirror Firestore — la key
+    del peer seguía viva en a2a-peers.json y el skill podía seguir llamándolo
+    (cazado en E2E 2026-08-29: la llamada salió con la key del peer apagado).
+    Marca `disabled` en el archivo local; el skill 1.4.0 rehúsa peers así."""
+    peer_id = (params.get("peerId") or "").strip()
+    enabled = params.get("enabled") is True
+    if not peer_id:
+        return {"status": "error", "error": "peerId required"}
+    data = _a2a_peers_load()
+    entry = data.get(peer_id)
+    if not isinstance(entry, dict):
+        return {"status": "error", "error": f"peer {peer_id} not linked"}
+    if enabled:
+        entry.pop("disabled", None)
+    else:
+        entry["disabled"] = True
+    _a2a_peers_save(data)
+    _log(f"a2a-peer: {peer_id} enabled={enabled}")
+    return {"status": "done", "result": {"peerId": peer_id, "enabled": enabled}}
+
+
+def handle_decl_refresh(token: dict, params: dict) -> dict:
+    """F6a-fix: refresh declarativo POR COMANDO — la app lo encola (junto con
+    el wake) tras cada mutación A2A para que pausas/keys/allocations lleguen
+    al gateway en segundos, no una llamada tarde (enforcement lag cazado en
+    E2E 2026-08-29). `delayS` (cap 15s) da tiempo a la CF de recomponer el
+    hash antes de leerlo — mismo patrón del decl-refresh de chat-sync 1.39.1."""
+    delay_s = params.get("delayS")
+    if isinstance(delay_s, (int, float)) and delay_s > 0:
+        time.sleep(min(float(delay_s), 15.0))
+    _run_declarative_sync(token)
+    return {"status": "done", "result": {"refreshed": True}}
+
+
 _HANDLERS = {
     "a2a.peer.link": handle_a2a_peer_link,
     "a2a.peer.unlink": handle_a2a_peer_unlink,
+    "a2a.peer.setEnabled": handle_a2a_peer_set_enabled,
+    "decl.refresh": handle_decl_refresh,
     "push_openclaw_config": lambda token, params: {
         "status": "done",
         "result": {"llmMode": push_openclaw_config(token)["llmMode"]},
