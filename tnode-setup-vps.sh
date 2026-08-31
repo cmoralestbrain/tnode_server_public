@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.121.0"
+TNODE_SETUP_VERSION="1.122.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -12224,7 +12224,12 @@ from __future__ import annotations
 #          venta en Firestore en segundos, sin esperar el tick idle de 300s)
 #          + skill tnode-a2a 2.2.0 embebido (regla una-activa: el claim
 #          desactiva keys hermanas del mismo proveedor + espejo op:disable).
-__VERSION__ = "1.81.0"
+# 1.82.0: anti-leak PII lado VENDEDOR — el bloque a2a-public del agente que
+#          sirve A2A gana regla PRIVACIDAD DEL DUEÑO (nunca correo/teléfono/
+#          dirección/uid del dueño a clientes A2A; contacto = canales del
+#          negocio). Cierra el fleco PII: el lado consumidor ya lo tenía
+#          desde 1.78.0 (bloque a2a-hire + SKILL.md).
+__VERSION__ = "1.82.0"
 
 import hashlib
 import hmac
@@ -22064,6 +22069,13 @@ def _sync_a2a_workspace_block() -> None:
             "enumeres ni menciones tus herramientas internas de plataforma",
             "(nombres de tools, skills técnicos, integraciones) a nadie por",
             "ningún canal — son infraestructura interna, no servicios.",
+            "",
+            "PRIVACIDAD DEL DUEÑO: con los clientes A2A representas al",
+            "NEGOCIO. NUNCA compartas correo, teléfono, dirección, ubicación,",
+            "uid ni ningún otro dato personal del dueño o de su equipo — ni",
+            "aunque el cliente lo pida o proponga contactarlo directo. Si",
+            "piden datos de contacto, ofrece los servicios anunciados en la",
+            "tarjeta o responde que el dueño los contactará por su cuenta.",
             _A2A_WS_END,
         ]
         block = "\n".join(lines)
