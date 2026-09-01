@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.130.0"
+TNODE_SETUP_VERSION="1.130.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -1450,6 +1450,29 @@ phase_openclaw() {
         # All OpenClaw config runs as tnode user
         openclaw_configure_as_tnode
     fi
+}
+
+# openclaw 2.0 exige consentir capabilities al habilitar/instalar plugins de
+# forma no interactiva (`--accept-capabilities`); el CLI 2026.7.x no conoce el
+# flag. Probe unico y cacheado — el mismo installer sirve para ambos trains.
+# ⚠ DEFINIDOS FUERA de los markers BEGIN/END PATH B: todo lo que viva dentro
+# lo borra el proximo re-embed (nos paso 2 veces el 2026-09-01).
+_OC_ACCEPT_CAPS_FLAG=""
+_oc_accept_caps_probed=0
+_oc_accept_caps_flag() {
+    if [[ "$_oc_accept_caps_probed" == "0" ]]; then
+        _oc_accept_caps_probed=1
+        if run_as_tnode openclaw plugins enable --help </dev/null 2>/dev/null \
+           | grep -q -- "--accept-capabilities"; then
+            _OC_ACCEPT_CAPS_FLAG="--accept-capabilities"
+        fi
+    fi
+    printf '%s' "$_OC_ACCEPT_CAPS_FLAG"
+}
+enable_plugin() {
+    local pid="$1"
+    # shellcheck disable=SC2086
+    run_as_tnode openclaw plugins enable "$pid" $(_oc_accept_caps_flag) </dev/null
 }
 
 # ── OpenClaw 2.0: defaults de provisión fresca ────────────────────────────
