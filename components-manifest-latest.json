@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-08-31T13:01:20.204135+00:00",
-  "tag": "tnode-setup-v1.122.0",
+  "generatedAt": "2026-09-01T00:02:50.370629+00:00",
+  "tag": "tnode-setup-v1.123.0",
   "components": [
     {
       "id": "tnode-chat-sync",
@@ -68,7 +68,7 @@
     {
       "id": "@tbrain/openclaw-tnode-a2a",
       "kind": "plugin-extension",
-      "version": "0.11.0",
+      "version": "0.12.0",
       "source": "extensions/tnode-a2a/"
     },
     {
