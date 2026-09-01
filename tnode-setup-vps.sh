@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.127.0"
+TNODE_SETUP_VERSION="1.128.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -97,11 +97,15 @@ CLOUD_MODEL="kimi-k2.5:cloud"
 # provisioning E2E. Override with `OPENCLAW_PIN_VERSION=` (empty) to take
 # whatever is current.
 OPENCLAW_PIN_VERSION="${OPENCLAW_PIN_VERSION-2026.7.1-2}"
-# Canal WhatsApp Personal (Baileys). El pin SIGUE al del core: cada release del
-# plugin sube su peerDependency (2026.6.33 pide openclaw >= 2026.6.33, 2026.7.1
-# pide >= 2026.7.1) y el core está clavado arriba. Bumpear SOLO junto con
-# OPENCLAW_PIN_VERSION, nunca por separado.
-OPENCLAW_WA_PLUGIN_VERSION="${OPENCLAW_WA_PLUGIN_VERSION-2026.5.19}"
+# Canal WhatsApp Personal (Baileys). El pin SIGUE al del core AUTOMATICAMENTE:
+# mismo release train, quitando el sufijo de republish npm del core (p.ej.
+# core "2026.7.1-2" → WA "2026.7.1"), que @openclaw/whatsapp no publica. Cada
+# release del plugin sube su peerDependency, así que un WA mas nuevo que el
+# core NO instala — derivarlo del core evita el drift (estuvimos en 2026.5.19
+# con core 2026.7.1-2, y ese WA viejo revienta contra core 2.0 por el subpath
+# plugin-sdk/channel-streaming removido). Override explicito via env si un
+# release de WA se salta el train.
+OPENCLAW_WA_PLUGIN_VERSION="${OPENCLAW_WA_PLUGIN_VERSION-${OPENCLAW_PIN_VERSION%%-*}}"
 # Pin del plugin web-search. Global (no local de install_websearch_plugin) para
 # que update_plugins_if_stale pueda compararlo: el installer se ejecuta via
 # `curl | bash`, asi que $0 es "bash" y no se puede releer el propio fichero.
@@ -10111,6 +10115,23 @@ wVmtFVEM5TiG6nUyXzzDbUTD7XV73V5f8/r/dT6EfwCoKAA=
 PATHB_B64_EOF
 }
 
+# openclaw 2.0 exige consentir capabilities al habilitar un plugin de forma
+# no interactiva (`--accept-capabilities`); el CLI 2026.7.x no conoce el flag.
+# Deteccion unica y cacheada: el mismo installer sirve para ambos trains.
+_OC_ACCEPT_CAPS_FLAG=""
+_oc_accept_caps_probed=0
+enable_plugin() {
+    local pid="$1"
+    if [[ "$_oc_accept_caps_probed" == "0" ]]; then
+        _oc_accept_caps_probed=1
+        if run_as_tnode openclaw plugins enable --help </dev/null 2>/dev/null            | grep -q -- "--accept-capabilities"; then
+            _OC_ACCEPT_CAPS_FLAG="--accept-capabilities"
+        fi
+    fi
+    # shellcheck disable=SC2086
+    run_as_tnode openclaw plugins enable "$pid" $_OC_ACCEPT_CAPS_FLAG </dev/null
+}
+
 materialize_pathb_plugins() {
     local stage_dir="$OPENCLAW_HOME/.pathb-stage"
     rm -rf "$stage_dir"; mkdir -p "$stage_dir"
@@ -10126,7 +10147,7 @@ materialize_pathb_plugins() {
     local pid
     for pid in tbrain-context-engine tnode tnode-transport tnode-wake tnode-a2a; do
         if run_as_tnode openclaw plugins install "$stage_dir/$pid" --force </dev/null; then
-            run_as_tnode openclaw plugins enable "$pid" </dev/null || warn "Path B: enable de $pid falló"
+            enable_plugin "$pid" || warn "Path B: enable de $pid falló"
             info "Path B: $pid instalado (SDK)"
         else
             warn "Path B: install de $pid falló"
@@ -10185,7 +10206,7 @@ update_plugins_if_stale() {
         fi
         info "plugin $pid: ${inst:-ausente} → $emb"
         if run_as_tnode openclaw plugins install "$stage_dir/$pid" --force </dev/null; then
-            run_as_tnode openclaw plugins enable "$pid" </dev/null \
+            enable_plugin "$pid" \
                 || warn "plugin $pid: enable fallo"
             updated=$((updated+1))
         else
@@ -10229,7 +10250,7 @@ enable_pathb_plugins() {
     # plugins, it loses its plugins.entries to the same pre-snapshot cleanup.
     for pid in tbrain-context-engine tnode tnode-transport tnode-wake openclaw-web-search; do
         if [[ -d "$ext_dir/$pid" ]]; then
-            if run_as_tnode openclaw plugins enable "$pid" </dev/null >/dev/null 2>&1; then
+            if enable_plugin "$pid" >/dev/null 2>&1; then
                 info "Path B: $pid enabled (SDK)"
             else
                 warn "Path B: enable de $pid falló"
@@ -10241,7 +10262,7 @@ enable_pathb_plugins() {
     # por spec npm), así que no entra en el loop de arriba: pierde su entry con
     # el mismo cleanup y hay que re-habilitarlo igual en cada provisión.
     if compgen -G "$OPENCLAW_HOME/npm/projects/openclaw-whatsapp-*" >/dev/null 2>&1; then
-        if run_as_tnode openclaw plugins enable whatsapp </dev/null >/dev/null 2>&1; then
+        if enable_plugin whatsapp >/dev/null 2>&1; then
             info "Path B: whatsapp enabled (SDK)"
         else
             warn "Path B: enable de whatsapp falló"
@@ -10290,7 +10311,7 @@ install_websearch_plugin() {
         warn "web-search: openclaw plugins install falló"
         rm -rf "$stage_dir"; return 1
     fi
-    run_as_tnode openclaw plugins enable openclaw-web-search </dev/null >/dev/null 2>&1 || true
+    enable_plugin openclaw-web-search >/dev/null 2>&1 || true
     rm -rf "$stage_dir"
     chown "$TNODE_USER":"$TNODE_USER" "$OPENCLAW_HOME/openclaw.json" 2>/dev/null || true
 }
@@ -10326,7 +10347,7 @@ install_whatsapp_plugin() {
         return 1
     fi
 
-    if ! run_as_tnode openclaw plugins enable whatsapp </dev/null >/dev/null 2>&1; then
+    if ! enable_plugin whatsapp >/dev/null 2>&1; then
         warn "WhatsApp: enable del canal falló"
         return 1
     fi
