@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.126.0"
+TNODE_SETUP_VERSION="1.127.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -12271,7 +12271,15 @@ from __future__ import annotations
 #          plugin 0.14.0 vincula la identidad del comprador al contrato)
 #          + skill tnode-a2a 2.3.0 re-embebido (call con Bearer del AS,
 #          fallback a key v1; claim manda networkClientId).
-__VERSION__ = "1.84.0"
+# 1.85.0: estandarización skills tnode-* + frontmatter OpenClaw 2.0 — los 8
+#          SKILL.md ganan frontmatter YAML (name + description, requisito
+#          de v2026.8.x para cargar) y los dirs se renombran agenda→
+#          tnode-agenda, drive→tnode-drive, poll→tnode-poll, inventario→
+#          tnode-inventario, awmf→tnode-awmf, email-send→tnode-email-send
+#          (tnode-delegate/tnode-a2a sin cambio). Cleanup de dirs legacy en
+#          _ensure_workspace_skills; paths actualizados en todos los
+#          bloques declarativos embebidos.
+__VERSION__ = "1.85.0"
 
 import hashlib
 import hmac
@@ -14340,7 +14348,12 @@ def _regenerate_agents_index() -> None:
 # del skill cuando se materializa via `channels.email.link(provider=resend)`.
 # DEBEN coincidir byte-a-byte con los heredocs en `setup_workspace_skills()`
 # del bash installer — cuando edites uno actualiza el otro.
-_EMAIL_SEND_SKILL_MD = '''# email-send
+_EMAIL_SEND_SKILL_MD = '''---
+name: tnode-email-send
+description: Envía correos vía Resend (HTTPS). Es el único path de envío del nodo — el VPS bloquea SMTP saliente; nunca uses smtplib, himalaya ni sendmail.
+---
+
+# tnode-email-send
 
 Envía correos electrónicos vía **Resend** (HTTPS, port 443) — el único path
 de envío que funciona en este nodo porque DigitalOcean bloquea SMTP
@@ -14363,7 +14376,7 @@ o timeout porque dependen de SMTP outbound:
 ## Cómo invocar
 
 ```bash
-~/.openclaw/workspace/skills/email-send/bin/send.py \\
+~/.openclaw/workspace/skills/tnode-email-send/bin/send.py \\
   --to destinatario@ejemplo.com \\
   --subject "Asunto del correo" \\
   --body "Cuerpo del correo en texto plano."
@@ -14392,7 +14405,7 @@ Pregunta del usuario: *"mándame un correo de bienvenida a ctobal@gmail.com"*
 Tu acción (UNA invocación, no múltiples intentos):
 
 ```bash
-~/.openclaw/workspace/skills/email-send/bin/send.py \\
+~/.openclaw/workspace/skills/tnode-email-send/bin/send.py \\
   --to ctobal@gmail.com \\
   --subject "Bienvenido a TNode Pro" \\
   --body "Hola Tobal,
@@ -14622,7 +14635,7 @@ def _ensure_email_send_skill() -> None:
     user pastes their Resend API key — no separate installer step needed.
     Idempotent and self-healing: if the user manually deletes or edits a
     file, re-running `channels.email.link` restores the canonical copy."""
-    skill_dir = OPENCLAW_DIR / "workspace" / "skills" / "email-send"
+    skill_dir = OPENCLAW_DIR / "workspace" / "skills" / "tnode-email-send"
     bin_dir = skill_dir / "bin"
     try:
         bin_dir.mkdir(parents=True, exist_ok=True)
@@ -14650,7 +14663,12 @@ def _ensure_email_send_skill() -> None:
 # skills canónicos del repo skills — regenerar ahí, NO editar a mano.
 
 # >>> BEGIN EMBEDDED WORKSPACE SKILLS (generated — do not edit by hand)
-_AGENDA_SKILL_MD = r'''# agenda
+_AGENDA_SKILL_MD = r'''---
+name: tnode-agenda
+description: Consulta disponibilidad y reserva o cancela citas con los recursos que configuró el dueño. Úsalo siempre que un cliente pida cita, hora o disponibilidad — nunca inventes horarios.
+---
+
+# tnode-agenda
 
 Consulta la disponibilidad del negocio y **reserva citas** para los
 clientes que te escriben. El dueño configuró desde su app TNode a las
@@ -14667,7 +14685,7 @@ horarios ni confirmes citas de memoria.
 ## Cómo invocar
 
 ```bash
-SKILL=~/.openclaw/workspace/skills/agenda/bin/agenda.py
+SKILL=~/.openclaw/workspace/skills/tnode-agenda/bin/agenda.py
 
 python3 $SKILL resources                       # quiénes atienden y sus horarios
 python3 $SKILL slots --date 2026-06-12         # espacios libres de todos ese día
@@ -14738,7 +14756,7 @@ liberó.
 '''
 
 _AGENDA_MANIFEST = r'''{
-  "name": "agenda",
+  "name": "tnode-agenda",
   "version": "1.0.0",
   "type": "openclaw-skill",
   "entrypoint": "SKILL.md"
@@ -14928,7 +14946,12 @@ if __name__ == "__main__":
     main()
 '''
 
-_DRIVE_SKILL_MD = r'''# drive
+_DRIVE_SKILL_MD = r'''---
+name: tnode-drive
+description: Lee (solo lectura) la carpeta de Google Drive que el dueño compartió — lista, busca y descarga archivos. Úsalo cuando mencionen su Drive o un documento que no está en tu workspace.
+---
+
+# tnode-drive
 
 Lee los archivos de la **carpeta de Google Drive que el dueño compartió
 contigo** desde su app TNode. Es de **solo lectura**: puedes listar,
@@ -14945,7 +14968,7 @@ sin haber hecho `search` primero.
 ## Cómo invocar
 
 ```bash
-SKILL=~/.openclaw/workspace/skills/drive/bin/drive.py
+SKILL=~/.openclaw/workspace/skills/tnode-drive/bin/drive.py
 
 python3 $SKILL status                  # ¿hay carpeta conectada? ¿cómo se llama?
 python3 $SKILL list                    # contenido de la carpeta (raíz)
@@ -14994,7 +15017,7 @@ Docs → Markdown (`.md`) · Sheets → CSV (primera hoja) · Slides → PDF.
 '''
 
 _DRIVE_MANIFEST = r'''{
-  "name": "drive",
+  "name": "tnode-drive",
   "version": "1.0.0",
   "type": "openclaw-skill",
   "entrypoint": "SKILL.md"
@@ -15226,7 +15249,12 @@ if __name__ == "__main__":
     main()
 '''
 
-_POLL_SKILL_MD = r'''# poll — difundir encuestas a los invitados
+_POLL_SKILL_MD = r'''---
+name: tnode-poll
+description: Crea o re-difunde encuestas a todos los invitados del nodo, con conteo en vivo para el dueño. Solo el dueño puede pedirlo.
+---
+
+# tnode-poll — difundir encuestas a los invitados
 
 Crea o reparte encuestas a TODOS los miembros (invitados) del nodo. A cada uno
 le aparece en su chat y puede votar; el conteo se actualiza en vivo y el dueño
@@ -15242,13 +15270,13 @@ lado del servidor; los invitados no pueden.
 Crear (y repartir) una encuesta nueva — pregunta + 2 a 12 opciones (agrega
 `--multi` si permites varias respuestas):
 
-    python3 ~/.openclaw/workspace/skills/poll/bin/poll.py create \
+    python3 ~/.openclaw/workspace/skills/tnode-poll/bin/poll.py create \
       --question "¿Snack para el viernes?" \
       --option "Pizza" --option "Sushi" --option "Tacos"
 
 Difundir de nuevo la última encuesta del dueño a todos los invitados:
 
-    python3 ~/.openclaw/workspace/skills/poll/bin/poll.py broadcast
+    python3 ~/.openclaw/workspace/skills/tnode-poll/bin/poll.py broadcast
 
 Respuesta (JSON a stdout):
 
@@ -15283,7 +15311,7 @@ invitados."
 '''
 
 _POLL_MANIFEST = r'''{
-  "name": "poll",
+  "name": "tnode-poll",
   "version": "1.1.0",
   "type": "openclaw-skill",
   "entrypoint": "SKILL.md"
@@ -15445,7 +15473,12 @@ if __name__ == "__main__":
     main()
 '''
 
-_TNODE_DELEGATE_SKILL_MD = r'''# tnode-delegate
+_TNODE_DELEGATE_SKILL_MD = r'''---
+name: tnode-delegate
+description: Delega una tarea al agente de otro nodo del dueño (peers del widget Equipo) cuando este nodo no tiene el canal, skill, contexto o acceso necesario, y usa su respuesta para continuar.
+---
+
+# tnode-delegate
 
 Delega una tarea al agente de **otro de tus nodos** (un "peer" que el dueño
 enlazó en el widget **Equipo** de la app) y usa su respuesta para continuar tu
@@ -15839,7 +15872,12 @@ if __name__ == "__main__":
     sys.exit(main())
 '''
 
-_INVENTARIO_SKILL_MD = r'''# inventario
+_INVENTARIO_SKILL_MD = r'''---
+name: tnode-inventario
+description: Flujo de resurtido — lee el inventario del dueño (sheet ya parseado a JSON) y estampa el tracking de órdenes. Para inventario usa siempre este skill, no tnode-drive.
+---
+
+# tnode-inventario
 
 Herramienta del **flujo de resurtido**: lee el Google Sheet del
 inventario del dueño (ya parseado a JSON) y **estampa el tracking** de
@@ -15859,7 +15897,7 @@ no el skill `drive`.
 ## Cómo invocar
 
 ```bash
-SKILL=~/.openclaw/workspace/skills/inventario/bin/inventario.py
+SKILL=~/.openclaw/workspace/skills/tnode-inventario/bin/inventario.py
 
 python3 $SKILL leer                                    # filas del sheet en JSON
 python3 $SKILL leer --sheet INVENTARIO                 # otro nombre de sheet
@@ -15882,7 +15920,7 @@ python3 $SKILL estampar --orden <approvalId> --fase resultado
 '''
 
 _INVENTARIO_MANIFEST = r'''{
-  "name": "inventario",
+  "name": "tnode-inventario",
   "version": "1.0.0",
   "type": "openclaw-skill",
   "entrypoint": "SKILL.md"
@@ -16049,7 +16087,12 @@ if __name__ == "__main__":
     main()
 '''
 
-_AWMF_SKILL_MD = r'''# awmf
+_AWMF_SKILL_MD = r'''---
+name: tnode-awmf
+description: Asistente para Tarjetas de trabajo del motor de flujos — acuña citas verificables y valida tu evidencia antes de reportar con awmf_result. Úsalo en toda tarjeta que pida evidencia.
+---
+
+# tnode-awmf
 
 Asistente para resolver **Tarjetas de trabajo del motor de flujos** (los
 turnos que empiezan con "[Tarjeta de trabajo del motor de flujos…]").
@@ -16068,7 +16111,7 @@ evidencia** antes de reportar. Úsalo en TODA tarjeta que pida evidencia.
 ## Cómo invocar
 
 ```bash
-SKILL=~/.openclaw/workspace/skills/awmf/bin/awmf.py
+SKILL=~/.openclaw/workspace/skills/tnode-awmf/bin/awmf.py
 
 # Encontraste la fila 7 de la hoja CLIENTES (7 = fila real del
 # spreadsheet: encabezado es 1, datos desde 2):
@@ -16111,7 +16154,7 @@ problemas con cómo arreglar cada uno.
 '''
 
 _AWMF_MANIFEST = r'''{
-  "name": "awmf",
+  "name": "tnode-awmf",
   "version": "1.0.0",
   "type": "openclaw-skill",
   "entrypoint": "SKILL.md"
@@ -16411,7 +16454,12 @@ if __name__ == "__main__":
     main()
 '''
 
-_TNODE_A2A_SKILL_MD = r'''# tnode-a2a
+_TNODE_A2A_SKILL_MD = r'''---
+name: tnode-a2a
+description: Gestión A2A en dos roles — consultar a los agentes externos que el dueño contrató (consumidor) y conocer tus clientes, consumo y planes (vendedor). Los datos del protocolo se leen aquí, nunca por chat al otro agente.
+---
+
+# tnode-a2a
 
 Gestión A2A v1.0 (Linux Foundation) en sus DOS roles: como **consumidor**
 (consultar a los agentes externos que el dueño contrató) y como **vendedor**
@@ -17220,15 +17268,15 @@ Cuando quien te escribe pida CITA / HORA / DISPONIBILIDAD ("¿tienen
 espacio mañana?") o quiera CANCELAR una cita, usa el skill agenda.
 NUNCA inventes horarios ni confirmes citas de memoria — el JSON del
 skill es tu única fuente de verdad.
-Manual completo: ~/.openclaw/workspace/skills/agenda/SKILL.md
+Manual completo: ~/.openclaw/workspace/skills/tnode-agenda/SKILL.md
 
 1. Disponibilidad:
-   exec: python3 ~/.openclaw/workspace/skills/agenda/bin/agenda.py slots --date YYYY-MM-DD
+   exec: python3 ~/.openclaw/workspace/skills/tnode-agenda/bin/agenda.py slots --date YYYY-MM-DD
    (hoy = `date +%F`; calcula "mañana" / "el viernes" desde ahí)
    Ofrece 2-3 horarios del JSON en lenguaje natural.
 
 2. Reservar:
-   exec: python3 ~/.openclaw/workspace/skills/agenda/bin/agenda.py book --date YYYY-MM-DD --start HH:MM --client "Nombre" --channel whatsapp [--contact "+52..."] [--resource <id>]
+   exec: python3 ~/.openclaw/workspace/skills/tnode-agenda/bin/agenda.py book --date YYYY-MM-DD --start HH:MM --client "Nombre" --channel whatsapp [--contact "+52..."] [--resource <id>]
    - --channel según por dónde te hablan: whatsapp / telegram / guest.
    - Pidieron a alguien en específico → --resource <id> (los ids salen
      de `agenda.py resources`).
@@ -17245,7 +17293,7 @@ Manual completo: ~/.openclaw/workspace/skills/agenda/SKILL.md
    Cuerpo: cliente, fecha, hora-fin, canal y contacto si lo tienes.
    Si este nodo NO tiene correo, omite el aviso sin disculparte.
 
-4. Cancelar: exec: python3 ~/.openclaw/workspace/skills/agenda/bin/agenda.py cancel --id <appointmentId>
+4. Cancelar: exec: python3 ~/.openclaw/workspace/skills/tnode-agenda/bin/agenda.py cancel --id <appointmentId>
 
 Errores: slot_unavailable → la respuesta trae "alternatives", ofrécelas
 tal cual; slot_taken → vuelve a consultar slots; resources vacío → el
@@ -17263,14 +17311,14 @@ por nombre que no está en tu workspace ("lee el contrato de mi carpeta",
 "¿qué hay en mi Drive?", "busca el manual de operación"), usa el skill
 drive. Es de SOLO LECTURA (su carpeta compartida, nada más). NUNCA digas
 que un archivo no existe sin haber hecho search primero.
-Manual completo: ~/.openclaw/workspace/skills/drive/SKILL.md
+Manual completo: ~/.openclaw/workspace/skills/tnode-drive/SKILL.md
 
 1. Encuentra el archivo:
-   exec: python3 ~/.openclaw/workspace/skills/drive/bin/drive.py search "palabras clave"
+   exec: python3 ~/.openclaw/workspace/skills/tnode-drive/bin/drive.py search "palabras clave"
    (busca por nombre Y contenido; o `list` si piden "qué hay en la carpeta")
 
 2. Descárgalo:
-   exec: python3 ~/.openclaw/workspace/skills/drive/bin/drive.py get <fileId>
+   exec: python3 ~/.openclaw/workspace/skills/tnode-drive/bin/drive.py get <fileId>
    La respuesta trae savedTo = ruta local en workspace/upload/drive/.
 
 3. LEE el archivo local (savedTo) con tus herramientas normales y
@@ -17323,17 +17371,17 @@ def _ensure_workspace_skill(name: str, files: dict) -> None:
 def _ensure_workspace_skills() -> None:
     """agenda + drive + poll + tnode-delegate + inventario on every node
     (startup self-heal)."""
-    _ensure_workspace_skill("agenda", {
+    _ensure_workspace_skill("tnode-agenda", {
         "SKILL.md": _AGENDA_SKILL_MD,
         "manifest.json": _AGENDA_MANIFEST,
         "bin/agenda.py": _AGENDA_PY,
     })
-    _ensure_workspace_skill("drive", {
+    _ensure_workspace_skill("tnode-drive", {
         "SKILL.md": _DRIVE_SKILL_MD,
         "manifest.json": _DRIVE_MANIFEST,
         "bin/drive.py": _DRIVE_PY,
     })
-    _ensure_workspace_skill("poll", {
+    _ensure_workspace_skill("tnode-poll", {
         "SKILL.md": _POLL_SKILL_MD,
         "manifest.json": _POLL_MANIFEST,
         "bin/poll.py": _POLL_PY,
@@ -17343,7 +17391,7 @@ def _ensure_workspace_skills() -> None:
         "manifest.json": _TNODE_DELEGATE_MANIFEST,
         "bin/tnode-delegate.py": _TNODE_DELEGATE_PY,
     })
-    _ensure_workspace_skill("inventario", {
+    _ensure_workspace_skill("tnode-inventario", {
         "SKILL.md": _INVENTARIO_SKILL_MD,
         "manifest.json": _INVENTARIO_MANIFEST,
         "bin/inventario.py": _INVENTARIO_PY,
@@ -17351,7 +17399,7 @@ def _ensure_workspace_skills() -> None:
     # awmf: asistente del ejecutor de Task Cards (citas verificables +
     # pre-flight de evidencia). Se materializa en TODOS los nodos: es
     # inerte sin motor y el render de chat-sync (>=1.36.0) lo referencia.
-    _ensure_workspace_skill("awmf", {
+    _ensure_workspace_skill("tnode-awmf", {
         "SKILL.md": _AWMF_SKILL_MD,
         "manifest.json": _AWMF_MANIFEST,
         "bin/awmf.py": _AWMF_PY,
@@ -17364,14 +17412,18 @@ def _ensure_workspace_skills() -> None:
         "manifest.json": _TNODE_A2A_MANIFEST,
         "bin/tnode-a2a.py": _TNODE_A2A_PY,
     })
-    try:
-        legacy = OPENCLAW_DIR / "workspace" / "skills" / "a2a-agent"
-        if legacy.is_dir():
-            import shutil
-            shutil.rmtree(legacy)
-            _log("workspace skill a2a-agent retirado (renombrado a tnode-a2a)")
-    except Exception as e:  # noqa: BLE001
-        _log(f"a2a-agent cleanup: {e}")
+    # 1.85.0: estandarización tnode-* — retirar dirs legacy para que el
+    # agente no encuentre dos copias del mismo skill.
+    for legacy_name in ("a2a-agent", "agenda", "drive", "poll", "inventario",
+                        "awmf", "email-send"):
+        try:
+            legacy = OPENCLAW_DIR / "workspace" / "skills" / legacy_name
+            if legacy.is_dir():
+                import shutil
+                shutil.rmtree(legacy)
+                _log(f"workspace skill {legacy_name} retirado (renombrado tnode-*)")
+        except Exception as e:  # noqa: BLE001
+            _log(f"{legacy_name} cleanup: {e}")
 
 
 # ── Guest agent (Opción B: per-guest isolation) ──────────────────────────
@@ -18367,8 +18419,8 @@ def _strip_legacy_tools_sections(text: str) -> str:
                 header.startswith("## regla anti-loop")
                 or header.startswith("## regla de aviso")
                 or header.startswith("## regla 4")
-                or "skills/agenda/bin/agenda.py" in body
-                or "skills/drive/bin/drive.py" in body
+                or "bin/agenda.py" in body
+                or "bin/drive.py" in body
             )
             if not drop:
                 out.extend(sec)
@@ -19634,15 +19686,15 @@ Cuando quien te escribe pida CITA / HORA / DISPONIBILIDAD ("¿tienen
 espacio mañana?") o quiera CANCELAR una cita, usa el skill agenda.
 NUNCA inventes horarios ni confirmes citas de memoria — el JSON del
 skill es tu única fuente de verdad.
-Manual completo: ~/.openclaw/workspace/skills/agenda/SKILL.md
+Manual completo: ~/.openclaw/workspace/skills/tnode-agenda/SKILL.md
 
 1. Disponibilidad:
-   exec: python3 ~/.openclaw/workspace/skills/agenda/bin/agenda.py slots --date YYYY-MM-DD
+   exec: python3 ~/.openclaw/workspace/skills/tnode-agenda/bin/agenda.py slots --date YYYY-MM-DD
    (hoy = `date +%F`; calcula "mañana" / "el viernes" desde ahí)
    Ofrece 2-3 horarios del JSON en lenguaje natural.
 
 2. Reservar:
-   exec: python3 ~/.openclaw/workspace/skills/agenda/bin/agenda.py book --date YYYY-MM-DD --start HH:MM --client "Nombre" --channel whatsapp [--contact "+52..."] [--resource <id>]
+   exec: python3 ~/.openclaw/workspace/skills/tnode-agenda/bin/agenda.py book --date YYYY-MM-DD --start HH:MM --client "Nombre" --channel whatsapp [--contact "+52..."] [--resource <id>]
    - --channel según por dónde te hablan: whatsapp / telegram / guest.
    - Pidieron a alguien en específico → --resource <id> (los ids salen
      de `agenda.py resources`).
@@ -19659,7 +19711,7 @@ Manual completo: ~/.openclaw/workspace/skills/agenda/SKILL.md
    Cuerpo: cliente, fecha, hora-fin, canal y contacto si lo tienes.
    Si este nodo NO tiene correo, omite el aviso sin disculparte.
 
-4. Cancelar: exec: python3 ~/.openclaw/workspace/skills/agenda/bin/agenda.py cancel --id <appointmentId>
+4. Cancelar: exec: python3 ~/.openclaw/workspace/skills/tnode-agenda/bin/agenda.py cancel --id <appointmentId>
 
 Errores: slot_unavailable → la respuesta trae "alternatives", ofrécelas
 tal cual; slot_taken → vuelve a consultar slots; resources vacío → el
@@ -19675,14 +19727,14 @@ por nombre que no está en tu workspace ("lee el contrato de mi carpeta",
 "¿qué hay en mi Drive?", "busca el manual de operación"), usa el skill
 drive. Es de SOLO LECTURA (su carpeta compartida, nada más). NUNCA digas
 que un archivo no existe sin haber hecho search primero.
-Manual completo: ~/.openclaw/workspace/skills/drive/SKILL.md
+Manual completo: ~/.openclaw/workspace/skills/tnode-drive/SKILL.md
 
 1. Encuentra el archivo:
-   exec: python3 ~/.openclaw/workspace/skills/drive/bin/drive.py search "palabras clave"
+   exec: python3 ~/.openclaw/workspace/skills/tnode-drive/bin/drive.py search "palabras clave"
    (busca por nombre Y contenido; o `list` si piden "qué hay en la carpeta")
 
 2. Descárgalo:
-   exec: python3 ~/.openclaw/workspace/skills/drive/bin/drive.py get <fileId>
+   exec: python3 ~/.openclaw/workspace/skills/tnode-drive/bin/drive.py get <fileId>
    La respuesta trae savedTo = ruta local en workspace/upload/drive/.
 
 3. LEE el archivo local (savedTo) con tus herramientas normales y
@@ -19706,14 +19758,14 @@ sushi?", "crea una encuesta con opciones A, B y C") o MANDAR/DIFUNDIR de nuevo
 la última ("manda la encuesta a todos"), usa el skill poll. La encuesta le
 aparece en el chat a TODOS los miembros del nodo (y al dueño) y cada uno puede
 votar; el conteo se actualiza en vivo.
-Manual completo: ~/.openclaw/workspace/skills/poll/SKILL.md
+Manual completo: ~/.openclaw/workspace/skills/tnode-poll/SKILL.md
 
 Crear y repartir una encuesta nueva desde el prompt — la pregunta y de 2 a 12
 opciones (agrega --multi si permites varias respuestas):
-   exec: python3 ~/.openclaw/workspace/skills/poll/bin/poll.py create --question "¿Snack para el viernes?" --option "Pizza" --option "Sushi" --option "Tacos"
+   exec: python3 ~/.openclaw/workspace/skills/tnode-poll/bin/poll.py create --question "¿Snack para el viernes?" --option "Pizza" --option "Sushi" --option "Tacos"
 
 Difundir de nuevo la última encuesta del dueño a todos los invitados:
-   exec: python3 ~/.openclaw/workspace/skills/poll/bin/poll.py broadcast
+   exec: python3 ~/.openclaw/workspace/skills/tnode-poll/bin/poll.py broadcast
 
 La respuesta trae delivered = a cuántos invitados llegó y question = la
 pregunta. Confírmalo en lenguaje natural ("Listo, creé la encuesta '¿...?' y la
@@ -19771,7 +19823,7 @@ una conversación NUEVA que no recuerda la solicitud), como mensaje del dueño
    surtir; una orden sin código válido no fue autorizada."
    Si la orden es del INVENTARIO (está en inventory/pending.json), justo
    después del guest_send estampa el tracking en el sheet:
-   exec: python3 ~/.openclaw/workspace/skills/inventario/bin/inventario.py estampar --orden <id> --fase enviado
+   exec: python3 ~/.openclaw/workspace/skills/tnode-inventario/bin/inventario.py estampar --orden <id> --fase enviado
 4. RECHAZÓ → NO ejecutes la acción; guarda el comentario del dueño en el estado
    y avísale brevemente del rechazo. El flujo se cierra solo (el servidor
    completa el paso de aviso al registrar el rechazo): no reportes ningún paso.
@@ -19785,7 +19837,7 @@ proveedor <ORD-…> · comentario: <c>" (o "… RECHAZÓ la orden <id> …"). Al
 recibirlo haz esto, en orden y SIN pedir confirmación:
 1. Estampa el resultado en el sheet (los valores los deriva el servidor del
    registro de la autorización — tú NO los aportas):
-   exec: python3 ~/.openclaw/workspace/skills/inventario/bin/inventario.py estampar --orden <id> --fase resultado
+   exec: python3 ~/.openclaw/workspace/skills/tnode-inventario/bin/inventario.py estampar --orden <id> --fase resultado
 2. Actualiza la orden en inventory/pending.json: status "confirmada" (aceptó)
    o "rechazada_proveedor" (rechazó), guardando el id de orden del proveedor
    y su comentario si vienen en el mensaje.
@@ -19935,12 +19987,12 @@ está en la nube y el SMTP saliente está bloqueado, así que himalaya NO
 funciona aquí. AVISA primero ("Voy a mandar el correo, dame un momento...")
 y usa:
 
-   exec: python3 ~/.openclaw/workspace/skills/email-send/bin/send.py --to destinatario@dominio.com --subject "Asunto" --body "Cuerpo en texto plano"
+   exec: python3 ~/.openclaw/workspace/skills/tnode-email-send/bin/send.py --to destinatario@dominio.com --subject "Asunto" --body "Cuerpo en texto plano"
 
 Este es el ÚNICO path de envío que funciona aquí. NUNCA uses smtplib,
 himalaya message send, mail, sendmail ni curl smtp:// — todos timeout porque
 el proveedor cloud bloquea el SMTP saliente (465/587). Detalles (HTML, CC,
---from) en ~/.openclaw/workspace/skills/email-send/SKILL.md.
+--from) en ~/.openclaw/workspace/skills/tnode-email-send/SKILL.md.
 
 ### Si un envío falla
 Reporta el error TAL CUAL a quien te lo pidió y detente ahí. NUNCA uses otra
@@ -23594,7 +23646,9 @@ from __future__ import annotations
 #          id parseado contra los clients de la config del plugin (exacto o
 #          prefijo ÚNICO, case-insensitive); cache invalidado también por
 #          mtime de openclaw.json. Borrar a2a-usage-state.json = backfill.
-__VERSION__ = "1.45.0"
+# 1.46.0: paths del render AWMF actualizados a la estandarización tnode-*
+#          (workspace/skills/awmf → tnode-awmf; par de config-sync 1.85.0).
+__VERSION__ = "1.46.0"
 
 import hashlib
 import hmac
@@ -25832,7 +25886,7 @@ def _render_awmf_card_turn(card: dict) -> str:
         L.append(
             "Si tu evidencia cita una hoja (fila encontrada o ausencia), "
             "NO escribas la cita a mano: acúñala con el skill awmf "
-            "(~/.openclaw/workspace/skills/awmf/SKILL.md, comando "
+            "(~/.openclaw/workspace/skills/tnode-awmf/SKILL.md, comando "
             "`cita fila` o `cita ausencia`)."
         )
     L.append("")
@@ -25860,7 +25914,7 @@ def _render_awmf_card_turn(card: dict) -> str:
             L.append(f"    · {k}: {desc}")
         L.append(
             "  Antes de reportar, VALIDA la forma de tu evidencia con el "
-            "skill awmf: python3 ~/.openclaw/workspace/skills/awmf/bin/"
+            "skill awmf: python3 ~/.openclaw/workspace/skills/tnode-awmf/bin/"
             "awmf.py validar --evidencia '<tu evidencia en JSON>' — si "
             "regresa problemas, corrígelos y valida de nuevo; solo reporta "
             "cuando diga ok."
