@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.130.1"
+TNODE_SETUP_VERSION="1.131.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -1491,6 +1491,12 @@ configure_openclaw_v2_defaults() {
         return 0
     fi
     info "OpenClaw 2.0: configurando ownership + consent + canal TNode live"
+    # Orden VALIDADO en lab (droplet 3557d3bb, 2026-09-01): ownership exige
+    # >=1 entry y systemAgent exige ownership → materializar `main` PRIMERO
+    # (en 2.0 los agents.entries solo nacen en el primer turn, tarde para
+    # esta fase).
+    run_as_tnode openclaw config set agents.entries.main --json "{\"workspace\":\"$OPENCLAW_HOME/workspace\"}" </dev/null \
+        || warn "v2-defaults: agents.entries.main falló"
     run_as_tnode openclaw config set agents.ownership explicit </dev/null \
         || warn "v2-defaults: agents.ownership falló"
     run_as_tnode openclaw config set agents.defaults.systemAgent.agentId main </dev/null \
@@ -12439,7 +12445,11 @@ from __future__ import annotations
 #          (tnode-delegate/tnode-a2a sin cambio). Cleanup de dirs legacy en
 #          _ensure_workspace_skills; paths actualizados en todos los
 #          bloques declarativos embebidos.
-__VERSION__ = "1.85.0"
+# 1.86.0: slots generativos train-aware — en OpenClaw 2.0 escriben
+#          agents.defaults.mediaModels.{image,music,video} (los nombres
+#          legacy invalidan el config y el gateway muere al nacer; causa
+#          raiz del fire-test 2026-09-01). En 7.1 sigue legacy.
+__VERSION__ = "1.86.0"
 
 import hashlib
 import hmac
@@ -14276,6 +14286,34 @@ def _remove_subagent_files(agent_id: str) -> None:
             f.unlink()
 
 
+_OC_VERSION_CACHE: list = []
+
+
+def _openclaw_is_v2() -> bool:
+    """True si el core instalado es del train 2026.8+ (OpenClaw 2.0).
+
+    En 2.0 el schema renombro los slots generativos de agents.defaults
+    (imageGenerationModel/music/video) a `mediaModels.{image,music,video}`;
+    escribir los nombres legacy deja el config INVALIDO y el gateway muere
+    al arrancar (causa raiz del fire-test fallido 2026-09-01). Cacheado por
+    proceso: el daemon se reinicia en cada rollout, suficiente frescura."""
+    if not _OC_VERSION_CACHE:
+        ver = ""
+        try:
+            out = subprocess.run(
+                ["openclaw", "--version"], capture_output=True, text=True,
+                timeout=20,
+            ).stdout or ""
+            m = re.search(r"(\d{4})\.(\d+)\.", out)
+            if m:
+                ver = (int(m.group(1)), int(m.group(2)))
+        except Exception:  # noqa: BLE001
+            ver = ""
+        _OC_VERSION_CACHE.append(ver)
+    v = _OC_VERSION_CACHE[0]
+    return bool(v) and v >= (2026, 8)
+
+
 def _update_openclaw_config_for_subagent(
     agent_id: str, action: str, recommended_model: str | None = None,
     image_generation_model: str | None = None,
@@ -14365,9 +14403,24 @@ def _update_openclaw_config_for_subagent(
         if any(media_models.values()):
             defaults_section = agents_section.setdefault("defaults", {})
             if isinstance(defaults_section, dict):
-                for slot_key, slot_slug in media_models.items():
-                    if slot_slug:
-                        defaults_section[slot_key] = slot_slug
+                if _openclaw_is_v2():
+                    # 2.0: slots bajo mediaModels.{image,music,video}; los
+                    # nombres legacy invalidan el config (gateway no arranca).
+                    mm = defaults_section.setdefault("mediaModels", {})
+                    v2_key = {
+                        "imageGenerationModel": "image",
+                        "musicGenerationModel": "music",
+                        "videoGenerationModel": "video",
+                    }
+                    if isinstance(mm, dict):
+                        for slot_key, slot_slug in media_models.items():
+                            if slot_slug:
+                                mm[v2_key[slot_key]] = slot_slug
+                            defaults_section.pop(slot_key, None)
+                else:
+                    for slot_key, slot_slug in media_models.items():
+                        if slot_slug:
+                            defaults_section[slot_key] = slot_slug
     elif action == "uninstall":
         if existing_idx is None:
             return False
@@ -32922,6 +32975,12 @@ main() {
         phase_tailscale
         # Path B: re-enable the materialized plugins after phase_tunnel.
         enable_pathb_plugins
+        # OpenClaw 2.0: el fast-path desde snapshot NO corre la fase que
+        # llama configure_openclaw_v2_defaults, y cleanup-pre-snapshot
+        # borra openclaw.json (los sets del bake se pierden). Correrla
+        # aqui, DESPUES de que phase_tunnel regenero openclaw.json —
+        # idempotente, no-op en 7.1. (Hallazgo del fire-test 2026-09-01.)
+        configure_openclaw_v2_defaults
     else
         # Update-only path: skip ollama / openclaw kernel reinstall / tunnel
         # provisioning / tailscale. Kernel + cloudflared refresh is delegated

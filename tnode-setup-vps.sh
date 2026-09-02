@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.130.1"
+TNODE_SETUP_VERSION="1.131.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -1516,11 +1516,66 @@ enable_plugin() {
 # las respuestas (chat-sync detecta el mismo flag y retrae su mirror de
 # texto). Todo verificado E2E en el canary Pi 2026-09-01. Solo corre cuando
 # el CLI es del train 2.0 (probe de --accept-capabilities); en 7.1 es no-op.
+# Escribe NUESTRO unit del gateway (systemd --user de $TNODE_USER) en vez de
+# depender de `openclaw gateway install`: el publisher managed de 2026.8.x
+# hace fingerprint del unit + drop-ins y un probe de "system ownership" que en
+# droplets DO termina "unverifiable" → SERVICE_DEFINITION_UNKNOWN y el unit
+# NUNCA se instala (fatal 3/3 en golds + fire-test 2026-09-01; el "Gateway
+# daemon activo" que seguia era el proceso efimero del installer). Mismo
+# patron que el resto de nuestros daemons: unit propio, Restart=always.
+install_openclaw_gateway_unit() {
+    local unit_dir="/home/$TNODE_USER/.config/systemd/user"
+    local oc_root
+    oc_root="$(npm root -g 2>/dev/null || echo /usr/lib/node_modules)"
+    mkdir -p "$unit_dir"
+    local oc_ver
+    oc_ver="$(run_as_tnode openclaw --version </dev/null 2>/dev/null | awk "{print \$2}")"
+    cat > "$unit_dir/openclaw-gateway.service" <<UNITEOF
+[Unit]
+Description=OpenClaw Gateway (v${oc_ver:-unknown})
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+ExecStart=/usr/bin/node $oc_root/openclaw/dist/index.js gateway --port 18789
+Restart=always
+RestartSec=5
+RestartPreventExitStatus=78
+TimeoutStopSec=30
+TimeoutStartSec=30
+SuccessExitStatus=0 143
+KillMode=control-group
+Environment=HOME=/home/$TNODE_USER
+Environment=TMPDIR=/tmp
+Environment=PATH=/usr/bin:/usr/local/bin:/bin
+Environment=OPENCLAW_GATEWAY_PORT=18789
+Environment=OPENCLAW_SYSTEMD_UNIT=openclaw-gateway.service
+Environment=OPENCLAW_SERVICE_MARKER=openclaw
+Environment=OPENCLAW_SERVICE_KIND=gateway
+Environment=OPENCLAW_SERVICE_VERSION=${oc_ver:-unknown}
+
+[Install]
+WantedBy=default.target
+UNITEOF
+    chown -R "$TNODE_USER":"$TNODE_USER" "$unit_dir"
+    local uid; uid="$(id -u "$TNODE_USER")"
+    sudo -u "$TNODE_USER" env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user daemon-reload 2>/dev/null || true
+    sudo -u "$TNODE_USER" env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user enable openclaw-gateway 2>/dev/null || true
+}
+
 configure_openclaw_v2_defaults() {
     if [[ -z "$(_oc_accept_caps_flag)" ]]; then
         return 0
     fi
     info "OpenClaw 2.0: configurando ownership + consent + canal TNode live"
+    # Orden VALIDADO en lab (droplet 3557d3bb, 2026-09-01): ownership exige
+    # >=1 entry y systemAgent exige ownership → materializar `main` PRIMERO
+    # (en 2.0 los agents.entries solo nacen en el primer turn, tarde para
+    # esta fase).
+    run_as_tnode openclaw config set agents.entries.main --json "{\"workspace\":\"$OPENCLAW_HOME/workspace\"}" </dev/null \
+        || warn "v2-defaults: agents.entries.main falló"
     run_as_tnode openclaw config set agents.ownership explicit </dev/null \
         || warn "v2-defaults: agents.ownership falló"
     run_as_tnode openclaw config set agents.defaults.systemAgent.agentId main </dev/null \
@@ -10545,8 +10600,8 @@ openclaw_configure_as_tnode() {
     # Transfer all config ownership to tnode before starting services
     chown -R "$TNODE_USER":"$TNODE_USER" "$OPENCLAW_HOME" 2>/dev/null || true
 
-    # Install gateway service as tnode
-    run_with_progress "Instalando gateway service" --estimate 10 run_as_tnode openclaw gateway install || true
+    # Install gateway service as tnode (unit PROPIO — ver install_openclaw_gateway_unit)
+    run_with_progress "Instalando gateway service" --estimate 10 install_openclaw_gateway_unit || true
 
     # Start gateway as tnode user
     local tnode_uid
@@ -12487,7 +12542,11 @@ from __future__ import annotations
 #          (tnode-delegate/tnode-a2a sin cambio). Cleanup de dirs legacy en
 #          _ensure_workspace_skills; paths actualizados en todos los
 #          bloques declarativos embebidos.
-__VERSION__ = "1.85.0"
+# 1.86.0: slots generativos train-aware — en OpenClaw 2.0 escriben
+#          agents.defaults.mediaModels.{image,music,video} (los nombres
+#          legacy invalidan el config y el gateway muere al nacer; causa
+#          raiz del fire-test 2026-09-01). En 7.1 sigue legacy.
+__VERSION__ = "1.86.0"
 
 import hashlib
 import hmac
@@ -14324,6 +14383,34 @@ def _remove_subagent_files(agent_id: str) -> None:
             f.unlink()
 
 
+_OC_VERSION_CACHE: list = []
+
+
+def _openclaw_is_v2() -> bool:
+    """True si el core instalado es del train 2026.8+ (OpenClaw 2.0).
+
+    En 2.0 el schema renombro los slots generativos de agents.defaults
+    (imageGenerationModel/music/video) a `mediaModels.{image,music,video}`;
+    escribir los nombres legacy deja el config INVALIDO y el gateway muere
+    al arrancar (causa raiz del fire-test fallido 2026-09-01). Cacheado por
+    proceso: el daemon se reinicia en cada rollout, suficiente frescura."""
+    if not _OC_VERSION_CACHE:
+        ver = ""
+        try:
+            out = subprocess.run(
+                ["openclaw", "--version"], capture_output=True, text=True,
+                timeout=20,
+            ).stdout or ""
+            m = re.search(r"(\d{4})\.(\d+)\.", out)
+            if m:
+                ver = (int(m.group(1)), int(m.group(2)))
+        except Exception:  # noqa: BLE001
+            ver = ""
+        _OC_VERSION_CACHE.append(ver)
+    v = _OC_VERSION_CACHE[0]
+    return bool(v) and v >= (2026, 8)
+
+
 def _update_openclaw_config_for_subagent(
     agent_id: str, action: str, recommended_model: str | None = None,
     image_generation_model: str | None = None,
@@ -14413,9 +14500,24 @@ def _update_openclaw_config_for_subagent(
         if any(media_models.values()):
             defaults_section = agents_section.setdefault("defaults", {})
             if isinstance(defaults_section, dict):
-                for slot_key, slot_slug in media_models.items():
-                    if slot_slug:
-                        defaults_section[slot_key] = slot_slug
+                if _openclaw_is_v2():
+                    # 2.0: slots bajo mediaModels.{image,music,video}; los
+                    # nombres legacy invalidan el config (gateway no arranca).
+                    mm = defaults_section.setdefault("mediaModels", {})
+                    v2_key = {
+                        "imageGenerationModel": "image",
+                        "musicGenerationModel": "music",
+                        "videoGenerationModel": "video",
+                    }
+                    if isinstance(mm, dict):
+                        for slot_key, slot_slug in media_models.items():
+                            if slot_slug:
+                                mm[v2_key[slot_key]] = slot_slug
+                            defaults_section.pop(slot_key, None)
+                else:
+                    for slot_key, slot_slug in media_models.items():
+                        if slot_slug:
+                            defaults_section[slot_key] = slot_slug
     elif action == "uninstall":
         if existing_idx is None:
             return False
@@ -32972,6 +33074,12 @@ main() {
             # Path B: phase_tunnel just regenerated openclaw.json (snapshot ships
             # none — cleanup-pre-snapshot deletes it); re-enable the plugins now.
             enable_pathb_plugins
+            # OpenClaw 2.0: el fast-path desde snapshot NO corre la fase que
+            # llama configure_openclaw_v2_defaults, y cleanup-pre-snapshot
+            # borra openclaw.json (los sets del bake se pierden). Correrla
+            # aqui, DESPUES de que phase_tunnel regenero openclaw.json —
+            # idempotente, no-op en 7.1. (Hallazgo del fire-test 2026-09-01.)
+            configure_openclaw_v2_defaults
         fi
     else
         # Update-only path: skip ollama / openclaw kernel reinstall / tunnel
