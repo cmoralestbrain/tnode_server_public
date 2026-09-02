@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.134.0"
+TNODE_SETUP_VERSION="1.135.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -12605,7 +12605,16 @@ from __future__ import annotations
 #          botToken, brave apiKey). gateway.auth.token queda plaintext a
 #          proposito: chat-sync lo lee y los store secrets son write-only.
 #          En 7.1 todo identico (plaintext legacy).
-__VERSION__ = "1.88.0"
+# 1.89.0: F3a — update_llm_provider acepta `apiKeySecretName`: el app
+#          deposita la key por WS directo al store del gateway (RPC
+#          secrets.store.set, sidecar transparente) y el comando de
+#          Firestore lleva SOLO el nombre; aqui se escribe el SecretRef.
+#          La key BYO deja de transitar por Firestore. Nombre validado
+#          contra la gramatica del SDK; en 7.1 se ignora (plaintext).
+#          + FIX _guest_agent_present leia agents.list legacy — en 2.0
+#          nativo devolvia False siempre y el startup self-heal quedaba
+#          en retry-loop infinito (~3s) desde el nacimiento del nodo.
+__VERSION__ = "1.89.0"
 
 import hashlib
 import hmac
@@ -13775,6 +13784,7 @@ def _apply_provider_to_openclaw(
     api_key: str = "",
     ctx: int | None = None,
     max_tokens: int = 4096,
+    api_key_secret_name: str | None = None,
 ) -> dict:
     """Upsert a provider block inside openclaw.json. Returns updated cfg.
 
@@ -13805,9 +13815,16 @@ def _apply_provider_to_openclaw(
     # Train 2.0: key al shared store + SecretRef en el config (ver bloque
     # Credential Management arriba). Si el store set falla, fallback a
     # plaintext — un nodo con LLM y residuo auditable gana a un nodo mudo.
+    # F3a: si el caller trae `api_key_secret_name`, el app YA depositó el
+    # valor en el store vía RPC `secrets.store.set` (la key jamás pasó por
+    # Firestore) — aquí solo se escribe el SecretRef.
     key_value: object = api_key or ""
     used_ref = False
-    if api_key and _openclaw_is_v2():
+    if api_key_secret_name and _openclaw_is_v2() \
+            and re.match(r"^[A-Z][A-Z0-9_]{0,127}$", api_key_secret_name):
+        key_value = _secret_ref(api_key_secret_name)
+        used_ref = True
+    elif api_key and _openclaw_is_v2():
         _sname = _secret_store_name(provider)
         if _store_secret(_sname, api_key):
             key_value = _secret_ref(_sname)
@@ -13821,7 +13838,7 @@ def _apply_provider_to_openclaw(
         "models": [],
     })
     p["baseUrl"] = base_url
-    if api_key:
+    if api_key or used_ref:
         p["apiKey"] = key_value
 
     models_list = p.setdefault("models", [])
@@ -13883,6 +13900,9 @@ def handle_update_llm_provider(token: dict, params: dict) -> dict:
     base_url = str(params.get("baseUrl") or "").strip()
     model = str(params.get("model") or "").strip()
     api_key = str(params.get("apiKey") or "")
+    # F3a: el sheet del app manda solo el NOMBRE de la entrada del store
+    # (la key viajó por WS directo al gateway, nunca por este comando).
+    api_key_secret_name = str(params.get("apiKeySecretName") or "").strip() or None
     ctx = params.get("ctx")
     max_tokens = params.get("maxTokens") or 4096
 
@@ -13902,6 +13922,7 @@ def handle_update_llm_provider(token: dict, params: dict) -> dict:
             provider, base_url, model, api_key,
             ctx=int(ctx) if ctx else None,
             max_tokens=int(max_tokens),
+            api_key_secret_name=api_key_secret_name,
         )
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "result": {"error": f"write_failed: {e}"}}
@@ -23463,13 +23484,20 @@ def run_command_drain_oneshot() -> int:
 
 
 def _guest_agent_present() -> bool:
-    """True if the `guest` agent entry is already in openclaw.json."""
+    """True if the `guest` agent entry is already in openclaw.json.
+
+    Lee el roster via _roster_load (vista train-aware): en 2.0 nativo el
+    roster vive en `agents.entries` (dict) y `agents.list` NO existe — el
+    read legacy devolvía False SIEMPRE y _run_startup_self_heal reintentaba
+    en loop infinito cada ~3s desde el nacimiento del nodo (cazado en HEB
+    2026-09-02: 19k retries en 16h; el unificador de 1.87 cubrió los 4
+    writers pero este reader se le escapó)."""
     try:
         cfg = json.loads(OPENCLAW_JSON_PATH.read_text())
     except Exception:  # noqa: BLE001
         return False
-    agents_list = cfg.get("agents", {}).get("list", [])
-    return isinstance(agents_list, list) and any(
+    agents_list = _roster_load(cfg.get("agents", {}) or {})
+    return any(
         isinstance(a, dict) and a.get("id") == "guest" for a in agents_list
     )
 
