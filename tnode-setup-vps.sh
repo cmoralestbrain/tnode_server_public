@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.131.0"
+TNODE_SETUP_VERSION="1.131.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -1570,24 +1570,30 @@ configure_openclaw_v2_defaults() {
         return 0
     fi
     info "OpenClaw 2.0: configurando ownership + consent + canal TNode live"
-    # Orden VALIDADO en lab (droplet 3557d3bb, 2026-09-01): ownership exige
-    # >=1 entry y systemAgent exige ownership → materializar `main` PRIMERO
-    # (en 2.0 los agents.entries solo nacen en el primer turn, tarde para
-    # esta fase).
-    run_as_tnode openclaw config set agents.entries.main --json "{\"workspace\":\"$OPENCLAW_HOME/workspace\"}" </dev/null \
-        || warn "v2-defaults: agents.entries.main falló"
-    run_as_tnode openclaw config set agents.ownership explicit </dev/null \
-        || warn "v2-defaults: agents.ownership falló"
-    run_as_tnode openclaw config set agents.defaults.systemAgent.agentId main </dev/null \
-        || warn "v2-defaults: systemAgent falló"
-    run_as_tnode openclaw config set agents.defaults.sessionStore.agentId main </dev/null \
-        || warn "v2-defaults: sessionStore falló"
-    run_as_tnode openclaw config set plugins.entries.tnode.hooks.allowConversationAccess true </dev/null \
-        || warn "v2-defaults: consent tnode falló"
-    run_as_tnode openclaw config set plugins.entries.tbrain-context-engine.hooks.allowConversationAccess true </dev/null \
-        || warn "v2-defaults: consent context-engine falló"
-    run_as_tnode openclaw config set channels.tnode --json '{"enabled":true,"mode":"live","name":"TNode"}' </dev/null \
-        || warn "v2-defaults: channels.tnode falló"
+    # UNA escritura JSON directa (<1s) en vez de 8 `openclaw config set`:
+    # la cadena de CLIs tomaba ~90s en un droplet frio y ese silencio de
+    # heartbeats justo tras tunnel_ready hizo que la CF declarara timeout
+    # del paso 6 con el installer aun vivo (fire-test #2, 2026-09-01).
+    # Shape validado contra el schema 2.0 (doctor 0 invalids en lab).
+    # Orden logico intacto: entries.main existe ANTES de ownership.
+    run_as_tnode python3 - <<V2DEFAULTSPYEOF || warn "v2-defaults: merge fallo"
+import json
+p = "$OPENCLAW_HOME/openclaw.json"
+d = json.load(open(p))
+a = d.setdefault("agents", {})
+a.setdefault("entries", {}).setdefault(
+    "main", {"workspace": "$OPENCLAW_HOME/workspace"})
+a["ownership"] = "explicit"
+ad = a.setdefault("defaults", {})
+ad.setdefault("systemAgent", {})["agentId"] = "main"
+ad.setdefault("sessionStore", {})["agentId"] = "main"
+pe = d.setdefault("plugins", {}).setdefault("entries", {})
+for pid in ("tnode", "tbrain-context-engine"):
+    pe.setdefault(pid, {}).setdefault("hooks", {})["allowConversationAccess"] = True
+ch = d.setdefault("channels", {}).setdefault("tnode", {})
+ch.update({"enabled": True, "mode": "live", "name": "TNode"})
+json.dump(d, open(p, "w"), indent=2)
+V2DEFAULTSPYEOF
     success "OpenClaw 2.0 defaults configurados"
 }
 
