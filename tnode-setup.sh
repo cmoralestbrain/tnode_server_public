@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.131.1"
+TNODE_SETUP_VERSION="1.132.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -12455,7 +12455,13 @@ from __future__ import annotations
 #          agents.defaults.mediaModels.{image,music,video} (los nombres
 #          legacy invalidan el config y el gateway muere al nacer; causa
 #          raiz del fire-test 2026-09-01). En 7.1 sigue legacy.
-__VERSION__ = "1.86.0"
+# 1.87.0: el nodo 2.0 se escribe NATIVO (fire-test #3): roster de agentes
+#          via _roster_load/_roster_store (agents.entries dict en 2.0 —
+#          `agents.list` y el marker `default:true` INVALIDAN el config;
+#          4 writers unificados: subagent/set_agent_params/guest/platform)
+#          + seed de media del primer provision tambien via mediaModels.
+#          En 7.1 todo identico.
+__VERSION__ = "1.87.0"
 
 import hashlib
 import hmac
@@ -13627,8 +13633,18 @@ def _apply_provider_to_openclaw(
     # OpenRouter-only (the defaults are OR slugs that need the node's OR key)
     # and setdefault-only (a prior Mente choice or sub-agent card is kept).
     if provider == "openrouter":
-        for _slot, _default_slug in _DEFAULT_MEDIA_MODELS.items():
-            agents_defaults.setdefault(_slot, _default_slug)
+        if _openclaw_is_v2():
+            _mm = agents_defaults.setdefault("mediaModels", {})
+            _v2_slot = {"imageGenerationModel": "image",
+                        "musicGenerationModel": "music",
+                        "videoGenerationModel": "video"}
+            if isinstance(_mm, dict):
+                for _slot, _default_slug in _DEFAULT_MEDIA_MODELS.items():
+                    _mm.setdefault(_v2_slot[_slot], _default_slug)
+                    agents_defaults.pop(_slot, None)
+        else:
+            for _slot, _default_slug in _DEFAULT_MEDIA_MODELS.items():
+                agents_defaults.setdefault(_slot, _default_slug)
 
     _write_openclaw_json(cfg)
     return cfg
@@ -13718,7 +13734,8 @@ def handle_set_agent_params(token: dict, params: dict) -> dict:
             max_tokens = None
 
     cfg = read_openclaw_json() or {}
-    agents_list = cfg.setdefault("agents", {}).setdefault("list", [])
+    _agents_section = cfg.setdefault("agents", {})
+    agents_list = _roster_load(_agents_section)
     entry = next(
         (a for a in agents_list if isinstance(a, dict) and a.get("id") == agent_id),
         None,
@@ -13744,6 +13761,7 @@ def handle_set_agent_params(token: dict, params: dict) -> dict:
     else:
         entry.pop("params", None)
 
+    _roster_store(_agents_section, agents_list)
     _write_openclaw_json(cfg)
     _log(
         f"set_agent_params {agent_id}: "
@@ -14320,6 +14338,43 @@ def _openclaw_is_v2() -> bool:
     return bool(v) and v >= (2026, 8)
 
 
+def _roster_load(agents_section: dict) -> list:
+    """Vista LIST del roster, independiente del train (fire-test #3).
+
+    En 2.0 el roster vive en `agents.entries` (dict) y `agents.list`
+    INVALIDA el config; en 7.1 es al reves. Toda la logica existente opera
+    sobre la vista list; `_roster_store` escribe de vuelta al storage del
+    train y en 2.0 ademas pela los markers `default` (retirados)."""
+    if _openclaw_is_v2():
+        entries = agents_section.get("entries")
+        merged: dict = {}
+        if isinstance(entries, dict):
+            for k, v in entries.items():
+                if isinstance(v, dict):
+                    merged[k] = dict(v)
+        # Si algun writer viejo dejo agents.list, absorberla (self-heal).
+        legacy = agents_section.get("list")
+        if isinstance(legacy, list):
+            for a in legacy:
+                if isinstance(a, dict) and a.get("id") and a["id"] not in merged:
+                    merged[a["id"]] = {k: v for k, v in a.items() if k != "id"}
+        return [{"id": k, **v} for k, v in merged.items()]
+    lst = agents_section.setdefault("list", [])
+    return lst if isinstance(lst, list) else []
+
+
+def _roster_store(agents_section: dict, agents_list: list) -> None:
+    if _openclaw_is_v2():
+        agents_section["entries"] = {
+            a["id"]: {k: v for k, v in a.items() if k not in ("id", "default")}
+            for a in agents_list
+            if isinstance(a, dict) and a.get("id")
+        }
+        agents_section.pop("list", None)
+    else:
+        agents_section["list"] = agents_list
+
+
 def _update_openclaw_config_for_subagent(
     agent_id: str, action: str, recommended_model: str | None = None,
     image_generation_model: str | None = None,
@@ -14341,10 +14396,7 @@ def _update_openclaw_config_for_subagent(
     if not isinstance(agents_section, dict):
         _log("openclaw.json: agents is not an object; cannot update sub-agents")
         return False
-    agents_list = agents_section.setdefault("list", [])
-    if not isinstance(agents_list, list):
-        _log("openclaw.json: agents.list is not an array; cannot update sub-agents")
-        return False
+    agents_list = _roster_load(agents_section)
     main_idx = next(
         (i for i, a in enumerate(agents_list)
          if isinstance(a, dict) and a.get("id") == "main"),
@@ -14461,6 +14513,8 @@ def _update_openclaw_config_for_subagent(
     )
     if _guest_entry is not None:
         _guest_entry.setdefault("subagents", {})["allowAgents"] = _roster
+
+    _roster_store(agents_section, agents_list)
 
     serialized = json.dumps(cfg, indent=2) + "\n"
     if OPENCLAW_JSON_PATH.read_text() == serialized:
@@ -17982,9 +18036,7 @@ def _ensure_guest_agent() -> bool:
     agents_section = cfg.setdefault("agents", {})
     if not isinstance(agents_section, dict):
         return False
-    agents_list = agents_section.setdefault("list", [])
-    if not isinstance(agents_list, list):
-        return False
+    agents_list = _roster_load(agents_section)
     changed = False
     # Materialize `main` explicitly too (same as the sub-agent path) so the
     # shape is consistent on a freshly-paired node.
@@ -18032,6 +18084,8 @@ def _ensure_guest_agent() -> bool:
             changed = True
     if not changed:
         return False
+    _roster_store(agents_section, agents_list)
+
     serialized = json.dumps(cfg, indent=2) + "\n"
     if OPENCLAW_JSON_PATH.read_text() == serialized:
         return False
@@ -18286,9 +18340,7 @@ def _ensure_platform_agents() -> bool:
     agents_section = cfg.setdefault("agents", {})
     if not isinstance(agents_section, dict):
         return False
-    agents_list = agents_section.setdefault("list", [])
-    if not isinstance(agents_list, list):
-        return False
+    agents_list = _roster_load(agents_section)
     changed = False
 
     # agentDir propio y EXISTENTE por agente ([[openclaw_agentdir_empty]]).
@@ -18372,6 +18424,8 @@ def _ensure_platform_agents() -> bool:
 
     if not changed:
         return False
+    _roster_store(agents_section, agents_list)
+
     serialized = json.dumps(cfg, indent=2) + "\n"
     if OPENCLAW_JSON_PATH.read_text() == serialized:
         return False
@@ -29137,7 +29191,7 @@ from __future__ import annotations
 #          mtime (stat local, gratis) y mantiene sus polls de Firestore en
 #          cadencia rápida solo mientras el archivo esté fresco. Sin
 #          clientes → sin touch → chat-sync cae a backstops idle.
-__VERSION__ = "1.21.0"
+__VERSION__ = "1.22.0"
 
 import argparse
 import asyncio
@@ -29149,6 +29203,8 @@ import mimetypes
 import os
 import secrets as py_secrets
 import signal
+import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -31024,6 +31080,36 @@ def _agent_model_set(agent_id: str, model_slug: str) -> Dict[str, Any]:
     }
 
 
+_OC_V2_CACHE: list = []
+_MEDIA_V2_SLOT = {
+    "imageGenerationModel": "image",
+    "musicGenerationModel": "music",
+    "videoGenerationModel": "video",
+}
+
+
+def _openclaw_is_v2() -> bool:
+    """True si el core es 2026.8+ (OpenClaw 2.0). En 2.0 los slots de media
+    viven en agents.defaults.mediaModels.{image,music,video}; escribir los
+    nombres legacy INVALIDA el config y el gateway muere (fire-test #3,
+    2026-09-01). Cacheado por proceso."""
+    if not _OC_V2_CACHE:
+        ver: Any = ""
+        try:
+            out = subprocess.run(
+                ["openclaw", "--version"], capture_output=True, text=True,
+                timeout=20,
+            ).stdout or ""
+            m = re.search(r"(\d{4})\.(\d+)\.", out)
+            if m:
+                ver = (int(m.group(1)), int(m.group(2)))
+        except Exception:  # noqa: BLE001
+            ver = ""
+        _OC_V2_CACHE.append(ver)
+    v = _OC_V2_CACHE[0]
+    return bool(v) and v >= (2026, 8)
+
+
 def _node_media_model_get(config_key: str) -> Dict[str, Any]:
     """Returns a node-global media-generation model from `agents.defaults`
     (`imageGenerationModel` / `musicGenerationModel` / `videoGenerationModel`).
@@ -31031,7 +31117,12 @@ def _node_media_model_get(config_key: str) -> Dict[str, Any]:
     honors them under `agents.defaults` (the `agents.list[]` schema rejects
     them). `null` when the node has no model configured for that slot."""
     config = _load_openclaw_json()
-    val = ((config.get("agents") or {}).get("defaults") or {}).get(config_key)
+    defaults = (config.get("agents") or {}).get("defaults") or {}
+    # 2.0 primero (mediaModels.{image,...}), fallback legacy — lee ambos
+    # trains sin importar quien escribio.
+    val = (defaults.get("mediaModels") or {}).get(_MEDIA_V2_SLOT[config_key])
+    if not isinstance(val, str):
+        val = defaults.get(config_key)
     return {config_key: val if isinstance(val, str) else None}
 
 
@@ -31057,7 +31148,14 @@ def _node_media_model_set(config_key: str, model_slug: str) -> Dict[str, Any]:
     defaults = agents.setdefault("defaults", {})
     if not isinstance(defaults, dict):
         raise AgentError("defaults-malformed", "agents.defaults is not an object")
-    defaults[config_key] = model_slug
+    if _openclaw_is_v2():
+        mm = defaults.setdefault("mediaModels", {})
+        if not isinstance(mm, dict):
+            raise AgentError("mediaModels-malformed", "mediaModels is not an object")
+        mm[_MEDIA_V2_SLOT[config_key]] = model_slug
+        defaults.pop(config_key, None)
+    else:
+        defaults[config_key] = model_slug
     _save_openclaw_json_atomic(config)
     # Reload in the background: `openclaw daemon restart` can block past the
     # client's RPC timeout, which surfaced as a false "tiempo de espera agotado"
