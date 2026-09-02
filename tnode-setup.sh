@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.132.0"
+TNODE_SETUP_VERSION="1.133.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -1469,10 +1469,34 @@ _oc_accept_caps_flag() {
     fi
     printf '%s' "$_OC_ACCEPT_CAPS_FLAG"
 }
+# El exit code del CLI NO es la verdad: en el fire-test #4 (2026-09-02) los
+# enables fallaron EN SILENCIO durante la provision (sospecha: lock SQLite del
+# state store — 4 de 5 Path B + WA sin enabled=true) y el nodo nacio sin
+# espejo/transport/wake ⇒ respuestas del agente sin persistir. La verdad es
+# plugins.entries.<id>.enabled=true en openclaw.json: verificar SIEMPRE.
+_plugin_enabled_in_config() {
+    python3 - "$OPENCLAW_HOME/openclaw.json" "$1" <<'PLUGCHECKPYEOF' 2>/dev/null
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+entry = cfg.get("plugins", {}).get("entries", {}).get(sys.argv[2], {})
+sys.exit(0 if entry.get("enabled") is True else 1)
+PLUGCHECKPYEOF
+}
 enable_plugin() {
-    local pid="$1"
-    # shellcheck disable=SC2086
-    run_as_tnode openclaw plugins enable "$pid" $(_oc_accept_caps_flag) </dev/null
+    local pid="$1" attempt out=""
+    for attempt in 1 2 3; do
+        # shellcheck disable=SC2086
+        out="$(run_as_tnode openclaw plugins enable "$pid" $(_oc_accept_caps_flag) </dev/null 2>&1)" || true
+        if _plugin_enabled_in_config "$pid"; then
+            return 0
+        fi
+        warn "enable_plugin: $pid intento $attempt sin enabled=true en config — $(printf '%s' "$out" | tail -1)"
+        sleep $((attempt * 2))
+    done
+    return 1
 }
 
 # ── OpenClaw 2.0: defaults de provisión fresca ────────────────────────────
@@ -10364,23 +10388,37 @@ update_plugins_if_stale() {
 enable_pathb_plugins() {
     local ext_dir="$OPENCLAW_HOME/extensions"
     local pid
-    # openclaw-web-search rides along: baked into extensions/ like the Path B
-    # plugins, it loses its plugins.entries to the same pre-snapshot cleanup.
-    for pid in tbrain-context-engine tnode tnode-transport tnode-wake openclaw-web-search; do
+    # Los 4 Path B son CRITICOS: sin tnode (espejo durable) el nodo pierde las
+    # respuestas del agente EN SILENCIO (mode=live retrae el texto de
+    # chat-sync); sin transport/wake el tunel da 403. Si tras los retries de
+    # enable_plugin no queda enabled=true → die: mejor provision fallida
+    # honesta (la CF hace rollback+refund) que un nodo que pierde chats.
+    for pid in tbrain-context-engine tnode tnode-transport tnode-wake; do
         if [[ -d "$ext_dir/$pid" ]]; then
-            if enable_plugin "$pid" >/dev/null 2>&1; then
-                info "Path B: $pid enabled (SDK)"
+            if enable_plugin "$pid"; then
+                info "Path B: $pid enabled (SDK, enabled=true verificado en config)"
             else
-                warn "Path B: enable de $pid falló"
+                die "Path B: enable de $pid falló tras retries (plugins.entries.$pid.enabled ausente en openclaw.json)"
             fi
         fi
     done
+
+    # openclaw-web-search rides along: baked into extensions/ like the Path B
+    # plugins, it loses its plugins.entries to the same pre-snapshot cleanup.
+    # No-critico: warn y seguir.
+    if [[ -d "$ext_dir/openclaw-web-search" ]]; then
+        if enable_plugin openclaw-web-search; then
+            info "Path B: openclaw-web-search enabled (SDK)"
+        else
+            warn "Path B: enable de openclaw-web-search falló"
+        fi
+    fi
 
     # El canal WhatsApp no vive en extensions/ sino en npm/projects/ (install
     # por spec npm), así que no entra en el loop de arriba: pierde su entry con
     # el mismo cleanup y hay que re-habilitarlo igual en cada provisión.
     if compgen -G "$OPENCLAW_HOME/npm/projects/openclaw-whatsapp-*" >/dev/null 2>&1; then
-        if enable_plugin whatsapp >/dev/null 2>&1; then
+        if enable_plugin whatsapp; then
             info "Path B: whatsapp enabled (SDK)"
         else
             warn "Path B: enable de whatsapp falló"
@@ -10429,7 +10467,7 @@ install_websearch_plugin() {
         warn "web-search: openclaw plugins install falló"
         rm -rf "$stage_dir"; return 1
     fi
-    enable_plugin openclaw-web-search >/dev/null 2>&1 || true
+    enable_plugin openclaw-web-search || true
     rm -rf "$stage_dir"
     chown "$TNODE_USER":"$TNODE_USER" "$OPENCLAW_HOME/openclaw.json" 2>/dev/null || true
 }
@@ -10465,7 +10503,7 @@ install_whatsapp_plugin() {
         return 1
     fi
 
-    if ! enable_plugin whatsapp >/dev/null 2>&1; then
+    if ! enable_plugin whatsapp; then
         warn "WhatsApp: enable del canal falló"
         return 1
     fi
