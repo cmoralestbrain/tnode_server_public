@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.133.0"
+TNODE_SETUP_VERSION="1.134.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -12596,7 +12596,16 @@ from __future__ import annotations
 #          4 writers unificados: subagent/set_agent_params/guest/platform)
 #          + seed de media del primer provision tambien via mediaModels.
 #          En 7.1 todo identico.
-__VERSION__ = "1.87.0"
+# 1.88.0: Credential Management 2.0 (SecretRefs + shared store): las API
+#          keys de model-providers van al secret store del gateway (stdin,
+#          write-only) y el config lleva un SecretRef — la key sale de
+#          openclaw.json, de los models.json generados y del push de config
+#          a Firestore. Rotacion = store set + secrets reload (sin restart).
+#          Self-heal migra plaintext existente (providers.apiKey, telegram
+#          botToken, brave apiKey). gateway.auth.token queda plaintext a
+#          proposito: chat-sync lo lee y los store secrets son write-only.
+#          En 7.1 todo identico (plaintext legacy).
+__VERSION__ = "1.88.0"
 
 import hashlib
 import hmac
@@ -13303,20 +13312,20 @@ def derive_llm_mode(openclaw_cfg: dict) -> str:
         return "none"
 
     openrouter = providers.get("openrouter") or {}
-    or_key = (openrouter.get("apiKey") or "").strip()
-    if or_key and or_key not in ("", "not-needed"):
+    # apiKey puede ser string plaintext (legacy) o SecretRef dict (2.0) —
+    # ambos cuentan como "key poblada" para el banner.
+    if _apikey_present(openrouter.get("apiKey")):
         return "openrouter"
 
     for name, prov in providers.items():
         if name == "openrouter":
             continue  # already ruled out above (no usable key)
         base_url = (prov.get("baseUrl") or "").strip()
-        api_key = (prov.get("apiKey") or "").strip()
         if _is_local_url(base_url):
             return "local"
         # Remote non-openrouter provider with a populated key counts as
         # "functional" for banner purposes (node is ready to serve).
-        if base_url and api_key and api_key != "not-needed":
+        if base_url and _apikey_present(prov.get("apiKey")):
             return "local"
 
     return "none"
@@ -13416,10 +13425,75 @@ def _cli_env() -> dict:
     return env
 
 
-def _run_openclaw(*args: str, timeout: int = 60, stdout_limit: int = 2000) -> dict:
+# ── OpenClaw 2.0 Credential Management (SecretRefs + shared store) ──────────
+# En el train 2.0 las API keys de model-providers NO se persisten en plaintext:
+# el valor va al shared secret store (sqlite del gateway, write-only) y el
+# config lleva un SecretRef {source:"store",provider:"default",id:NAME}. Eso
+# saca la key de openclaw.json, de los models.json generados Y del push de
+# config a Firestore (push_openclaw_config sube el config completo). El
+# gateway resuelve el ref en su snapshot en memoria; rotación = store set +
+# secrets reload, sin tocar config ni reiniciar. gateway.auth.token queda
+# FUERA a propósito: chat-sync necesita leer ese valor y los store secrets
+# son write-only por diseño (residuo documentado, evaluar en fase F3).
+
+_SECRET_REF_SOURCES = ("env", "file", "exec", "store")
+
+
+def _is_secret_ref(v) -> bool:
+    return isinstance(v, dict) and v.get("source") in _SECRET_REF_SOURCES
+
+
+def _secret_ref(name: str) -> dict:
+    return {"source": "store", "provider": "default", "id": name}
+
+
+def _secret_store_name(provider: str) -> str:
+    """Nombre de entrada del store para la key de un provider, en la gramática
+    del SDK (^[A-Z][A-Z0-9_]{0,127}$). openrouter → OPENROUTER_API_KEY."""
+    base = re.sub(r"[^A-Z0-9_]", "_", provider.upper())
+    if not re.match(r"^[A-Z]", base):
+        base = "P_" + base
+    return (base + "_API_KEY")[:128]
+
+
+def _store_secret(name: str, value: str) -> bool:
+    """Escribe un secret al shared store por STDIN (nunca argv/env)."""
+    r = _run_openclaw(
+        "secrets", "store", "set", name, "--kind", "secret",
+        timeout=30, input_text=value,
+    )
+    if not r.get("ok"):
+        _log(f"secrets: store set {name} falló: {(r.get('stderr') or r.get('error') or '')[:200]}")
+    return bool(r.get("ok"))
+
+
+def _secrets_reload() -> None:
+    """Best-effort: re-resuelve refs al snapshot vivo del gateway. Si el
+    gateway está caído no es fatal — el arranque resuelve solo."""
+    r = _run_openclaw("secrets", "reload", timeout=30)
+    if not r.get("ok"):
+        _log(f"secrets: reload falló (no fatal): {(r.get('stderr') or r.get('error') or '')[:150]}")
+
+
+def _apikey_present(v) -> bool:
+    """True si el campo apiKey está poblado — plaintext real o SecretRef."""
+    if _is_secret_ref(v):
+        return True
+    s = v.strip() if isinstance(v, str) else ""
+    return bool(s) and s != "not-needed"
+
+
+def _run_openclaw(
+    *args: str,
+    timeout: int = 60,
+    stdout_limit: int = 2000,
+    input_text: str | None = None,
+) -> dict:
     """stdout_limit trunca al TAIL (default 2000, como siempre); 0 = sin
     truncar — necesario cuando el caller parsea JSON del stdout (un JSON
-    truncado por la cabeza parece parsear y truena con 'Extra data')."""
+    truncado por la cabeza parece parsear y truena con 'Extra data').
+    `input_text` va por stdin (para `secrets store set`: la key jamás pasa
+    por argv ni env, donde `ps`/process-listing la expondrían)."""
     bin_path = _openclaw_binary()
     if not bin_path:
         return {"ok": False, "error": "openclaw_not_found"}
@@ -13431,6 +13505,7 @@ def _run_openclaw(*args: str, timeout: int = 60, stdout_limit: int = 2000) -> di
             timeout=timeout,
             check=False,
             env=_cli_env(),
+            input=input_text,
         )
         result = {
             "ok": proc.returncode == 0,
@@ -13727,16 +13802,27 @@ def _apply_provider_to_openclaw(
     internal_id = _strip_provider_prefix(model, provider)
     prefixed_slug = _build_prefixed_slug(provider, internal_id)
 
+    # Train 2.0: key al shared store + SecretRef en el config (ver bloque
+    # Credential Management arriba). Si el store set falla, fallback a
+    # plaintext — un nodo con LLM y residuo auditable gana a un nodo mudo.
+    key_value: object = api_key or ""
+    used_ref = False
+    if api_key and _openclaw_is_v2():
+        _sname = _secret_store_name(provider)
+        if _store_secret(_sname, api_key):
+            key_value = _secret_ref(_sname)
+            used_ref = True
+
     cfg = read_openclaw_json() or {}
     providers = cfg.setdefault("models", {}).setdefault("providers", {})
     p = providers.setdefault(provider, {
         "baseUrl": base_url,
-        "apiKey": api_key or "",
+        "apiKey": key_value,
         "models": [],
     })
     p["baseUrl"] = base_url
     if api_key:
-        p["apiKey"] = api_key
+        p["apiKey"] = key_value
 
     models_list = p.setdefault("models", [])
     if not isinstance(models_list, list):
@@ -13782,6 +13868,11 @@ def _apply_provider_to_openclaw(
                 agents_defaults.setdefault(_slot, _default_slug)
 
     _write_openclaw_json(cfg)
+    # Rotación con ref SIN cambio de config (mismo NAME, valor nuevo en el
+    # store): el file-watcher no tiene nada que recargar — el reload de
+    # secrets es quien publica el valor nuevo al snapshot del gateway.
+    if used_ref:
+        _secrets_reload()
     return cfg
 
 
@@ -14459,8 +14550,14 @@ def _openclaw_is_v2() -> bool:
     if not _OC_VERSION_CACHE:
         ver = ""
         try:
+            # _openclaw_binary y NO "openclaw" pelón: en clawpi el CLI vive
+            # en ~/.npm-global/bin, FUERA del PATH de la unit systemd — el
+            # bare-name tronaba silencioso y la deteccion 2.0 devolvia False
+            # (cazado 2026-09-02 estrenando la migracion de secrets: el
+            # self-heal se saltaba TODO el codigo train-aware en la Pi).
+            _bin = _openclaw_binary() or "openclaw"
             out = subprocess.run(
-                ["openclaw", "--version"], capture_output=True, text=True,
+                [_bin, "--version"], capture_output=True, text=True,
                 timeout=20,
             ).stdout or ""
             m = re.search(r"(\d{4})\.(\d+)\.", out)
@@ -23412,6 +23509,53 @@ def _ensure_sync_json_env_fields() -> None:
         _log(f"sync json backfill failed: {e}")
 
 
+def _migrate_plaintext_secrets_v2() -> None:
+    """F2 Credential Management: migra credenciales plaintext existentes en
+    openclaw.json al shared secret store + SecretRef (solo train 2.0).
+
+    Alcance deliberado (superficie soportada por el SDK que nosotros
+    poblamos): models.providers.*.apiKey · channels.telegram.botToken ·
+    plugins.entries.brave.config.webSearch.apiKey. gateway.auth.token NO
+    (chat-sync lee ese valor; store secrets son write-only). Idempotente:
+    un campo ya-ref se salta; sin cambios no escribe nada."""
+    if not _openclaw_is_v2():
+        return
+    cfg = read_openclaw_json()
+    if not isinstance(cfg, dict):
+        return
+    migrated: list[str] = []
+
+    def _to_ref(holder: dict, field: str, store_name: str, label: str) -> None:
+        v = holder.get(field)
+        if not isinstance(v, str):
+            return  # ausente o ya-ref
+        s = v.strip()
+        if not s or s == "not-needed":
+            return
+        if _store_secret(store_name, s):
+            holder[field] = _secret_ref(store_name)
+            migrated.append(label)
+
+    provs = (cfg.get("models") or {}).get("providers") or {}
+    for pname, prov in provs.items():
+        if isinstance(prov, dict):
+            _to_ref(prov, "apiKey", _secret_store_name(pname),
+                    f"models.providers.{pname}.apiKey")
+    tg = (cfg.get("channels") or {}).get("telegram")
+    if isinstance(tg, dict):
+        _to_ref(tg, "botToken", "TELEGRAM_BOT_TOKEN", "channels.telegram.botToken")
+    brave_ws = ((((cfg.get("plugins") or {}).get("entries") or {})
+                 .get("brave") or {}).get("config") or {}).get("webSearch")
+    if isinstance(brave_ws, dict):
+        _to_ref(brave_ws, "apiKey", "BRAVE_API_KEY",
+                "plugins.entries.brave.config.webSearch.apiKey")
+
+    if migrated:
+        _write_openclaw_json(cfg)
+        _secrets_reload()
+        _log(f"secrets: migrados a SecretRef store: {', '.join(migrated)}")
+
+
 def _run_startup_self_heal() -> bool:
     """Run the idempotent startup self-heal (agents index, workspace dirs,
     skills, guest agent).
@@ -23430,6 +23574,7 @@ def _run_startup_self_heal() -> bool:
         _ensure_platform_agents()
         _ensure_guest_agent()
         _ensure_heartbeat_default()
+        _migrate_plaintext_secrets_v2()
     except PermissionError as e:
         _log(f"self-heal deferred (boot race, will retry): {e}")
         return False
