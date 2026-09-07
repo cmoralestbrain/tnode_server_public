@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.139.1"
+TNODE_SETUP_VERSION="1.140.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -12145,7 +12145,7 @@ write_tnode_skill_manager_py() {
 #!/usr/bin/env python3
 """tnode-skill-manager — ciclo de vida de los skills TNode en el nodo.
 
-__VERSION__ = "1.2.1"
+__VERSION__ = "1.3.0"
 
 Saca los skills de config-sync. Antes viajaban embebidos como constantes
 dentro del daemon (~8,000 líneas) y se materializaban en cada arranque; ahora
@@ -12191,7 +12191,7 @@ import sys
 import tarfile
 import time
 
-__VERSION__ = "1.2.1"
+__VERSION__ = "1.3.0"
 
 STATE_SCHEMA = 1
 MANIFEST_SCHEMA = 2
@@ -12242,6 +12242,34 @@ def agent_workspace(agent: str) -> pathlib.Path:
 
 def skill_dir(agent: str, name: str) -> pathlib.Path:
     return agent_workspace(agent) / "skills" / name
+
+
+def _openclaw_cli_env() -> dict:
+    """El CLI `openclaw` trata OPENCLAW_HOME como el directorio PADRE de
+    .openclaw (los daemons y este CLI lo usan como el dir .openclaw)."""
+    env = os.environ.copy()
+    env["OPENCLAW_HOME"] = str(openclaw_dir().parent)
+    env.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+    return env
+
+
+def _frontmatter(text: str) -> dict:
+    """name/description del frontmatter YAML mínimo de un SKILL.md."""
+    out = {}
+    if not text.startswith("---"):
+        return out
+    body = text.split("---", 2)
+    if len(body) < 3:
+        return out
+    for line in body[1].splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _titleize(slug: str) -> str:
+    return " ".join(w[:1].upper() + w[1:] for w in re.split(r"[-_\s]+", slug) if w)
 
 
 # ── salida ────────────────────────────────────────────────────────
@@ -12523,13 +12551,24 @@ def cmd_sync(args):
                 updated.append({"skill": tag, "from": rec.get("version"), "to": entry.get("version"),
                                 "written": len(res["written"])})
     st["cacheBuiltAt"] = index.get("builtAt")
+    # P4: skills nacidos en el Taller (propuestas applied) entran al manager
+    # con manifest v2 borrador y quedan visibles en el app como "sin clasificar".
+    adopted = []
+    if not args.agent or args.agent == "main":
+        for d in workshop_applied_dirs("main"):
+            r = _adopt_dir(pathlib.Path(d), "main", st)
+            if r:
+                adopted.append(r)
     save_state(st)
     summary = ("%d instalados, %d actualizados, %d reparados, %d sin cambio"
                % (len(installed), len(updated), len(repaired), len(unchanged)))
+    if adopted:
+        summary += ", %d adoptados del Taller" % len(adopted)
     if errors:
         summary += ", %d con error" % len(errors)
     _out({"action": "sync", "installed": installed, "updated": updated, "repaired": repaired,
-          "unchanged": unchanged, "errors": errors, "summary": summary}, 0 if not errors else 1)
+          "unchanged": unchanged, "adopted": adopted, "errors": errors, "summary": summary},
+         0 if not errors else 1)
 
 
 def cmd_list(args):
@@ -12556,6 +12595,9 @@ def cmd_list(args):
             "whyOwnerOnly": m.get("whyOwnerOnly"),
             "allowedAgents": ((m.get("agents") or {}).get("allowed")) or ["main"],
             "client": m.get("client") or {"tools": [], "exec": []},
+            "origin": m.get("origin") or rec.get("origin") or "catalog",
+            "source": rec.get("source"),
+            "needsReview": bool(m.get("needsReview")),
             "agents": agents, "status": m.get("status", "active"),
         })
     _out({"action": "list", "locale": args.locale, "skills": rows,
@@ -12603,8 +12645,8 @@ def cmd_verify(args):
             checked.append(name)
             if errs:
                 problems.append({"skill": name, "errors": errs})
-        for name in st["skills"]:
-            if name not in (index.get("skills") or {}):
+        for name, rec in st["skills"].items():
+            if name not in (index.get("skills") or {}) and rec.get("source") != "local":
                 problems.append({"skill": name, "errors": ["en state pero no en cache"]})
     _out({"action": "verify", "checked": checked, "problems": problems,
           "summary": "%d verificados, %d con problemas" % (len(checked), len(problems))},
@@ -12797,6 +12839,170 @@ def cmd_fetch(args):
          0 if not errors else 1)
 
 
+def workshop_applied_dirs(agent: str) -> list:
+    """Dirs de skills que NACIERON en el Taller (propuestas `applied` de
+    `openclaw skills workshop list`). Fail-closed: si el CLI no contesta,
+    no se adopta nada — así los skills bundled/managed del core (gog,
+    healthcheck, peekaboo…) que también viven en workspace/skills/ nunca
+    entran al manager por accidente."""
+    try:
+        proc = subprocess.run(
+            ["openclaw", "skills", "workshop", "list", "--agent", agent, "--json"],
+            capture_output=True, text=True, timeout=60, check=False, env=_openclaw_cli_env())
+        if proc.returncode != 0:
+            return []
+        data = json.loads((proc.stdout or "").strip() or "[]")
+    except Exception:  # noqa: BLE001
+        return []
+    items = data if isinstance(data, list) else (data.get("proposals") or data.get("records") or data.get("items") or [])
+    dirs = []
+    for it in items:
+        rec = it.get("record", it) if isinstance(it, dict) else {}
+        if rec.get("status") != "applied":
+            continue
+        # El listado (proposals-manifest.v1) trae skillKey/skillName; el
+        # record completo (inspect) trae target.skillDir. Aceptar ambos.
+        d = (rec.get("target") or {}).get("skillDir")
+        key = rec.get("skillKey") or rec.get("skillName")
+        if not d and key:
+            d = str(skill_dir(agent, key))
+        if d and d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def _adopt_dir(sdir: pathlib.Path, agent: str, st: dict) -> dict | None:
+    """Registra un skill del Taller: manifest v2 BORRADOR (audience dueño,
+    needsReview) si no lo trae, y entrada en state con source=local."""
+    name = sdir.name
+    skill_md = sdir / "SKILL.md"
+    if not skill_md.is_file() or name in st["skills"]:
+        return None
+    mpath = sdir / "manifest.json"
+    manifest = None
+    if mpath.is_file():
+        try:
+            manifest = read_manifest(mpath)
+        except ValueError:
+            manifest = None
+    if not manifest or manifest.get("manifestSchema") != MANIFEST_SCHEMA:
+        fm = _frontmatter(skill_md.read_text(encoding="utf-8", errors="replace"))
+        desc = (fm.get("description") or (manifest or {}).get("description") or "").strip()
+        title = _titleize(name)
+        manifest = {
+            "name": name, "version": (manifest or {}).get("version") or "0.1.0",
+            "type": "openclaw-skill", "entrypoint": "SKILL.md", "manifestSchema": MANIFEST_SCHEMA,
+            "displayName": {"es": title, "en": title},
+            "summary": {"es": desc, "en": desc, "_auto": ["en"]},
+            "audience": "dueño", "forClients": None, "needsOwnerData": False,
+            "whyOwnerOnly": {
+                "es": "Sin clasificar: dile a tu asistente si es sólo para ti o también para tus clientes",
+                "en": "Unclassified: tell your assistant whether it's only for you or also for your customers",
+            },
+            "agents": {"default": ["main"], "allowed": ["main"]},
+            "tools": ["exec"], "client": {"tools": [], "exec": []},
+            "lifecycle": {"install": None, "uninstall": None, "enable": None, "disable": None},
+            "blocks": {"tools": None, "soul": None}, "crons": [], "secrets": [], "requires": {},
+            "origin": "workshop", "needsReview": True,
+        }
+        mpath.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    st["skills"][name] = {
+        "version": manifest.get("version"), "sha256": None, "source": "local",
+        "origin": manifest.get("origin", "workshop"),
+        "installedAt": _now(), "updatedAt": _now(),
+        "audience": manifest.get("audience", "dueño"),
+        "agents": {agent: {"enabled": True}},
+    }
+    return {"skill": name, "agent": agent, "needsReview": bool(manifest.get("needsReview"))}
+
+
+def cmd_adopt(args):
+    """P4: registra en el manager los skills creados en el Taller (o un dir
+    explícito con --dir). Idempotente."""
+    st = load_state()
+    adopted = []
+    dirs = [pathlib.Path(args.dir)] if args.dir else [pathlib.Path(d) for d in workshop_applied_dirs(args.agent)]
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        r = _adopt_dir(d, args.agent, st)
+        if r:
+            adopted.append(r)
+    if adopted:
+        save_state(st)
+    _out({"action": "adopt", "adopted": adopted,
+          "summary": "%d skills del Taller adoptados" % len(adopted)})
+
+
+def cmd_classify(args):
+    """P4: el dueño (vía su asistente) dice para quién es una skill. Escribe
+    los textos i18n y la audiencia en el manifest. Regla P3: aunque pida
+    'clientes', sin `client.tools` la skill queda sólo en main (los skills
+    del Taller corren por exec, que recepcion no tiene)."""
+    st = load_state()
+    rec = st["skills"].get(args.skill)
+    if not rec:
+        _die(f"not_installed: {args.skill}")
+    agent = next(iter(rec.get("agents") or {"main": {}}))
+    mpath = skill_dir(agent, args.skill) / "manifest.json"
+    try:
+        m = read_manifest(mpath)
+    except (OSError, ValueError) as e:
+        _die(f"manifest_unreadable: {e}")
+    auto = []
+    def i18n(es, en, field):
+        if es is None and en is None:
+            return m.get(field)
+        es = es if es is not None else en
+        if en is None:
+            auto.append(field)
+            en = es
+        return {"es": es, "en": en}
+    m["displayName"] = i18n(args.display_es, args.display_en, "displayName") or m.get("displayName")
+    m["summary"] = i18n(args.summary_es, args.summary_en, "summary") or m.get("summary")
+    m["audience"] = args.audience
+    if args.audience != "dueño":
+        fc = i18n(args.for_clients_es, args.for_clients_en, "forClients")
+        if not _i18n_ok(fc):
+            _die("for_clients_required: con audience clientes/ambos pasa --for-clients-es (y --for-clients-en)")
+        m["forClients"] = fc
+    else:
+        m["forClients"] = None
+    m["needsOwnerData"] = bool(args.needs_owner_data)
+    if args.why_es or args.why_en:
+        m["whyOwnerOnly"] = i18n(args.why_es, args.why_en, "whyOwnerOnly")
+    elif not m["needsOwnerData"] and args.audience != "dueño":
+        m["whyOwnerOnly"] = None
+    elif m.get("needsReview"):
+        m["whyOwnerOnly"] = None
+    client_tools = ((m.get("client") or {}).get("tools")) or []
+    can_clients = args.audience != "dueño" and not m["needsOwnerData"] and bool(client_tools)
+    m["agents"] = {"default": ["main"], "allowed": ["main", "recepcion"] if can_clients else ["main"]}
+    note = None
+    if args.audience != "dueño" and not client_tools:
+        note = ("audience_pending_tools: la skill se usa por scripts (exec) y recepcion no puede "
+                "ejecutarlos; quedará sólo para el dueño hasta que tenga una herramienta segura "
+                "(client.tools). Se guardó tu intención en audienceRequested.")
+        m["audienceRequested"] = args.audience
+        m["whyOwnerOnly"] = m.get("whyOwnerOnly") or {
+            "es": "Todavía no tiene una herramienta segura para clientes",
+            "en": "No customer-safe tool yet"}
+    if auto:
+        m["_auto"] = sorted(set((m.get("_auto") or []) + [f"{f}.en" for f in auto]))
+    m["needsReview"] = False
+    m["manifestSchema"] = MANIFEST_SCHEMA
+    errs = validate_manifest(m)
+    if errs:
+        _die("manifest_invalid", errors=errs)
+    mpath.write_text(json.dumps(m, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    rec["audience"] = m["audience"]
+    rec["updatedAt"] = _now()
+    save_state(st)
+    _out({"action": "classify", "skill": args.skill, "audience": m["audience"],
+          "allowedAgents": m["agents"]["allowed"], "autoTranslated": auto, "note": note,
+          "summary": "%s clasificada como %s%s" % (args.skill, m["audience"], " (queda sólo dueño por ahora)" if note else "")})
+
+
 def cmd_blocks(args):
     """Bloques declarativos para el compositor de config-sync (§5). P1: sólo
     los skills que traen `blocks.tools` (archivo en su dir) y están
@@ -12926,6 +13132,21 @@ def main():
     p = sub.add_parser("fetch", help="baja al cache lo que dicta el catálogo (P2)")
     p.add_argument("--catalog", required=True, help="JSON {skills: {name: {version, sha256, url}}}")
     p.set_defaults(fn=cmd_fetch)
+
+    p = sub.add_parser("adopt", help="P4: registra skills creados en el Taller")
+    p.add_argument("--agent", default="main")
+    p.add_argument("--dir", default=None, help="adoptar este dir explícitamente (pruebas)")
+    p.set_defaults(fn=cmd_adopt)
+
+    p = sub.add_parser("classify", help="P4: para quién es una skill (lo dice el dueño)")
+    p.add_argument("skill")
+    p.add_argument("--audience", required=True, choices=AUDIENCES)
+    p.add_argument("--display-es"); p.add_argument("--display-en")
+    p.add_argument("--summary-es"); p.add_argument("--summary-en")
+    p.add_argument("--for-clients-es"); p.add_argument("--for-clients-en")
+    p.add_argument("--why-es"); p.add_argument("--why-en")
+    p.add_argument("--needs-owner-data", action="store_true")
+    p.set_defaults(fn=cmd_classify)
 
     p = sub.add_parser("blocks")
     p.add_argument("--agent", default="main")
@@ -15819,6 +16040,12 @@ from __future__ import annotations
 #          + FIX _guest_agent_present leia agents.list legacy — en 2.0
 #          nativo devolvia False siempre y el startup self-heal quedaba
 #          en retry-loop infinito (~3s) desde el nacimiento del nodo.
+# 2.3.0   — P4 skill-manager: las skills que nacen en el Taller entran al
+#           manager (CLI 1.3.0 `adopt`, dentro de `sync`) con manifest v2
+#           borrador ("sin clasificar") y se espejan al app; el bloque
+#           `feature:skills-workshop` de TOOLS.md le pide al asistente
+#           preguntar al dueño para quién es y registrarlo con `classify`
+#           (i18n es/en). Espejo: `origin`, `needsReview`.
 # 2.2.0   — P3 skill-manager: skills PARA CLIENTES. `skill.enable/disable`
 #           aceptan `agentId` (recepcion) y delegan en el CLI; tras cada
 #           cambio se recalcula `channelSkillTools` del plugin context-engine
@@ -15950,7 +16177,7 @@ from __future__ import annotations
 #          quedó listo. Apagar conserva la BD (el historial es del usuario);
 #          sólo `purge:true` la borra. Mismo patrón que agenda/drive/poll:
 #          los archivos viajan en el daemon y se auto-materializan al boot.
-__VERSION__ = "2.2.0"
+__VERSION__ = "2.3.0"
 
 import hashlib
 import hmac
@@ -18808,7 +19035,9 @@ def _mirror_installed_skills(token: dict, force: bool = False) -> None:
         # el CLI ya localizó los textos; para el app mandamos el objeto i18n
         # completo leyendo el manifest vivo
         try:
-            m = json.loads((OPENCLAW_DIR / "workspace" / "skills" / sk["name"] / "manifest.json").read_text(encoding="utf-8"))
+            _agent0 = next(iter(sk.get("agents") or {"main": {}}))
+            _ws = OPENCLAW_DIR / "workspace" if _agent0 == "main" else OPENCLAW_DIR / f"workspace-{_agent0}"
+            m = json.loads((_ws / "skills" / sk["name"] / "manifest.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             m = {}
         agents = {a: {"mapValue": {"fields": {"enabled": {"booleanValue": bool((r or {}).get("enabled", True))}}}}
@@ -18826,6 +19055,8 @@ def _mirror_installed_skills(token: dict, force: bool = False) -> None:
             "whyOwnerOnlyI18n": _i18n(m.get("whyOwnerOnly")),
             "allowedAgents": {"arrayValue": {"values": [{"stringValue": a} for a in (sk.get("allowedAgents") or ["main"])]}},
             "clientTools": {"arrayValue": {"values": [{"stringValue": t} for t in ((sk.get("client") or {}).get("tools") or [])]}},
+            "origin": {"stringValue": str(sk.get("origin") or "catalog")},
+            "needsReview": {"booleanValue": bool(sk.get("needsReview"))},
             "agents": {"mapValue": {"fields": agents}},
             "skillsUpdatedAt": {"timestampValue": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
         }
@@ -20991,6 +21222,27 @@ ANTES de ejecutar cualquier herramienta (exec, web_search), SIEMPRE escribe un m
 - "Buscando informacion..."
 Esto es OBLIGATORIO. Primero el aviso, despues el tool."""
 
+_T_SKILLS_WORKSHOP = """## Regla: skills nuevas del Taller (skill-manager)
+
+Cuando apliques una propuesta del Taller y nazca una skill nueva, quedará
+registrada como "sin clasificar". Antes de darla por lista, pregúntale al
+dueño UNA cosa, en sus palabras: ¿esta habilidad es sólo para ti, o también
+para tus clientes cuando te escriben por WhatsApp/Telegram? Registra la
+respuesta (tú das los textos en español E inglés, cortos y desde el lado
+de quien la usa):
+
+   exec: python3 ~/.openclaw/scripts/tnode_skill_manager.py classify <nombre> --audience dueño|clientes|ambos --display-es "…" --display-en "…" --summary-es "…" --summary-en "…" [--for-clients-es "…" --for-clients-en "…"]
+
+Si la skill trabaja con datos privados del dueño (agenda personal, archivos,
+apuestas, dinero), agrega --needs-owner-data. Si el dueño dice "clientes"
+pero la skill se usa ejecutando scripts, quedará sólo para él por ahora
+(la recepcionista no ejecuta scripts); díselo sin drama. Para ver cuáles
+faltan por clasificar:
+
+   exec: python3 ~/.openclaw/scripts/tnode_skill_manager.py list
+   (campo needsReview)
+"""
+
 _T_AGENDA = """## Regla: agendar citas (skill agenda)
 
 Cuando quien te escribe pida CITA / HORA / DISPONIBILIDAD ("¿tienen
@@ -21539,6 +21791,7 @@ def _compose_tools_doc(token: dict) -> dict:
     blocks.append({"order": 230, "id": "feature:agenda", "kind": "feature", "text": _T_AGENDA})
     blocks.append({"order": 240, "id": "feature:drive", "kind": "feature", "text": _T_DRIVE})
     blocks.append({"order": 250, "id": "feature:poll", "kind": "feature", "text": _T_POLL})
+    blocks.append({"order": 252, "id": "feature:skills-workshop", "kind": "feature", "text": _T_SKILLS_WORKSHOP})
     # Una sola lectura de workflowDefinitions sirve v1 (`enabled`) y AWMF
     # (`awmfEnabled`) — espejo de buildToolsJson.
     all_wf_docs = _list_node_subcollection(token, "workflowDefinitions")
