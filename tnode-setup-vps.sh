@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.140.0"
+TNODE_SETUP_VERSION="1.140.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -16040,6 +16040,8 @@ from __future__ import annotations
 #          + FIX _guest_agent_present leia agents.list legacy — en 2.0
 #          nativo devolvia False siempre y el startup self-heal quedaba
 #          en retry-loop infinito (~3s) desde el nacimiento del nodo.
+# 2.3.1   — skills-mirror poda los docs de installed_skills (managedBy) cuya
+#           skill ya no está en el state (uninstall / Taller retirado).
 # 2.3.0   — P4 skill-manager: las skills que nacen en el Taller entran al
 #           manager (CLI 1.3.0 `adopt`, dentro de `sync`) con manifest v2
 #           borrador ("sin clasificar") y se espejan al app; el bloque
@@ -16177,7 +16179,7 @@ from __future__ import annotations
 #          quedó listo. Apagar conserva la BD (el historial es del usuario);
 #          sólo `purge:true` la borra. Mismo patrón que agenda/drive/poll:
 #          los archivos viajan en el daemon y se auto-materializan al boot.
-__VERSION__ = "2.3.0"
+__VERSION__ = "2.3.1"
 
 import hashlib
 import hmac
@@ -19067,6 +19069,32 @@ def _mirror_installed_skills(token: dict, force: bool = False) -> None:
             ok += 1
         except Exception as e:  # noqa: BLE001
             _log(f"skills-mirror: {sk['name']}: {e}")
+    # 2.3.1: poda — docs MÍOS (managedBy) cuya skill ya no está en el state
+    # (uninstall, o un skill del Taller retirado) se borran; si no, el app
+    # los seguiría pintando para siempre.
+    try:
+        q = {"structuredQuery": {
+            "from": [{"collectionId": "installed_skills"}],
+            "where": {"fieldFilter": {"field": {"fieldPath": "managedBy"}, "op": "EQUAL",
+                                      "value": {"stringValue": "tnode-skill-manager"}}},
+            "select": {"fields": [{"fieldPath": "skillId"}]}}}
+        parent = f"{_firestore_base()}/users/{token['uid']}/nodes/{cfg['nodeId']}"
+        res = _http_request("POST", f"{parent}:runQuery", payload=q,
+                            headers={"Authorization": f"Bearer {token['idToken']}"}, timeout=30)
+        have = {sk["name"] for sk in rows}
+        pruned = 0
+        for item in (res if isinstance(res, list) else []):
+            doc = item.get("document") or {}
+            name_path = doc.get("name") or ""
+            sid = name_path.rsplit("/", 1)[-1]
+            if sid and sid not in have:
+                _http_request("DELETE", f"{_firestore_base().split('/documents')[0]}/documents/{name_path.split('/documents/',1)[1]}",
+                              headers={"Authorization": f"Bearer {token['idToken']}"}, timeout=30)
+                pruned += 1
+        if pruned:
+            _log(f"skills-mirror: {pruned} docs podados (skills retirados)")
+    except Exception as e:  # noqa: BLE001
+        _log(f"skills-mirror: poda: {e}")
     _MIRROR_SKILLS_LAST_SIG = sig
     _log(f"skills-mirror: {ok}/{len(rows)} docs en installed_skills")
 
