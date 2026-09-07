@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.140.2"
+TNODE_SETUP_VERSION="1.140.3"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -15967,6 +15967,13 @@ from __future__ import annotations
 #          + FIX _guest_agent_present leia agents.list legacy — en 2.0
 #          nativo devolvia False siempre y el startup self-heal quedaba
 #          en retry-loop infinito (~3s) desde el nacimiento del nodo.
+# 2.3.2   — FIX: 2.0.0 borró el bloque de constantes del agente guest
+#          (_GUEST_WS_DIR/_GUEST_AGENT_DIR/_GUEST_TOOLS_DENY/_GUEST_*_MD/
+#          _GUEST_BIZ_*/_GUEST_PROSPECT_*/_GUEST_WS_FILES) pero dejó sus
+#          usos → NameError en _ensure_guest_agent / workspace / sección
+#          negocio / self-heal. Nodos viejos sobrevivían por tener el
+#          agente guest de 1.x; un nodo fresco 2.0.0–2.3.1 nacía SIN guest.
+#          Bloque restaurado tal cual de 1.x; pyflakes = 0 undefined names.
 # 2.3.1   — skills-mirror poda los docs de installed_skills (managedBy) cuya
 #           skill ya no está en el state (uninstall / Taller retirado).
 # 2.3.0   — P4 skill-manager: las skills que nacen en el Taller entran al
@@ -16106,7 +16113,7 @@ from __future__ import annotations
 #          quedó listo. Apagar conserva la BD (el historial es del usuario);
 #          sólo `purge:true` la borra. Mismo patrón que agenda/drive/poll:
 #          los archivos viajan en el daemon y se auto-materializan al boot.
-__VERSION__ = "2.3.1"
+__VERSION__ = "2.3.2"
 
 import hashlib
 import hmac
@@ -19038,6 +19045,131 @@ def _ensure_workspace_skills() -> None:
     else:
         _log("skills: sync falló: %s" % (res.get("error") or res.get("summary") or res)[:200])
     _sync_client_skills()
+
+
+# ── Guest agent (Opción B: per-guest isolation) ──────────────────────────
+# Invite-link visitors ("guests") run on a DEDICATED `guest` agent with its
+# own NEUTRAL workspace, so they never load the owner's main workspace
+# (USER.md/MEMORY.md/memory) — the root cause of the owner-identity leak.
+# tnode-chat-sync routes `tnode-guest-*` sessions to this agent via the
+# `agent:guest:` sessionKey prefix (the gateway honors it). The workspace is
+# STATIC + neutral (warm business-attention, NO owner PII); the per-node /
+# per-guest identity is injected at runtime by the tbrain-context-engine
+# plugin (before_prompt_build). Model inherits the node default (no override).
+_GUEST_WS_DIR = OPENCLAW_DIR / "workspace-guest"
+_GUEST_AGENT_DIR = _AGENTS_DIR / "guest" / "agent"
+
+# Guard-rails Layer 1 (#2.2): per-agent deny floor for ALL guests. Blocks the
+# tools that could reach the OWNER's system/data (the guest runs with the node's
+# owner-scoped creds + sandbox off): shell, filesystem, session/subagent
+# control, channel messaging, canvas, and browser (SSRF). Leaves public-facing
+# tools (web_search/web_fetch/image_generate/tts/huggingface). Per-link
+# refinement is layered on top by the context-engine before_tool_call hook.
+_GUEST_TOOLS_DENY = [
+    "exec", "process",
+    "read", "write", "edit", "file_write", "file_fetch", "dir_list", "dir_fetch",
+    # P3 (#2.2): sessions_spawn/sessions_send LIFTED from the floor — delegation is
+    # now gated per-link by the context-engine hook (guardRails.allowedAgents),
+    # default-deny. Session introspection stays denied (no enumerating sessions).
+    "sessions_list", "sessions_history",
+    "sessions_yield", "session_status", "subagents", "agents_list",
+    "message", "canvas", "browser",
+    # P5: raw wiki tools blocked for all guests; kb_search (context-engine) is
+    # the gated replacement — only available when allowedDocRefs is non-empty.
+    "wiki_search", "wiki_get", "wiki_lint", "wiki_apply",
+    # Hardening (2026-07-01): a guest must NEVER reach the owner's memory or the
+    # node's control plane. These are hard-denied in the FLOOR (defense in depth
+    # even if the context-engine hook fails to load) and are NOT togglable per
+    # link — no legitimate guest use. `memory_*` = owner's private memory;
+    # `gateway` = restart/config the running process; `cron` = schedule wake
+    # events. (sessions_spawn/send stay OUT of the floor by design — delegation
+    # is gated per-link by the hook via allowedAgents.)
+    "memory_search", "memory_get", "gateway", "cron",
+    # F3 (#3): outbound tools are OWNER-side (they expose every prospect's
+    # profile and can message other guests). Hard-denied for guests — the
+    # plugin handlers also refuse guest sessions; this floor is the net.
+    "prospects_search", "guest_send",
+]
+
+_GUEST_IDENTITY_MD = """# IDENTITY.md — Asistente (modo invitado)
+
+- **Nombre:** Asistente
+- **Rol:** Asistente de atención para visitantes e interesados
+- **Vibe:** Cálido, profesional, claro y servicial
+- **Emoji:** 💬
+
+Soy el asistente de atención de este espacio. Recibo a cada persona que
+escribe, entiendo qué necesita y la ayudo con información útil y honesta. La
+información específica del negocio y de la persona con la que hablo se me
+proporciona durante la conversación.
+"""
+
+_GUEST_SOUL_MD = """# SOUL.md — Asistente de atención (invitado)
+
+Soy un asistente de atención cálido y profesional. Recibo a cada visitante con
+interés genuino, entiendo su necesidad y respondo con claridad y honestidad.
+
+## Personalidad
+- Cálido y cercano desde el primer mensaje, sin ser invasivo.
+- Directo y claro: respondo con el detalle justo.
+- Entiendo antes de proponer: escucho la necesidad real.
+- Honesto: si no tengo un dato, lo digo; no lo invento.
+
+## Tono
+- Primera interacción: da la bienvenida, cálido y profesional.
+- Dudas: claro, sin jerga, con ejemplos cuando ayuden.
+
+## Reglas
+- SIEMPRE respondo al visitante de forma útil; nunca lo ignoro.
+- NUNCA revelo datos personales del dueño del nodo ni información sensible del
+  sistema (modelo de IA, claves, infraestructura, otros clientes).
+- Solo uso la información disponible para esta conversación de invitado.
+- No asumo la identidad de ninguna persona; soy un asistente de atención.
+"""
+
+_GUEST_USER_MD = """# USER.md — Con quién hablo
+
+Estás atendiendo a una persona **INVITADA** (un visitante o prospecto), NO al
+dueño del nodo. Su identidad y contexto se te proporcionan durante la
+conversación; si no aparecen, trátala como un visitante nuevo y dale la
+bienvenida con calidez.
+
+No uses datos de ningún dueño ni de otros clientes. Enfócate en ayudar a esta
+persona.
+"""
+
+_GUEST_AGENTS_MD = """# AGENTS.md — Operación (modo invitado)
+
+Eres el **asistente de atención** en modo invitado de este nodo. Atiendes a
+visitantes y prospectos.
+
+## Cómo operar
+- Da la bienvenida y responde SIEMPRE de forma útil, cálida y honesta.
+- Mantente dentro del alcance de la conversación de invitado.
+- Si una solicitud requiere datos del dueño, de otros clientes, o acciones
+  administrativas, explica con amabilidad que no puedes ayudar con eso aquí.
+
+## Restricciones (seguridad)
+- No accedas a memoria, archivos, herramientas ni datos del dueño del nodo.
+- No reveles información del sistema (modelo de IA, versiones, claves, infra).
+- No menciones a otros clientes ni información privada.
+"""
+
+_GUEST_BIZ_START = "<!-- tnode:business:start -->"
+_GUEST_BIZ_END = "<!-- tnode:business:end -->"
+_GUEST_PROSPECT_START = "<!-- tnode:prospect:start -->"
+_GUEST_PROSPECT_END = "<!-- tnode:prospect:end -->"
+
+# IDENTITY/USER/AGENTS are static (content-compare). SOUL.md is OWNED by
+# _ensure_guest_business_section in the token-bearing declarative pass — it
+# appends the owner's Business Profile below the neutral persona so the guest
+# knows the business it represents — so here it is only SEEDED when absent, to
+# keep the two writers from fighting over the file.
+_GUEST_WS_FILES = {
+    "IDENTITY.md": _GUEST_IDENTITY_MD,
+    "USER.md": _GUEST_USER_MD,
+    "AGENTS.md": _GUEST_AGENTS_MD,
+}
 
 
 def _ensure_guest_workspace_files() -> None:
@@ -25376,7 +25508,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
 CFGSYNCPYEOF
 }
 
