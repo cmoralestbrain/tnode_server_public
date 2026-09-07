@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.140.3"
+TNODE_SETUP_VERSION="1.140.4"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -31366,7 +31366,7 @@ from __future__ import annotations
 #          mtime (stat local, gratis) y mantiene sus polls de Firestore en
 #          cadencia rápida solo mientras el archivo esté fresco. Sin
 #          clientes → sin touch → chat-sync cae a backstops idle.
-__VERSION__ = "1.22.0"
+__VERSION__ = "1.22.1"
 
 import argparse
 import asyncio
@@ -31385,7 +31385,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 try:
     import websockets
