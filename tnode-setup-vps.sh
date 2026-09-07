@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.135.0"
+TNODE_SETUP_VERSION="1.136.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -11212,6 +11212,11 @@ phase_helpers() {
     # ── 5c: pair-watch ──
     install_pair_watch
 
+    # ── 5c': tnode-skill-manager (cache de skills + CLI; config-sync sólo
+    # invoca `sync`). Va ANTES de config-sync para que su primer arranque ya
+    # encuentre el cache. ──
+    install_tnode_skill_manager
+
     # ── 5d: tnode-config-sync (event-driven command executor + state
     # mirror; replaces llm-config-watcher). Runs on every node regardless
     # of provider so the Flutter app can query state/current and dispatch
@@ -12123,6 +12128,3089 @@ SVCUNIT
 }
 
 # ─────────────────────────────────────────────────────────────
+# tnode-skill-manager CLI (canonical: cmoralestbrain/skills/tnode-skill-manager/;
+# heredoc maintained by port_heredocs_cli_env.py).
+write_tnode_skill_manager_py() {
+    local dest="$1"
+    cat > "$dest" <<'SKILLMGRPYEOF'
+#!/usr/bin/env python3
+"""tnode-skill-manager — ciclo de vida de los skills TNode en el nodo.
+
+__VERSION__ = "1.0.0"
+
+Saca los skills de config-sync. Antes viajaban embebidos como constantes
+dentro del daemon (~8,000 líneas) y se materializaban en cada arranque; ahora
+viven como paquetes en un CACHE local y este CLI los reconcilia contra el
+workspace de cada agente. config-sync sólo invoca `sync`.
+
+Diseño: skills/DESIGN-skill-manager.md (P0, 2026-09-06). Esta versión cubre
+la fase P1: fuente `cache`, `state.json`, `sync/list/verify/install/enable/
+disable/uninstall/blocks/create`. La fuente `catalog` (R2 + componentsCatalog
+con punteros prod/beta) llega en P2; la colocación en `recepcion` y el
+allowlist del canal, en P3.
+
+Layout en el nodo (OPENCLAW_HOME = el dir .openclaw, como en los daemons):
+
+    <home>/tnode-skills/cache/index.json          # {skills: {name: {version, sha256, file, files{rel: sha256}}}}
+    <home>/tnode-skills/cache/<name>-<ver>.tgz    # miembros: <name>/<rel>
+    <home>/tnode-skills/state.json                # única verdad local (lo escribe SOLO este CLI)
+    <home>/tnode-skills/blocks/<agent>.json       # bloques que el compositor de config-sync incluye
+    <home>/workspace/skills/<name>/               # materialización para `main`
+    <workspace del agente>/skills/<name>/         # otros agentes (P3)
+
+Reglas:
+- Sólo stdlib. Salida SIEMPRE JSON (`ok`, `action`, `summary`), también en error.
+- Un archivo idéntico no se reescribe (sin churn de mtime); uno que derivó se
+  repara en cada `sync`. Nunca se borran archivos ajenos al paquete (datos
+  del skill viven fuera de su dir, p.ej. workspace/data/).
+- `audience` ausente en el manifest = sólo dueño (fail-closed).
+"""
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+
+__VERSION__ = "1.0.0"
+
+STATE_SCHEMA = 1
+MANIFEST_SCHEMA = 2
+AUDIENCES = ("dueño", "clientes", "ambos")
+I18N_FIELDS = ("displayName", "summary", "forClients", "whyOwnerOnly")
+DEFAULT_LOCALE = "es"
+
+
+# ── rutas ─────────────────────────────────────────────────────────
+
+def openclaw_dir() -> pathlib.Path:
+    home = os.environ.get("OPENCLAW_HOME")
+    return pathlib.Path(home) if home else pathlib.Path.home() / ".openclaw"
+
+
+def base_dir() -> pathlib.Path:
+    return openclaw_dir() / "tnode-skills"
+
+
+def cache_dir() -> pathlib.Path:
+    override = os.environ.get("TNODE_SKILLS_CACHE")
+    return pathlib.Path(override) if override else base_dir() / "cache"
+
+
+def state_path() -> pathlib.Path:
+    return base_dir() / "state.json"
+
+
+def blocks_dir() -> pathlib.Path:
+    return base_dir() / "blocks"
+
+
+def agent_workspace(agent: str) -> pathlib.Path:
+    """main → <home>/workspace. Otros agentes: `agents.entries.<id>.workspace`
+    de openclaw.json (2.0), con fallback a <home>/workspace-<id>."""
+    if agent == "main":
+        return openclaw_dir() / "workspace"
+    try:
+        cfg = json.loads((openclaw_dir() / "openclaw.json").read_text(encoding="utf-8"))
+        entries = (cfg.get("agents") or {}).get("entries") or {}
+        ws = (entries.get(agent) or {}).get("workspace")
+        if ws:
+            return pathlib.Path(ws)
+    except (OSError, ValueError):
+        pass
+    return openclaw_dir() / f"workspace-{agent}"
+
+
+def skill_dir(agent: str, name: str) -> pathlib.Path:
+    return agent_workspace(agent) / "skills" / name
+
+
+# ── salida ────────────────────────────────────────────────────────
+
+def _out(payload: dict, code: int = 0) -> None:
+    payload.setdefault("ok", code == 0)
+    payload.setdefault("version", __VERSION__)
+    print(json.dumps(payload, ensure_ascii=False, default=str))
+    sys.exit(code)
+
+
+def _die(error: str, **extra) -> None:
+    payload = {"ok": False, "error": error}
+    payload.update(extra)
+    _out(payload, 1)
+
+
+def _log(msg: str) -> None:
+    print(f"[tnode-skill-manager] {msg}", file=sys.stderr)
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_file(path: pathlib.Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ── estado ────────────────────────────────────────────────────────
+
+def load_state() -> dict:
+    p = state_path()
+    if not p.is_file():
+        return {"schema": STATE_SCHEMA, "channel": None, "skills": {}}
+    try:
+        st = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        _log(f"state.json ilegible ({e}); se regenera")
+        return {"schema": STATE_SCHEMA, "channel": None, "skills": {}}
+    st.setdefault("schema", STATE_SCHEMA)
+    st.setdefault("skills", {})
+    return st
+
+
+def save_state(st: dict) -> None:
+    p = state_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    st["updatedAt"] = _now()
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, p)
+
+
+# ── cache ─────────────────────────────────────────────────────────
+
+def load_index() -> dict:
+    p = cache_dir() / "index.json"
+    if not p.is_file():
+        return {"schema": 1, "skills": {}}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        _die(f"cache_index_invalid: {p} ({e})")
+    return {"schema": 1, "skills": {}}
+
+
+def read_package(name: str, entry: dict) -> dict:
+    """Devuelve {rel: bytes} del tgz del cache, verificando su sha256."""
+    tgz = cache_dir() / entry["file"]
+    if not tgz.is_file():
+        raise FileNotFoundError(f"package_missing: {tgz}")
+    data = tgz.read_bytes()
+    if entry.get("sha256") and _sha256_bytes(data) != entry["sha256"]:
+        raise ValueError(f"package_sha_mismatch: {tgz.name}")
+    files: dict = {}
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+        for m in tf.getmembers():
+            if not m.isfile():
+                continue
+            parts = pathlib.PurePosixPath(m.name).parts
+            if len(parts) < 2 or parts[0] != name or ".." in parts:
+                raise ValueError(f"package_bad_member: {m.name}")
+            rel = "/".join(parts[1:])
+            fh = tf.extractfile(m)
+            files[rel] = fh.read() if fh else b""
+    return files
+
+
+# ── manifest v2 ───────────────────────────────────────────────────
+
+def _i18n_ok(v) -> bool:
+    return isinstance(v, dict) and isinstance(v.get(DEFAULT_LOCALE), str) and v[DEFAULT_LOCALE].strip() != ""
+
+
+def validate_manifest(m: dict, skill_root: pathlib.Path | None = None) -> list:
+    """Errores del manifest v2 (lista vacía = válido). `skill_root` permite
+    verificar que entrypoint y lifecycle apunten a archivos reales."""
+    errs = []
+    for k in ("name", "version", "type", "entrypoint"):
+        if not isinstance(m.get(k), str) or not m[k]:
+            errs.append(f"missing:{k}")
+    for k in ("displayName", "summary"):
+        if not _i18n_ok(m.get(k)):
+            errs.append(f"i18n:{k} (objeto con '{DEFAULT_LOCALE}' obligatorio)")
+    aud = m.get("audience", "dueño")
+    if aud not in AUDIENCES:
+        errs.append(f"audience:{aud!r} no está en {AUDIENCES}")
+    if aud != "dueño" and not _i18n_ok(m.get("forClients")):
+        errs.append("forClients: obligatorio (i18n) cuando audience != dueño")
+    if m.get("needsOwnerData") and not _i18n_ok(m.get("whyOwnerOnly")):
+        errs.append("whyOwnerOnly: obligatorio (i18n) cuando needsOwnerData")
+    agents = m.get("agents") or {}
+    allowed = agents.get("allowed") or ["main"]
+    default = agents.get("default") or ["main"]
+    if not set(default) <= set(allowed):
+        errs.append("agents.default debe estar contenido en agents.allowed")
+    if aud == "dueño" and "recepcion" in allowed and not m.get("needsOwnerData") is False:
+        pass  # permitido: 'dueño' puede vivir en recepcion si el dueño lo decide en P3
+    if skill_root is not None:
+        if m.get("entrypoint") and not (skill_root / m["entrypoint"]).is_file():
+            errs.append(f"entrypoint:{m['entrypoint']} no existe")
+        for hook, cmd in ((m.get("lifecycle") or {}).items()):
+            if cmd:
+                script = str(cmd).split()[0]
+                if not (skill_root / script).is_file():
+                    errs.append(f"lifecycle.{hook}: {script} no existe")
+    return errs
+
+
+def localize(m: dict, locale: str) -> dict:
+    """Resuelve los campos i18n: locale → es → primero disponible."""
+    out = dict(m)
+    for k in I18N_FIELDS:
+        v = m.get(k)
+        if isinstance(v, dict):
+            out[k] = v.get(locale) or v.get(DEFAULT_LOCALE) or next(
+                (x for x in v.values() if isinstance(x, str)), None)
+    return out
+
+
+def read_manifest(path: pathlib.Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+# ── materialización ───────────────────────────────────────────────
+
+def materialize(dest: pathlib.Path, files: dict) -> dict:
+    """Escribe sólo lo que difiere. .py ejecutables. Devuelve conteos."""
+    written, unchanged = [], 0
+    dest.mkdir(parents=True, exist_ok=True)
+    for rel, content in files.items():
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if target.is_file() and target.read_bytes() == content:
+                unchanged += 1
+                continue
+        except OSError:
+            pass
+        target.write_bytes(content)
+        written.append(rel)
+        if rel.endswith(".py"):
+            try:
+                os.chmod(target, 0o755)
+            except OSError:
+                pass
+    return {"written": written, "unchanged": unchanged}
+
+
+def drift(dest: pathlib.Path, file_shas: dict) -> list:
+    """Archivos del paquete que faltan o cambiaron en disco."""
+    bad = []
+    for rel, sha in file_shas.items():
+        t = dest / rel
+        if not t.is_file() or _sha256_file(t) != sha:
+            bad.append(rel)
+    return bad
+
+
+def run_hook(skill_root: pathlib.Path, cmd, timeout: int = 300) -> dict | None:
+    """Corre un comando de lifecycle relativo al dir del skill. Devuelve su
+    JSON si lo hay, o {"ok": rc==0, "stdout": ...}."""
+    if not cmd:
+        return None
+    parts = str(cmd).split()
+    script = skill_root / parts[0]
+    argv = [sys.executable or "python3", str(script), *parts[1:]] if script.suffix == ".py" \
+        else [str(script), *parts[1:]]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "timeout", "cmd": cmd}
+    except OSError as e:
+        return {"ok": False, "error": str(e), "cmd": cmd}
+    raw = (proc.stdout or "").strip()
+    try:
+        payload = json.loads(raw)
+        payload.setdefault("ok", proc.returncode == 0)
+    except (TypeError, ValueError):
+        payload = {"ok": proc.returncode == 0, "stdout": raw[-400:], "stderr": (proc.stderr or "")[-400:]}
+    payload["cmd"] = cmd
+    return payload
+
+
+def _install_from_cache(name: str, entry: dict, agent: str, st: dict, *, hooks: bool) -> dict:
+    files = read_package(name, entry)
+    manifest = json.loads(files["manifest.json"].decode("utf-8")) if "manifest.json" in files else {}
+    dest = skill_dir(agent, name)
+    res = materialize(dest, files)
+    rec = st["skills"].setdefault(name, {})
+    rec.update({
+        "version": entry.get("version"), "sha256": entry.get("sha256"),
+        "source": "cache", "installedAt": rec.get("installedAt") or _now(),
+        "updatedAt": _now(),
+        "audience": manifest.get("audience", "dueño"),
+    })
+    agents = rec.setdefault("agents", {})
+    arec = agents.setdefault(agent, {"enabled": True})
+    hook_res = None
+    if hooks and (manifest.get("lifecycle") or {}).get("install"):
+        hook_res = run_hook(dest, manifest["lifecycle"]["install"])
+        arec["lastInstallHook"] = {"at": _now(), "ok": bool(hook_res and hook_res.get("ok"))}
+    return {"skill": name, "version": entry.get("version"), "agent": agent,
+            "written": res["written"], "unchanged": res["unchanged"], "hook": hook_res}
+
+
+# ── comandos ──────────────────────────────────────────────────────
+
+def cmd_sync(args):
+    """Reconcilia cache ↔ disco ↔ state para los agentes por defecto de cada
+    skill (P1: main). Idempotente; repara drift; nunca corre hooks de install
+    (eso es `install`/`enable` explícito, o el dueño desde el app)."""
+    index = load_index()
+    st = load_state()
+    installed, updated, repaired, unchanged, errors = [], [], [], [], []
+    for name, entry in sorted((index.get("skills") or {}).items()):
+        try:
+            files = read_package(name, entry)
+        except (OSError, ValueError, KeyError) as e:
+            errors.append({"skill": name, "error": str(e)})
+            continue
+        manifest = json.loads(files["manifest.json"].decode("utf-8")) if "manifest.json" in files else {}
+        rec = st["skills"].get(name) or {}
+        targets = list(((rec.get("agents") or {}).keys()) or ((manifest.get("agents") or {}).get("default") or ["main"]))
+        if args.agent:
+            targets = [args.agent]
+        for agent in targets:
+            dest = skill_dir(agent, name)
+            same_version = rec.get("version") == entry.get("version") and rec.get("sha256") == entry.get("sha256")
+            bad = drift(dest, entry.get("files") or {}) if same_version else None
+            if same_version and not bad:
+                unchanged.append(f"{name}@{agent}")
+                continue
+            res = materialize(dest, files)
+            r = st["skills"].setdefault(name, {})
+            first = not rec
+            r.update({"version": entry.get("version"), "sha256": entry.get("sha256"),
+                      "source": "cache", "installedAt": r.get("installedAt") or _now(),
+                      "updatedAt": _now(), "audience": manifest.get("audience", "dueño")})
+            r.setdefault("agents", {}).setdefault(agent, {"enabled": True})
+            tag = f"{name}@{agent}"
+            if first:
+                installed.append(tag)
+            elif same_version:
+                repaired.append({"skill": tag, "files": bad})
+            else:
+                updated.append({"skill": tag, "from": rec.get("version"), "to": entry.get("version"),
+                                "written": len(res["written"])})
+    st["cacheBuiltAt"] = index.get("builtAt")
+    save_state(st)
+    summary = ("%d instalados, %d actualizados, %d reparados, %d sin cambio"
+               % (len(installed), len(updated), len(repaired), len(unchanged)))
+    if errors:
+        summary += ", %d con error" % len(errors)
+    _out({"action": "sync", "installed": installed, "updated": updated, "repaired": repaired,
+          "unchanged": unchanged, "errors": errors, "summary": summary}, 0 if not errors else 1)
+
+
+def cmd_list(args):
+    st = load_state()
+    index = load_index()
+    rows = []
+    for name, rec in sorted(st["skills"].items()):
+        agents = rec.get("agents") or {}
+        if args.agent and args.agent not in agents:
+            continue
+        # el manifest se lee del disco (la copia viva), no del cache
+        any_agent = args.agent or next(iter(agents), "main")
+        mpath = skill_dir(any_agent, name) / "manifest.json"
+        try:
+            m = localize(read_manifest(mpath), args.locale)
+        except (OSError, ValueError):
+            m = {"name": name}
+        rows.append({
+            "name": name, "version": rec.get("version"),
+            "cacheVersion": ((index.get("skills") or {}).get(name) or {}).get("version"),
+            "displayName": m.get("displayName") or name, "summary": m.get("summary"),
+            "audience": m.get("audience", rec.get("audience", "dueño")),
+            "forClients": m.get("forClients"), "needsOwnerData": bool(m.get("needsOwnerData")),
+            "whyOwnerOnly": m.get("whyOwnerOnly"),
+            "allowedAgents": ((m.get("agents") or {}).get("allowed")) or ["main"],
+            "agents": agents, "status": m.get("status", "active"),
+        })
+    _out({"action": "list", "locale": args.locale, "skills": rows,
+          "summary": "%d skills" % len(rows)})
+
+
+def cmd_verify(args):
+    """Sin --repo: valida cache (index + tgz + sha), state y manifests vivos.
+    Con --repo <dir>: valida los manifests v2 del repo skills (gate de CI)."""
+    problems, checked = [], []
+    if args.repo:
+        root = pathlib.Path(args.repo)
+        for mpath in sorted(root.glob("*/manifest.json")):
+            sdir = mpath.parent
+            try:
+                m = read_manifest(mpath)
+            except ValueError as e:
+                problems.append({"skill": sdir.name, "errors": [f"json:{e}"]})
+                continue
+            errs = validate_manifest(m, sdir)
+            if m.get("name") != sdir.name:
+                errs.append(f"name:{m.get('name')!r} != dir {sdir.name!r}")
+            checked.append(sdir.name)
+            if errs:
+                problems.append({"skill": sdir.name, "errors": errs})
+    else:
+        index = load_index()
+        st = load_state()
+        for name, entry in sorted((index.get("skills") or {}).items()):
+            errs = []
+            try:
+                files = read_package(name, entry)
+                m = json.loads(files.get("manifest.json", b"{}").decode("utf-8"))
+                errs += validate_manifest(m)
+                if m.get("version") != entry.get("version"):
+                    errs.append(f"version: manifest {m.get('version')} != index {entry.get('version')}")
+            except (OSError, ValueError, KeyError) as e:
+                errs.append(str(e))
+            rec = st["skills"].get(name)
+            if rec:
+                for agent in (rec.get("agents") or {}):
+                    bad = drift(skill_dir(agent, name), entry.get("files") or {})
+                    if bad:
+                        errs.append(f"drift@{agent}: {', '.join(bad[:5])}")
+            checked.append(name)
+            if errs:
+                problems.append({"skill": name, "errors": errs})
+        for name in st["skills"]:
+            if name not in (index.get("skills") or {}):
+                problems.append({"skill": name, "errors": ["en state pero no en cache"]})
+    _out({"action": "verify", "checked": checked, "problems": problems,
+          "summary": "%d verificados, %d con problemas" % (len(checked), len(problems))},
+         0 if not problems else 1)
+
+
+def cmd_install(args):
+    name, _, ver = args.skill.partition("@")
+    st = load_state()
+    if args.source and args.source not in ("cache",):
+        # directorio local (P4: Taller de Skills)
+        src = pathlib.Path(args.source)
+        if not (src / "manifest.json").is_file():
+            _die(f"source_invalid: {src} sin manifest.json")
+        m = read_manifest(src / "manifest.json")
+        errs = validate_manifest(m, src)
+        if errs:
+            _die("manifest_invalid", errors=errs)
+        files = {}
+        for p in src.rglob("*"):
+            if p.is_file() and "__pycache__" not in p.parts and p.name != ".DS_Store":
+                files[str(p.relative_to(src).as_posix())] = p.read_bytes()
+        dest = skill_dir(args.agent, name)
+        res = materialize(dest, files)
+        rec = st["skills"].setdefault(name, {})
+        rec.update({"version": m.get("version"), "sha256": None, "source": str(src),
+                    "installedAt": rec.get("installedAt") or _now(), "updatedAt": _now(),
+                    "audience": m.get("audience", "dueño")})
+        rec.setdefault("agents", {}).setdefault(args.agent, {"enabled": True})
+        hook = run_hook(dest, (m.get("lifecycle") or {}).get("install")) if not args.no_hooks else None
+        save_state(st)
+        _out({"action": "install", "skill": name, "agent": args.agent, "version": m.get("version"),
+              "written": res["written"], "hook": hook, "summary": f"{name} instalado en {args.agent} desde {src}"})
+    index = load_index()
+    entry = (index.get("skills") or {}).get(name)
+    if not entry:
+        _die(f"skill_not_in_cache: {name}", available=sorted((index.get("skills") or {}).keys()))
+    if ver and ver != entry.get("version"):
+        _die(f"version_not_in_cache: {name}@{ver}", cached=entry.get("version"),
+             hint="la fuente `catalog` (P2) permitirá versiones específicas")
+    try:
+        files = read_package(name, entry)
+        m = json.loads(files.get("manifest.json", b"{}").decode("utf-8"))
+    except (OSError, ValueError, KeyError) as e:
+        _die(str(e))
+    allowed = (m.get("agents") or {}).get("allowed") or ["main"]
+    if args.agent not in allowed and not args.force:
+        _die(f"agent_not_allowed: {name} sólo puede vivir en {allowed}",
+             hint="usa --force si de verdad lo quieres ahí")
+    res = _install_from_cache(name, entry, args.agent, st, hooks=not args.no_hooks)
+    save_state(st)
+    res.update({"action": "install", "summary": f"{name} {entry.get('version')} instalado en {args.agent}"})
+    _out(res)
+
+
+def _toggle(args, enabled: bool):
+    st = load_state()
+    rec = st["skills"].get(args.skill)
+    if not rec or args.agent not in (rec.get("agents") or {}):
+        _die(f"not_installed: {args.skill} en {args.agent}")
+    rec["agents"][args.agent]["enabled"] = enabled
+    rec["updatedAt"] = _now()
+    dest = skill_dir(args.agent, args.skill)
+    hook = None
+    try:
+        m = read_manifest(dest / "manifest.json")
+        hook = run_hook(dest, (m.get("lifecycle") or {}).get("enable" if enabled else "disable"))
+    except (OSError, ValueError):
+        pass
+    save_state(st)
+    _out({"action": "enable" if enabled else "disable", "skill": args.skill, "agent": args.agent,
+          "hook": hook, "summary": f"{args.skill} {'habilitado' if enabled else 'deshabilitado'} en {args.agent}"})
+
+
+def cmd_enable(args):
+    _toggle(args, True)
+
+
+def cmd_disable(args):
+    _toggle(args, False)
+
+
+def cmd_uninstall(args):
+    st = load_state()
+    rec = st["skills"].get(args.skill)
+    if not rec:
+        _die(f"not_installed: {args.skill}")
+    agents = [args.agent] if args.agent else list((rec.get("agents") or {}).keys())
+    results = []
+    for agent in agents:
+        dest = skill_dir(agent, args.skill)
+        hook = None
+        try:
+            m = read_manifest(dest / "manifest.json")
+            cmd = (m.get("lifecycle") or {}).get("uninstall")
+            if cmd and args.purge:
+                cmd = cmd + " --purge"
+            hook = run_hook(dest, cmd)
+        except (OSError, ValueError):
+            pass
+        if dest.is_dir():
+            shutil.rmtree(dest, ignore_errors=True)
+        (rec.get("agents") or {}).pop(agent, None)
+        results.append({"agent": agent, "hook": hook})
+    if not rec.get("agents"):
+        st["skills"].pop(args.skill, None)
+    save_state(st)
+    _out({"action": "uninstall", "skill": args.skill, "agents": results,
+          "summary": f"{args.skill} retirado de {', '.join(agents)}"})
+
+
+def cmd_blocks(args):
+    """Bloques declarativos para el compositor de config-sync (§5). P1: sólo
+    los skills que traen `blocks.tools` (archivo en su dir) y están
+    habilitados en ese agente. Se escribe también a blocks/<agent>.json."""
+    st = load_state()
+    blocks = []
+    order = 300
+    for name, rec in sorted(st["skills"].items()):
+        arec = (rec.get("agents") or {}).get(args.agent)
+        if not arec or not arec.get("enabled", True):
+            continue
+        dest = skill_dir(args.agent, name)
+        try:
+            m = read_manifest(dest / "manifest.json")
+        except (OSError, ValueError):
+            continue
+        rel = (m.get("blocks") or {}).get("tools")
+        if not rel:
+            continue
+        cand = [dest / rel.replace(".md", f".{args.agent}.md"), dest / rel]
+        src = next((c for c in cand if c.is_file()), None)
+        if not src:
+            continue
+        text = src.read_text(encoding="utf-8").strip()
+        if f"<!-- {name}:begin -->" not in text:
+            text = f"<!-- {name}:begin -->\n{text}\n<!-- {name}:end -->"
+        blocks.append({"id": f"skill:{name}", "order": order, "text": text})
+        order += 10
+    doc = {"schema": 1, "target": "TOOLS.md", "agent": args.agent, "blocks": blocks, "generatedAt": _now()}
+    blocks_dir().mkdir(parents=True, exist_ok=True)
+    (blocks_dir() / f"{args.agent}.json").write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _out({"action": "blocks", **doc, "summary": "%d bloques para %s" % (len(blocks), args.agent)})
+
+
+def cmd_create(args):
+    """Scaffold de manifest v2 (P4: lo usa el Taller de Skills)."""
+    dest = pathlib.Path(args.dir)
+    name = args.name or dest.name
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,48}", name):
+        _die(f"invalid_name: {name!r} (minúsculas, dígitos y guiones)")
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "bin").mkdir(exist_ok=True)
+    manifest = {
+        "name": name, "version": "0.1.0", "type": "openclaw-skill", "entrypoint": "SKILL.md",
+        "manifestSchema": MANIFEST_SCHEMA,
+        "displayName": {"es": args.display_es or name, "en": args.display_en or args.display_es or name},
+        "summary": {"es": args.summary_es or "", "en": args.summary_en or args.summary_es or ""},
+        "audience": args.audience, "forClients": None, "needsOwnerData": False, "whyOwnerOnly": None,
+        "agents": {"default": ["main"], "allowed": ["main", "recepcion"] if args.audience != "dueño" else ["main"]},
+        "tools": ["exec"], "lifecycle": {"install": None, "uninstall": None, "enable": None, "disable": None},
+        "blocks": {"tools": None, "soul": None}, "crons": [], "secrets": [], "requires": {},
+    }
+    if args.audience != "dueño":
+        manifest["forClients"] = {"es": args.for_clients_es or "", "en": args.for_clients_en or args.for_clients_es or ""}
+    mpath = dest / "manifest.json"
+    if mpath.exists() and not args.force:
+        _die(f"exists: {mpath}", hint="--force para sobrescribir")
+    mpath.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    skill_md = dest / "SKILL.md"
+    if not skill_md.exists():
+        skill_md.write_text(f"---\nname: {name}\ndescription: {manifest['summary']['es']}\n---\n\n# {name}\n\nCuándo usarlo, cómo invocarlo, reglas de respuesta.\n", encoding="utf-8")
+    _out({"action": "create", "dir": str(dest), "manifest": manifest,
+          "summary": f"{name} creado en {dest}; completa SKILL.md y bin/"})
+
+
+def cmd_version(args):
+    _out({"action": "version", "summary": __VERSION__, "cache": str(cache_dir()), "state": str(state_path())})
+
+
+# ── main ──────────────────────────────────────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser(prog="tnode-skill-manager")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("version").set_defaults(fn=cmd_version)
+
+    p = sub.add_parser("sync", help="reconcilia cache ↔ disco ↔ state")
+    p.add_argument("--agent", default=None, help="sólo ese agente (default: los del state / manifest)")
+    p.set_defaults(fn=cmd_sync)
+
+    p = sub.add_parser("list")
+    p.add_argument("--agent", default=None)
+    p.add_argument("--locale", default=os.environ.get("TNODE_LOCALE", DEFAULT_LOCALE))
+    p.add_argument("--json", action="store_true", help="(siempre JSON; por compatibilidad)")
+    p.set_defaults(fn=cmd_list)
+
+    p = sub.add_parser("verify")
+    p.add_argument("--repo", default=None, help="valida manifests v2 de un repo skills (CI)")
+    p.set_defaults(fn=cmd_verify)
+
+    p = sub.add_parser("install")
+    p.add_argument("skill", help="<name>[@version]")
+    p.add_argument("--agent", default="main")
+    p.add_argument("--from", dest="source", default="cache", help="cache | <dir>")
+    p.add_argument("--no-hooks", action="store_true")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_install)
+
+    for cmd_name, fn in (("enable", cmd_enable), ("disable", cmd_disable)):
+        p = sub.add_parser(cmd_name)
+        p.add_argument("skill")
+        p.add_argument("--agent", default="main")
+        p.set_defaults(fn=fn)
+
+    p = sub.add_parser("uninstall")
+    p.add_argument("skill")
+    p.add_argument("--agent", default=None, help="default: todos los agentes donde vive")
+    p.add_argument("--purge", action="store_true")
+    p.set_defaults(fn=cmd_uninstall)
+
+    p = sub.add_parser("blocks")
+    p.add_argument("--agent", default="main")
+    p.set_defaults(fn=cmd_blocks)
+
+    p = sub.add_parser("create")
+    p.add_argument("dir")
+    p.add_argument("--name", default=None)
+    p.add_argument("--audience", default="dueño", choices=AUDIENCES)
+    p.add_argument("--display-es", default=None)
+    p.add_argument("--display-en", default=None)
+    p.add_argument("--summary-es", default=None)
+    p.add_argument("--summary-en", default=None)
+    p.add_argument("--for-clients-es", default=None)
+    p.add_argument("--for-clients-en", default=None)
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_create)
+
+    args = ap.parse_args()
+    try:
+        args.fn(args)
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001 — la salida SIEMPRE es JSON
+        _die(f"{type(e).__name__}: {e}"[:400], action=args.cmd)
+
+
+if __name__ == "__main__":
+    main()
+SKILLMGRPYEOF
+}
+
+# >>> BEGIN SKILLS CACHE (generated by build_skills_cache.py — do not edit by hand)
+# Cache de skills TNode: un tgz determinista por skill + index.json, en
+# base64. Lo desempaca install_tnode_skill_manager() en
+# $OPENCLAW_HOME/tnode-skills/cache/ y `tnode-skill-manager sync` lo
+# materializa en el workspace de cada agente en cada arranque de
+# config-sync (DESIGN-skill-manager.md P1). Antes los skills viajaban como
+# constantes dentro de tnode-config-sync.
+# skills-cache-sha256: b66ad9a8b4696e638fcb5d69ae85da2b76964f588db4c40f1212632379cc1a35
+_skills_cache_b64() {
+cat <<'SKILLS_CACHE_B64_EOF'
+aW5kZXguanNvbgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADAwMDA2NDQAMDAwMDAw
+MAAwMDAwMDAwADAwMDAwMDEyNTA1ADAwMDAwMDAwMDAwADAwNzc1MgAgMAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB1c3RhcgAwMAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB7
+CiAgInNjaGVtYSI6IDEsCiAgImJ1aWx0QXQiOiAiY2FjaGUtNzliM2EyNjcwMDIzIiwKICAic2tp
+bGxzIjogewogICAgInRub2RlLWFnZW5kYSI6IHsKICAgICAgInZlcnNpb24iOiAiMS4wLjAiLAog
+ICAgICAiZmlsZSI6ICJ0bm9kZS1hZ2VuZGEtMS4wLjAudGd6IiwKICAgICAgInNoYTI1NiI6ICI3
+Y2IzZWFiYmFkMzAyNjc0MTcxODk0YmM3ZDlkMzYzNzQwYzE0NDE2YWU5MDBlNzA2NDk2YjZmMGI4
+YmZhYWU4IiwKICAgICAgImF1ZGllbmNlIjogImFtYm9zIiwKICAgICAgImZpbGVzIjogewogICAg
+ICAgICJTS0lMTC5tZCI6ICJlNWJiZTFiOWVjNTE3MDBkZWJmMGZhYzMzMGU2OTNjNTVkNjJlYjA3
+OGE4MTAyNzU0N2I1OGRlYTJkNzg2NTJmIiwKICAgICAgICAiYmluL2FnZW5kYS5weSI6ICJhNWFi
+MWY5MzU0ZWY2OGM2YjlkMjllNTNjZGRlNjA2MWE0MDA3YmU4MDM1ZGQ3ODMyOGFkYzQ5OWVjZGYw
+ODNiIiwKICAgICAgICAibWFuaWZlc3QuanNvbiI6ICI2Y2ZjM2Y5MDQ1Y2FhMGE0Yzg1ZjU1MTZi
+OTYzY2RhMWNhNTBkZDJmZmM1ODE2OWJlOTg0MDQ4MTgxYWFlMGVlIgogICAgICB9CiAgICB9LAog
+ICAgInRub2RlLWRyaXZlIjogewogICAgICAidmVyc2lvbiI6ICIxLjAuMCIsCiAgICAgICJmaWxl
+IjogInRub2RlLWRyaXZlLTEuMC4wLnRneiIsCiAgICAgICJzaGEyNTYiOiAiNTU2YjU4ZWQyNDU5
+ZGNhMWRlNGIwN2U4NzNlMmZmM2ExOTE3ZTY0NGQ3MTdmNmFhZmM2ZjNmNWVhNTU1MmQzMiIsCiAg
+ICAgICJhdWRpZW5jZSI6ICJkdWXDsW8iLAogICAgICAiZmlsZXMiOiB7CiAgICAgICAgIlNLSUxM
+Lm1kIjogImMyYWQ4MzM3MGQzNzA0MjBiNzE2Mzc3OWM3ZmVmMTA0NjNkYjNhZTU0NmNiYjM4NzQz
+NzAwNGUxNzhiMTM4MmMiLAogICAgICAgICJiaW4vZHJpdmUucHkiOiAiMWRjZjFjMGNkMjY1OGRj
+YWFhZjdmYjIxODMxMTRjN2EzYTVmYTljMDY1MWMxZjU2YTExNzM3MTgzYzM5Y2VlYiIsCiAgICAg
+ICAgIm1hbmlmZXN0Lmpzb24iOiAiNmJjYzIyMjhhNzYwNjAzMDc1YWY4YTg2MWQzNGRkMmQ3YjRj
+ZjkwZDI1MDZlMzY1MjkyZjA1NTMwNWEzZDI1NCIKICAgICAgfQogICAgfSwKICAgICJ0bm9kZS1w
+b2xsIjogewogICAgICAidmVyc2lvbiI6ICIxLjEuMCIsCiAgICAgICJmaWxlIjogInRub2RlLXBv
+bGwtMS4xLjAudGd6IiwKICAgICAgInNoYTI1NiI6ICJjNDc0MjBjYWJjNDhlMzkyNjJmY2NiYmFm
+NTIzZjFiMGU3YTUzYjg5OWQ1MWE2MDAxNjE5YzYzYTliMGQ4NzFlIiwKICAgICAgImF1ZGllbmNl
+IjogImFtYm9zIiwKICAgICAgImZpbGVzIjogewogICAgICAgICJTS0lMTC5tZCI6ICI2M2Q4NjQy
+OTJkODI0ODEyZThhYTQ1MDgzZjRjYjJmYzY1MGMwNDJjNDgzZTNjYzc2YzNiNGExYzBiY2M2NGMz
+IiwKICAgICAgICAiYmluL3BvbGwucHkiOiAiOTc2ODAyZTIwZTA3YzEyOWM3ZTA1N2Y5NDk3MTdj
+ZTM3MGQwODVjYjk1M2FjMTM3MjUxOTE1ODNiNmVmMWE0MCIsCiAgICAgICAgIm1hbmlmZXN0Lmpz
+b24iOiAiMWYzMGNlNGIxYmIyNzk0ZGQ2MDRkODMwMWIxZjc4M2Q1MDYxY2U5NjcyZDVhMjlhZGNi
+MmM2YmI4YzRjM2JmMSIKICAgICAgfQogICAgfSwKICAgICJ0bm9kZS1kZWxlZ2F0ZSI6IHsKICAg
+ICAgInZlcnNpb24iOiAiMS4wLjAiLAogICAgICAiZmlsZSI6ICJ0bm9kZS1kZWxlZ2F0ZS0xLjAu
+MC50Z3oiLAogICAgICAic2hhMjU2IjogImMzOWE5N2UxNzFiMGNjZGI2MDM0OGQwMDY4OGVhZWM0
+ZjVhZGYxNWZlN2JlMzM4YTU0MWRjYzhhMTIzZTNhOGEiLAogICAgICAiYXVkaWVuY2UiOiAiZHVl
+w7FvIiwKICAgICAgImZpbGVzIjogewogICAgICAgICJTS0lMTC5tZCI6ICIzZDQ1ZTc1ODU5YWJl
+Zjc0NmI0MDlmYjU4ZWZhZWU5YWI3NTRjMWJkNjRkOTIyNWM4ZTFhOWIxMjZkNWE2YWZhIiwKICAg
+ICAgICAiYmluL3Rub2RlLWRlbGVnYXRlLnB5IjogImNjOTYxOGIxZWY3ZGU1YjRlNzY0MTIwZTk0
+OGNmYzQzNTIyYWEwMWVkZjc5NmIxYjE2OTdmMDNkNWQzYzUxYzEiLAogICAgICAgICJtYW5pZmVz
+dC5qc29uIjogImY1MjQ0OWMwNzJhYzZmN2I4NGU2NzFmZmZlOTY1ZGRlYzFlMzUxZTRjMWYzOTc4
+OTQwMGQwYjQ3MzljOGFkMWUiCiAgICAgIH0KICAgIH0sCiAgICAidG5vZGUtaW52ZW50YXJpbyI6
+IHsKICAgICAgInZlcnNpb24iOiAiMS4wLjAiLAogICAgICAiZmlsZSI6ICJ0bm9kZS1pbnZlbnRh
+cmlvLTEuMC4wLnRneiIsCiAgICAgICJzaGEyNTYiOiAiNTg5YzhhMWJhNGU1YjhjNjljYmY1YTFl
+ZDIxYzFmMzdmMThiODQ5MmZhZWJhZDQ3NTlkM2E4YWFlZGE1NDJmYSIsCiAgICAgICJhdWRpZW5j
+ZSI6ICJkdWXDsW8iLAogICAgICAiZmlsZXMiOiB7CiAgICAgICAgIlNLSUxMLm1kIjogIjlkNzE4
+MGE5NTlkZmEzMWY3NjE1ZjA2NTNhYzhlZmZiMjhiNTRlNjlkYjk3M2E0OTg5ZWMxNGFhNDFlYTg3
+YjUiLAogICAgICAgICJiaW4vaW52ZW50YXJpby5weSI6ICIxNjY0YWMzMzY1ZjNlYzBmZWM1MWZi
+MWZlZjQwNDNmZjdiNzA5NzYwM2ZkOWZiMWQ3NDk3ZmVmZjk1MzlhMzhkIiwKICAgICAgICAibWFu
+aWZlc3QuanNvbiI6ICJmYmZmNTE4MmE1MmEyMmJmMWJjYjJmMjg4NTgxMWIxZTc0OWM1ZTQyMzNh
+MjI0MmI2Nzk0ZjJjNTBmNDVlZTgwIgogICAgICB9CiAgICB9LAogICAgInRub2RlLWF3bWYiOiB7
+CiAgICAgICJ2ZXJzaW9uIjogIjEuMC4wIiwKICAgICAgImZpbGUiOiAidG5vZGUtYXdtZi0xLjAu
+MC50Z3oiLAogICAgICAic2hhMjU2IjogIjIyZTg1YTg1YWRlZTE0MTcyNmU0NWU2ZTFlMjAwNzE1
+YmI3ZTYxMTA0ZTUxYjUyMjNkZTIwMGY5ZTJjYmJkOTEiLAogICAgICAiYXVkaWVuY2UiOiAiZHVl
+w7FvIiwKICAgICAgImZpbGVzIjogewogICAgICAgICJTS0lMTC5tZCI6ICI0MzY4MGQxY2Y3M2U0
+ZGIwYTgzYmFkNThhNjBiZGY1OTcxZjMxN2I2ZTg2ZWI0YTA4MzJkNGVhMTIwZGQ0Yjk1IiwKICAg
+ICAgICAiYmluL2F3bWYucHkiOiAiYjczYTc2NDU4MTEzNmVkOWE1OWE1NzcyMjE5NDA2MmZjMDVh
+NDBjNTFhMWQxYWJjNzE3MzVkODJiMjNkMmZiYyIsCiAgICAgICAgIm1hbmlmZXN0Lmpzb24iOiAi
+MGExM2UwMGQ4MjEyNmQzYmZjMjYxYjgzMjA2YWVmZDQ0NDk1ZGQ4MjhjZTMzZWRmY2M3Njk0ZTEz
+ODM3Yjc2ZCIKICAgICAgfQogICAgfSwKICAgICJ0bm9kZS1hMmEiOiB7CiAgICAgICJ2ZXJzaW9u
+IjogIjIuMy4wIiwKICAgICAgImZpbGUiOiAidG5vZGUtYTJhLTIuMy4wLnRneiIsCiAgICAgICJz
+aGEyNTYiOiAiZGUxODRjNWZhODM1Y2JhMmI5MDVlNmYwMzVlNDkwZTA4NjViNjRhN2YwNGYzNjkw
+ZTMyZjJjMzg4N2QzZDZkYSIsCiAgICAgICJhdWRpZW5jZSI6ICJkdWXDsW8iLAogICAgICAiZmls
+ZXMiOiB7CiAgICAgICAgIlNLSUxMLm1kIjogImFiZTc3NjQ0MTI5NmM2MDhkYmU2YzJkOWQ5YmUx
+YTIzNDkwYmZmYjI4YjA1YWNkMWM4Yzg1NWZjOWJiNzMyNTUiLAogICAgICAgICJiaW4vdG5vZGUt
+YTJhLnB5IjogIjRjOGJiMjYyNDU0MzQyYzkxMTVhM2E3MmZiY2RlZjQ5NzFhNzMxNzIxZDg5YWNl
+MjFmYTJlY2YwOWE3MDhhY2YiLAogICAgICAgICJtYW5pZmVzdC5qc29uIjogImMxN2U4YTI5ZGUz
+Y2YwYTE2OTE0ODdhYjhlNmQyNTZlNmVkNTkxNDIyNGJhZGRjZTNjZjMxODcxMmM2YWE0ZjEiCiAg
+ICAgIH0KICAgIH0sCiAgICAidG5vZGUtYmV0IjogewogICAgICAidmVyc2lvbiI6ICIxLjE2LjAi
+LAogICAgICAiZmlsZSI6ICJ0bm9kZS1iZXQtMS4xNi4wLnRneiIsCiAgICAgICJzaGEyNTYiOiAi
+MTRlNTEzYTg4YjMxOGU4YmU4ODU2YjljNmEyZjllNTIyMDE0NmY3MGVmYWQyZDA0OTI3YjQ1NDdm
+OTViZDcwYyIsCiAgICAgICJhdWRpZW5jZSI6ICJkdWXDsW8iLAogICAgICAiZmlsZXMiOiB7CiAg
+ICAgICAgIlNLSUxMLm1kIjogImFhYWM1ZTIyZWM4N2U4ZTliMWU4ZTcxMWVkZmUxMzk3MThiMWEw
+OGEyNjkyYWNhZjQ5NzhmNGFjM2RjNmNkZDciLAogICAgICAgICJiaW4vYXBpc3BvcnRzLnB5Ijog
+Ijg2Y2UwNzhmNDY2OGE3MDY0MTA0MGQ1YWYyNTg3ZWQ1ODkxZjA5NzI0NGVjYjdmZjg5ZTliZWMz
+Y2JlNWY1NmIiLAogICAgICAgICJiaW4vYmFja2ZpbGwucHkiOiAiMGQ3MTNjY2MwNTA4MDFlYjY2
+ZTJjZTY5ZjlhMWJiMDE0MmRlM2NiOTlkMGEyYzdjODAwMGNhZjliMmIxY2MzYiIsCiAgICAgICAg
+ImJpbi9iZXQucHkiOiAiNDE3YjAzZThjZmJmN2QzOGVlN2FhYmUxMmJhOWVhOTQyZWEzNDI1NTEy
+NmJlMzhiOTZkZTZiZjUxZTUyMTg2ZiIsCiAgICAgICAgImJpbi9kYi5weSI6ICI0N2E2ODczODQ0
+YzA0MmMyYzNhMGQzYzI1MWNiZmQyMThmZGMwNzMwODEwMjQ1MzE0MjYxYTA1YTEwZDIzZjgxIiwK
+ICAgICAgICAiYmluL21vZGVscy5weSI6ICJlZjNkZDY2ZmE2Mjc4MDlkZGExMmNmMDIwMmYzZDBh
+YWY0OTUxMTIxMDFhNTJiOWVhNmJkOGYxNWEwODFkMGZjIiwKICAgICAgICAiYmluL3ZhbHVlLnB5
+IjogImNiZTI1OWEyMGZlYTAyMmFmZTM2NWRkY2M5YjdiOTJlMGMwMjA4ODdlZDVkMzg0N2FkMzUw
+OTY3OTUxMzg2YjQiLAogICAgICAgICJtYW5pZmVzdC5qc29uIjogImE5ZmUzZWU2Y2MxNTY2MWY3
+MGE3NTgyNDc0NmViMzFhYzhmNzgwNjljZjlmOGIxYzE0MGRiODM0YzlmNWMzOGMiLAogICAgICAg
+ICJtaWdyYXRpb25zLzAwMl9udWxsX2xpbmVfdW5pcXVlLnNxbCI6ICIxYjZjMWJhZTQxYTE3M2Yy
+OGRkZmNhNjFjMWE3NjdjOGQ0NWQ5YTNjNGZkNzAyYmVkZmY0ZjcxOGRhMjlkZGFkIiwKICAgICAg
+ICAibWlncmF0aW9ucy8wMDNfc3RhdHVzX3NuYXBzaG90LnNxbCI6ICI2MmIwYjdiODRkYjhmZThh
+MzVkYzQ1N2JkNjI4ZDY2NTliNjBjYzFhNjVhNDMwYmMwYmE4ZjA3YjVhNjc5MmUyIiwKICAgICAg
+ICAibWlncmF0aW9ucy8wMDRfdmVyaWZpZWRfcHJvdmlkZXJfaWRzLnNxbCI6ICJkM2UyMTQyYmQ1
+OGNlMDBkNTZmYTUwNTRjYmQ5ZDQ4NzI0OWI5ZWY2ZTI4OWUyNThjZjkzMDlhM2FlZGZiZWFiIiwK
+ICAgICAgICAibWlncmF0aW9ucy8wMDVfdHJhY2tfcmVjb3JkX25hbWVzLnNxbCI6ICI3MWI3ZWQ1
+ODg3OWNjMzYwNmUwZjdjYzY1MWViNmQ4MGViZDJmZjZkMGI2MGJjMDU0MDVkMWU0ZTU0NGZmZDdh
+IiwKICAgICAgICAibWlncmF0aW9ucy8wMDZfbm90aWZpZWRfcGlja3Muc3FsIjogImQ5NzE3NTBm
+OTdhZTlmNzdhOTYwNjM4ZjBlMTkyNzMzNjQwYjJiOGI1OWIyZDU3Nzg2YzdkODQ1MzI0ZTEzZTEi
+LAogICAgICAgICJtaWdyYXRpb25zLzAwN19vbmVfcGlja19vbmVfcm93LnNxbCI6ICJjNzljMzNh
+Y2QwMmM5MmI0MzIzMDJhNWI4NTE3ZDRmM2RjZTI2NjUzOTFhNjM1NWJmNDMyZDI3OTY3OGQ1Yzcx
+IiwKICAgICAgICAic2NoZW1hLnNxbCI6ICI5MjhmNmYxM2M1NTU0MzdkMzllZDFmZjhiZGYwNDJl
+ZTBlY2U3YmU2N2FjNDNjMmJmOTYyM2E4NTlmYWI3NTA5IiwKICAgICAgICAic2VlZC5zcWwiOiAi
+MWE2MDVkNmQ3MjA5ZDcyYzk1MDIzYzczNTE0NzI2ZTk2YWRmZjk4Zjk4MjYyMWI3OTZjYmE5YTNl
+Y2EwMGNjZCIKICAgICAgfQogICAgfQogIH0KfQoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAdG5vZGUtYTJhLTIu
+My4wLnRnegAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADAwMDA2NDQAMDAwMDAwMAAwMDAwMDAwADAw
+MDAwMDI0NzI2ADAwMDAwMDAwMDAwADAxMDcxNgAgMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+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
+tTHqWmb9KN1llG5BL0/p5p46bbW9VNz8VfOI8vD1gDJsIp9u8anRUAhP7rwPRbzBE569hEm/vD+9
+VOM7YdBg3te1t/iJU6W9CnmAyoiAgLYatSWExwYps4Vx3hg4tLJyAj5WlwLvsuZnAFCqPdo2KYed
+RFEg80k2cZWmKCg2SjwxuhwFJT1T9WwQlDhEDbWwdVioC9TVMShvaTBH4ziIIKRimwyt0koZpUF9
+2SiOQoW9xlcKuoRQGjAxVQHWKzLnvA+1ULXeqjV/eHPr4Xl4Hp6H5+F5eB6eh+fheXgenk95/g9y
+dw+DAFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AHRub2RlLWJldC0xLjE2LjAudGd6AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwMDAwNjQ0ADAwMDAw
+MDAAMDAwMDAwMAAwMDAwMDIyMDQzMgAwMDAwMDAwMDAwMAAwMTExMDAAIDAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAdXN0YXIAMDAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+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
+bLd1ELJOQLndNs9fa18dT6Shy9Mzj9e1j4hk5jiFXhmViQdoRn6FbHJ+vdLNdQaSjmFJ0JVu3F/q
+Aw5RucZN6ufaV8vySGYkzuvcWPw3C0fDrIoejHJ+wUuOynA7EtxWj4VWwzJGNBpbKDtqWenCM/dn
+4i/77u/d37u/d39/Ln//H7YShzEAOAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB0bm9kZS1kZWxlZ2F0ZS0xLjAuMC50Z3oAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAMDAwMDY0NAAwMDAwMDAwADAwMDAwMDAAMDAwMDAwMTM1MDUAMDAwMDAwMDAw
+MDAAMDEyMDEyACAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHVz
+dGFyADAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB+LCAAAAAAAAv/tW0tz28aWzpq/ooNMlUBFBPWwc2eY
+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
+OWo1/erqYq5fHGUJWT6rksRIPeuKVlcEGLB9jEvoaS696m7AhR3klf6GvjvJIrtLd8264qnXNRIi
+SSSqWeeKaxHSFM3YRc4V4TxMWnEVZ4qs3pIYg1W2cljo+9buGIK1NdiIMUlk+KqltRWrtVLJKlle
+FhYmH50ZeU2n3hqoKzbN2KywYHwSXoiUPLLp3DoPeuqpp5566qmnnnrqqaeeeuqpp5566qmnnnrq
+qaeeeuqpp5566qmnnnrqqaeeeuqpp54ePPgXHAsDSABQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==
+SKILLS_CACHE_B64_EOF
+}
+
+install_tnode_skill_manager() {
+    local DEST_SCRIPTS="$OPENCLAW_HOME/scripts"
+    local CACHE_DIR="$OPENCLAW_HOME/tnode-skills/cache"
+    mkdir -p "$DEST_SCRIPTS" "$CACHE_DIR"
+    write_tnode_skill_manager_py "$DEST_SCRIPTS/tnode_skill_manager.py"
+    chmod +x "$DEST_SCRIPTS/tnode_skill_manager.py"
+    if ! _skills_cache_b64 | base64 -d | tar x -C "$CACHE_DIR" 2>/dev/null; then
+        warn "tnode-skill-manager: no se pudo desempacar el cache de skills"
+        return 0
+    fi
+    chown -R "$TNODE_USER":"$TNODE_USER" "$OPENCLAW_HOME/tnode-skills" "$DEST_SCRIPTS/tnode_skill_manager.py" 2>/dev/null || true
+    success "tnode-skill-manager → $DEST_SCRIPTS/tnode_skill_manager.py + cache ($(ls "$CACHE_DIR" | grep -c .tgz) skills)"
+    # Primera materialización (best-effort): config-sync la repite en cada arranque.
+    if [[ -d "$OPENCLAW_HOME/workspace" ]]; then
+        run_as_tnode env OPENCLAW_HOME="$OPENCLAW_HOME" python3 "$DEST_SCRIPTS/tnode_skill_manager.py" sync >/dev/null 2>&1 \
+            && success "tnode-skill-manager: skills materializados en workspace/" \
+            || warn "tnode-skill-manager: sync inicial falló (config-sync reintenta al arrancar)"
+    fi
+}
+# <<< END SKILLS CACHE
+
 # tnode-config-sync: event-driven replacement for llm-config-watcher.
 # Subscribes to users/{uid}/nodes/{nodeId}/commands via a Firebase
 # custom token (scope=sync_admin) and executes them on-demand
@@ -12614,7 +15702,119 @@ from __future__ import annotations
 #          + FIX _guest_agent_present leia agents.list legacy — en 2.0
 #          nativo devolvia False siempre y el startup self-heal quedaba
 #          en retry-loop infinito (~3s) desde el nacimiento del nodo.
-__VERSION__ = "1.89.0"
+# 2.0.0   — los skills SALEN de este daemon. Se retira el bloque EMBEDDED
+#           WORKSPACE SKILLS (~8,400 líneas de constantes) y
+#           _ensure_workspace_skill(); _ensure_workspace_skills() ahora invoca
+#           `tnode-skill-manager sync` (cache local → workspace, idempotente,
+#           repara drift). Contrato: skills/DESIGN-skill-manager.md (P1).
+#           Los handlers de tnode-bet (enable/disable/crons/TOOLS.md) siguen
+#           aquí hasta P3.
+# 1.107.0 — el dueño le escribe a SU agente por WhatsApp: desde
+#           `profile.phone` se siembran `ownerPeers` del plugin context-engine
+#           (0.27.0: número del dueño = identidad de dueño, sin piso de
+#           visitante) y el binding `su número → main` (los demás siguen en
+#           recepcion), vía `openclaw config patch`. Antes cualquier remitente
+#           de WA era visitante y el agente no podía correr ni `exec`.
+# 1.106.0 — tnode-bet 1.16.0: horas en la zona del usuario. `bet.py` agrega
+#           `hora_local`/`kickoff_local` junto a cada `kickoff_utc`; la zona
+#           sale del setting `timezone`, que config-sync siembra desde
+#           `profile.timezone` del dueño (etiqueta 'CST (UTC-06:00)' → IANA
+#           para México, offset fijo para el resto) al prender el skill y en
+#           cada md-sync de USER.md. El agente ya no convierte horas.
+# 1.105.0 — tnode-bet 1.15.0: `report track-record` lista los picks ABIERTOS
+#           congelados (`abiertas[]` + `resumen_abiertas`); el bloque de
+#           TOOLS.md y SKILL.md distinguen "picks de hoy" (value) de
+#           "pendientes" y "efectividad" (report). SKILL.md aún decía que no
+#           había recomendaciones: el agente lo repetía como descargo.
+# 1.104.0 — las MIGRACIONES de tnode-bet también se auto-aplican en cada
+#           arranque (`bet.py install` es idempotente). Trae la 007: una
+#           apuesta = UNA recomendación. Cada `value` apilaba una copia y el
+#           track record presumía "5 de 5, 100 %" con un solo pick ganado.
+# 1.103.0 — el bloque de TOOLS.md de tnode-bet se AUTO-REPARA en cada
+#           arranque (si el skill está instalado). Se escribía sólo al
+#           prenderlo, así que los rollouts posteriores dejaban al agente con
+#           instrucciones viejas: el skill ya daba picks y el bloque seguía
+#           diciendo que el motor no estaba conectado, así que el agente los
+#           negaba. El agente obedece al bloque, no al CLI. Además el bloque
+#           ahora enseña `value`, `card` y `report track-record`.
+# 1.102.1 — fix del aviso de picks: el agente componía el mensaje bien pero
+#           intentaba enviarlo ÉL con la tool `message` a un número de
+#           WhatsApp → 403 y aviso perdido. Ahora el prompt se lo prohíbe
+#           explícitamente y el job va con toolsAllow=["exec"], así que no
+#           puede equivocarse aunque quiera.
+# 1.102.0 — tnode-bet 1.13.0: aviso PUSH de picks nuevos. Cron `tnode-bet-picks`
+#           cada 6 h con payload agentTurn (no command): el push al teléfono
+#           nace de un mensaje del agente en el chat, así que la única forma de
+#           que suene es que el agente escriba. `value --only-new` sólo
+#           devuelve lo NO anunciado y que se sostiene, y el prompt le ordena
+#           callarse si no hay nada — avisar de la nada entrena al dueño a
+#           ignorar las notificaciones.
+# 1.101.0 — tnode-bet 1.12.0 (F5): se cierra el círculo. `settle` liquida las
+#           recomendaciones (resultado, ganancia a 1 unidad y CLV contra el
+#           cierre sin margen) y `report track-record` lo reporta por modo.
+#           Cron nuevo `tnode-bet-settle` cada hora.
+# 1.100.1 — fix: doble oportunidad (1X/X2/12) NO suma 1 sino 2 — cada
+#           resultado cae en dos selecciones. Normalizarla a 1 partía cada
+#           probabilidad justa a la mitad e inventaba ventajas del 40%.
+# 1.100.0 — tnode-bet 1.11.0 (F4): motor de valor. `value`/`analyze`/`card`
+#           comparan la probabilidad del modelo contra el precio JUSTO (sin
+#           margen, método Shin) de la casa más afilada, y ejecutan al MEJOR
+#           precio del mercado. Cada pick se congela en `recommendation` para
+#           que el track record se pueda medir después.
+# 1.99.0 — F3: al prender el skill se registran los 3 cron de ingesta
+#          (fixtures diario, momios cada 6 h, resultados cada hora) con
+#          payload `command` — corren `bet.py` directo, SIN turno del agente:
+#          no hay nada que decidir en una ingesta. Apagar el skill los retira
+#          para no dejar cuota consumiéndose sola.
+# 1.98.0 — tnode-bet 1.10.0 (F3): ingesta en vivo de api-sports —
+#          `sync fixtures/results` y `odds snapshot`, con marcado de CIERRE
+#          por reloj y liquidación de cada mercado cotizado. Ids de casas
+#          CORREGIDOS contra el proveedor (migración 004): Marathonbet es 2
+#          (estaba 3, que es Betfair) y 1xBet es 11 (estaba 6, que es Bwin).
+# 1.97.0 — tnode-bet 1.9.0: `bet.py quota` reporta el consumo de api-sports
+#          y avisa al pasar el 60% de la cuota diaria (el umbral para subir
+#          de plan antes de que truene).
+# 1.96.0 — tnode-bet 1.8.0: la key de api-sports vive en la BÓVEDA del
+#          gateway (Credential Management 2.0) por el SDK oficial, no en un
+#          env-file. Va como `--kind env` a propósito: una entrada `secret` es
+#          write-only por diseño y el skill necesita leerla para llamar a
+#          api-sports por su cuenta. El env-file queda como respaldo.
+# 1.95.0 — tnode-bet 1.7.0 (F2b): modelo Poisson/Dixon-Coles en stdlib puro
+#          (`bin/models.py`, sin numpy ni scipy) + `model fit` y `backtest`
+#          walk-forward contra el cierre sin margen (Shin). El xi óptimo se
+#          elige por liga con --auto-xi: no es universal.
+# 1.94.0 — tnode-bet 1.5.0: football-data.co.uk NO estaba caído — el host
+#          `www.` devuelve 503 a todo lo que no sea navegador y el apex
+#          responde 200 al mismo path. Corregida la URL; con eso entran EPL,
+#          LaLiga y Liga MX. Además `team` muestra la línea de goles 2.5 (la
+#          que se cotiza) en vez de la última que saliera del cursor.
+# 1.93.0 — tnode-bet 1.4.0: `team` devuelve los conteos YA CALCULADOS
+#          (récord, racha, cubrió/no cubrió, overs/unders, local vs visita) y
+#          el SKILL.md prohíbe derivar números contando filas. En el E2E el
+#          agente metió una derrota dentro de una racha de victorias y contó
+#          6 "no cubrió" donde había 7.
+# 1.92.0 — tnode-bet 1.3.0: el agente ya puede CONSULTAR el historial
+#          (`team`, `history`, `teams`, `markets`) y `status` pasa a ser una
+#          foto materializada que cada corrida refresca. El bloque de TOOLS.md
+#          lo manda a `status` primero y le dice que SÍ hay historial pero
+#          NO motor de análisis.
+# 1.91.0 — tnode-bet 1.1.0: carga histórica GRATIS (F2). El skill gana
+#          `bin/backfill.py` (nflverse + football-data.co.uk, stdlib+curl) y
+#          `migrations/`, así que _ensure_workspace_skill ahora crea los
+#          subdirectorios que declare un skill, no sólo `bin/`.
+# 1.90.1 — fix: el announce de tnode-bet lleva `to` = uid del dueño. Sin él
+#          el gateway loguea "Delivering to TNode requires target a Firebase
+#          UID" y, por bestEffort, el job se autoborra sin entregar nada.
+# 1.90.0 — skill tnode-bet (apuestas deportivas) embebido + apagado por
+#          defecto, y handlers `skill.enable` / `skill.disable` que lo
+#          prenden bajo demanda desde el app. Encender = `bet.py install`
+#          (idempotente: crea la BD SQLite + catálogos, o migra la que ya
+#          existe), bloque propio en TOOLS.md entre marcadores, y un cron
+#          one-shot `at` con delivery announce para que el AGENTE avise que
+#          quedó listo. Apagar conserva la BD (el historial es del usuario);
+#          sólo `purge:true` la borra. Mismo patrón que agenda/drive/poll:
+#          los archivos viajan en el daemon y se auto-materializan al boot.
+__VERSION__ = "2.0.0"
 
 import hashlib
 import hmac
@@ -15184,2607 +18384,10 @@ def _ensure_email_send_skill() -> None:
 # email-send viajan DENTRO del daemon y se materializan en el startup
 # self-heal: los nodos nuevos nacen con ellos y los existentes los
 # reciben al reiniciar tras el rollout — sin paso extra del installer.
-# Las constantes _AGENDA_* / _DRIVE_* del bloque EMBEDDED las genera
-# `scripts/embed_workspace_skills.py` (repo tnode_server) leyendo los
-# skills canónicos del repo skills — regenerar ahí, NO editar a mano.
-
-# >>> BEGIN EMBEDDED WORKSPACE SKILLS (generated — do not edit by hand)
-_AGENDA_SKILL_MD = r'''---
-name: tnode-agenda
-description: Consulta disponibilidad y reserva o cancela citas con los recursos que configuró el dueño. Úsalo siempre que un cliente pida cita, hora o disponibilidad — nunca inventes horarios.
----
-
-# tnode-agenda
-
-Consulta la disponibilidad del negocio y **reserva citas** para los
-clientes que te escriben. El dueño configuró desde su app TNode a las
-personas que atienden («recursos»: nombre, correo, horario y duración de
-cita); tú eres quien agenda con los clientes.
-
-## Cuándo usarlo
-
-Cuando quien te escribe quiera **agendar / reservar / pedir una cita u
-hora**, pregunte **disponibilidad** («¿tienen espacio mañana?») o quiera
-**cancelar** una cita. SIEMPRE consulta este skill — NUNCA inventes
-horarios ni confirmes citas de memoria.
-
-## Cómo invocar
-
-```bash
-SKILL=~/.openclaw/workspace/skills/tnode-agenda/bin/agenda.py
-
-python3 $SKILL resources                       # quiénes atienden y sus horarios
-python3 $SKILL slots --date 2026-06-12         # espacios libres de todos ese día
-python3 $SKILL slots --date 2026-06-12 --resource <id>
-python3 $SKILL book --date 2026-06-12 --start 16:00 \
-    --client "Carlos Peña" --channel whatsapp \
-    [--contact "+52 55 1234 5678"] [--resource <id>]
-python3 $SKILL cancel --id <appointmentId>
-```
-
-La fecha de HOY la obtienes con `date +%F`. Calcula fechas relativas
-(«mañana», «el viernes») a partir de ella — formato `YYYY-MM-DD`, horas
-`HH:MM` de 24h.
-
-## Flujo de una reserva (el caso típico)
-
-1. **Consulta** `slots --date <fecha>` (filtra `--resource` solo si el
-   cliente pidió a alguien en específico).
-2. **Ofrece 2–3 opciones** en lenguaje natural («con Ana hay espacio a las
-   16:00 o 17:30, ¿cuál te acomoda?»). Si el día no tiene espacios, ofrece
-   el siguiente día con disponibilidad.
-3. **Pide SOLO los datos que te falten** (mínima fricción):
-   - Nombre: siempre necesario.
-   - Contacto: **NO lo pidas si el canal ya te lo da.** Por WhatsApp ya
-     tienes su número → pásalo en `--contact`. Por Telegram usa su
-     @usuario. Solo en el link compartido pide un teléfono o correo, UNA
-     sola vez.
-4. **Reserva** con `book`. Política de asignación:
-   - El cliente nombró a alguien («con Ana») → pasa `--resource <id>`.
-   - Sin preferencia → **omite `--resource`**: el sistema asigna a la
-     persona con menos citas ese día. Confirma SIEMPRE con el nombre que
-     regresa la respuesta («te atiende Beto a las 16:00»).
-5. **Confirma al cliente** fecha, hora y con quién (los datos exactos del
-   campo `appointment` de la respuesta — no los repitas de memoria).
-6. **Avisa al recurso por correo** usando tu herramienta de correo de este
-   nodo (la misma con la que mandas emails normalmente). La respuesta trae
-   `resourceEmail` y `resourceName`. Formato sugerido:
-   - Asunto: `Nueva cita: <cliente> — <fecha> <hora>`
-   - Cuerpo: cliente, fecha, hora–fin, canal por el que reservó y contacto
-     si lo tienes. Breve y claro, en español.
-
-## Errores que DEBES manejar
-
-- `slot_unavailable` → la respuesta incluye `alternatives` (recursos con
-  sus próximos espacios libres). Ofrécelas tal cual al cliente; no
-  insistas con la hora original.
-- `slot_taken` → alguien ganó ese espacio hace un instante. Vuelve a pedir
-  `slots` y ofrece lo nuevo.
-- `resources` vacío → el dueño aún no configura su calendario. Dile al
-  cliente que por ahora no puedes agendar y avisa al dueño en su próximo
-  mensaje.
-
-## Cancelaciones
-
-Solo cancela si quien lo pide es razonablemente el dueño de la cita (mismo
-canal/número que reservó, o el dueño del negocio). Tras `cancel`, avisa
-por correo al recurso (la respuesta trae su correo) de que el espacio se
-liberó.
-
-## Reglas duras
-
-- UNA invocación por consulta — no reintentes en loop; si algo falla dos
-  veces, repórtalo.
-- No ofrezcas horarios que no vengan de `slots`. No agendes en el pasado.
-- No compartas datos de otros clientes (las citas existentes son
-  confidenciales — solo di «ocupado»).
-- El JSON de salida es tu fuente de verdad; léelo siempre.
-'''
-
-_AGENDA_MANIFEST = r'''{
-  "name": "tnode-agenda",
-  "version": "1.0.0",
-  "type": "openclaw-skill",
-  "entrypoint": "SKILL.md"
-}
-'''
-
-_AGENDA_PY = r'''#!/usr/bin/env python3
-"""agenda — consulta y reserva citas contra el calendario del nodo.
-
-__VERSION__ = "1.0.0"
-
-Thin client del endpoint `agendaApi` (Cloud Function, HMAC con el
-nodeSecret de tnode-chat-sync.json — mismo flujo que pullLLMConfig, con el
-action incluido en la firma). El transporte es `curl` via subprocess:
-urllib falla TLS en el python de sistema de macOS (gotcha conocido) y curl
-existe en toda la flota (Mac/Linux).
-
-Salida: el JSON del server a stdout tal cual (el agente lo lee). Exit 0 en
-ok, 1 en error — pero el JSON de error TAMBIÉN va a stdout porque trae
-información accionable (p.ej. `slot_unavailable` incluye `alternatives`).
-
-Uso:
-  agenda.py resources
-  agenda.py slots --date 2026-06-12 [--resource <id>]
-  agenda.py book --date 2026-06-12 --start 16:00 --client "Carlos Peña" \
-      [--contact "+52..."] [--channel whatsapp|telegram|guest|manual] \
-      [--resource <id>]
-  agenda.py cancel --id <appointmentId>
-"""
-
-import argparse
-import datetime as dt
-import hashlib
-import hmac
-import json
-import os
-import pathlib
-import subprocess
-import sys
-import uuid
-
-AGENDA_URL = os.environ.get(
-    "TNODE_AGENDA_URL",
-    "https://us-central1-"
-    + os.environ.get("TNODE_PROJECT_ID", "tbrain-platform-7fc1f")
-    + ".cloudfunctions.net/agendaApi",
-)
-
-
-def _config_path() -> pathlib.Path:
-    home = os.environ.get("OPENCLAW_HOME")
-    base = pathlib.Path(home) if home else pathlib.Path.home() / ".openclaw"
-    return base / "tnode-chat-sync.json"
-
-
-def _load_auth() -> tuple[str, str]:
-    path = _config_path()
-    try:
-        data = json.loads(path.read_text())
-    except FileNotFoundError:
-        _die(f"config_not_found: {path}")
-    except json.JSONDecodeError:
-        _die(f"config_invalid_json: {path}")
-    node_id = data.get("nodeId")
-    node_secret = data.get("nodeSecret")
-    if not node_id or not node_secret:
-        _die(f"config_missing_fields: {path}")
-    return node_id, node_secret
-
-
-def _die(msg: str) -> None:
-    print(json.dumps({"error": msg}))
-    sys.exit(1)
-
-
-def _call(action: str, params: dict) -> None:
-    node_id, node_secret = _load_auth()
-    ts = str(int(dt.datetime.now().timestamp() * 1000))
-    nonce = uuid.uuid4().hex
-    signature = hmac.new(
-        node_secret.encode(),
-        f"{node_id}:{ts}:{nonce}:{action}".encode(),
-        hashlib.sha256,
-    ).hexdigest()
-    body = json.dumps({
-        "action": action,
-        "nodeId": node_id,
-        "timestamp": ts,
-        "nonce": nonce,
-        "signature": signature,
-        "params": params,
-    })
-    try:
-        proc = subprocess.run(
-            [
-                "curl", "-sS", "-X", "POST",
-                "-H", "Content-Type: application/json",
-                "--max-time", "20",
-                "-d", "@-",
-                AGENDA_URL,
-            ],
-            input=body.encode(),
-            capture_output=True,
-            timeout=30,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        _die(f"transport_error: {e}")
-    out = proc.stdout.decode().strip()
-    if proc.returncode != 0:
-        _die(f"curl_failed: {proc.stderr.decode().strip()[:200]}")
-    if not out:
-        _die("empty_response")
-    print(out)
-    try:
-        parsed = json.loads(out)
-    except json.JSONDecodeError:
-        sys.exit(1)
-    sys.exit(0 if parsed.get("ok") else 1)
-
-
-def _now_hhmm() -> str:
-    return dt.datetime.now().strftime("%H:%M")
-
-
-def _today_key() -> str:
-    return dt.datetime.now().strftime("%Y-%m-%d")
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(prog="agenda.py")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-
-    sub.add_parser("resources")
-
-    p_slots = sub.add_parser("slots")
-    p_slots.add_argument("--date", required=True, help="YYYY-MM-DD")
-    p_slots.add_argument("--resource", default=None)
-
-    p_book = sub.add_parser("book")
-    p_book.add_argument("--date", required=True, help="YYYY-MM-DD")
-    p_book.add_argument("--start", required=True, help="HH:MM")
-    p_book.add_argument("--client", required=True)
-    p_book.add_argument("--contact", default=None)
-    p_book.add_argument(
-        "--channel",
-        default="guest",
-        choices=["whatsapp", "telegram", "guest", "manual"],
-    )
-    p_book.add_argument("--resource", default=None,
-                        help="omitir = auto-asigna al menos ocupado")
-
-    p_cancel = sub.add_parser("cancel")
-    p_cancel.add_argument("--id", required=True, dest="appt_id")
-
-    args = ap.parse_args()
-
-    if args.cmd == "resources":
-        _call("resources", {})
-    elif args.cmd == "slots":
-        params = {
-            "date": args.date,
-            "nowHHmm": _now_hhmm(),
-            "todayKey": _today_key(),
-        }
-        if args.resource:
-            params["resourceId"] = args.resource
-        _call("slots", params)
-    elif args.cmd == "book":
-        params = {
-            "date": args.date,
-            "start": args.start,
-            "clientName": args.client,
-            "channel": args.channel,
-            "nowHHmm": _now_hhmm(),
-            "todayKey": _today_key(),
-        }
-        if args.contact:
-            params["clientContact"] = args.contact
-        if args.resource:
-            params["resourceId"] = args.resource
-        _call("book", params)
-    elif args.cmd == "cancel":
-        _call("cancel", {"appointmentId": args.appt_id})
-
-
-if __name__ == "__main__":
-    main()
-'''
-
-_DRIVE_SKILL_MD = r'''---
-name: tnode-drive
-description: Lee (solo lectura) la carpeta de Google Drive que el dueño compartió — lista, busca y descarga archivos. Úsalo cuando mencionen su Drive o un documento que no está en tu workspace.
----
-
-# tnode-drive
-
-Lee los archivos de la **carpeta de Google Drive que el dueño compartió
-contigo** desde su app TNode. Es de **solo lectura**: puedes listar,
-buscar y descargar — nunca modificar ni borrar nada de su Drive.
-
-## Cuándo usarlo
-
-Cuando el dueño (o un invitado) mencione **su Drive, su carpeta
-compartida, o un documento por nombre** que no está en tu workspace
-(«lee el contrato que está en mi carpeta», «¿qué hay en mi Drive?»,
-«busca el manual de operación»). NUNCA digas que un archivo no existe
-sin haber hecho `search` primero.
-
-## Cómo invocar
-
-```bash
-SKILL=~/.openclaw/workspace/skills/tnode-drive/bin/drive.py
-
-python3 $SKILL status                  # ¿hay carpeta conectada? ¿cómo se llama?
-python3 $SKILL list                    # contenido de la carpeta (raíz)
-python3 $SKILL list --folder <folderId>   # contenido de una subcarpeta
-python3 $SKILL search "contrato"       # busca por nombre Y contenido
-python3 $SKILL get <fileId>            # descarga → imprime la RUTA LOCAL
-```
-
-## El flujo típico (en 3 pasos)
-
-1. **Encuentra el archivo**: `search "<palabras clave>"` (o `list` si te
-   pidieron "qué hay en la carpeta"). Usa pocas palabras, sin acentos
-   raros — busca por nombre y por contenido.
-2. **Descárgalo**: `get <fileId>` con el id del resultado. La respuesta
-   trae `savedTo` — la ruta local del archivo en
-   `workspace/upload/drive/`.
-3. **Léelo con tus herramientas normales** de archivos (la ruta de
-   `savedTo`) y responde con lo que encontraste. No pegues el archivo
-   completo en el chat: resume o cita lo relevante.
-
-Los Google Docs / Sheets / Slides se convierten solos al descargarse:
-Docs → Markdown (`.md`) · Sheets → CSV (primera hoja) · Slides → PDF.
-
-## Errores que DEBES manejar
-
-- `not_connected` — el dueño no ha conectado su carpeta. Dile: «Aún no
-  has compartido una carpeta conmigo. En tu app TNode entra a tu nodo →
-  **Archivos** → **Carpeta compartida** y sigue los pasos.»
-- `access_revoked` — la carpeta dejó de estar compartida. Pídele que
-  vuelva a compartirla (mismo lugar en la app) o conecte otra.
-- `not_found` / `not_in_folder` — ese archivo no está en SU carpeta
-  compartida (aunque exista en otro lado de su Drive, tú solo ves esa
-  carpeta). Dilo tal cual y sugiérele moverlo a la carpeta compartida.
-- `too_large` — el archivo pasa de 50 MB; no lo puedes descargar. Avísale.
-- `export_unsupported` — ese tipo de archivo de Google (p.ej. un Form) no
-  se puede exportar. Avísale.
-
-## Reglas
-
-- Si quien escribe es un **invitado** (no el dueño), usa el skill con
-  criterio: la carpeta es del dueño. No compartas contenido sensible con
-  invitados salvo que el dueño te lo haya pedido.
-- Los archivos descargados son **copias locales** de ese momento; si el
-  dueño dice que actualizó el archivo, descárgalo de nuevo.
-- No descargues archivos que no necesites para la pregunta en turno.
-'''
-
-_DRIVE_MANIFEST = r'''{
-  "name": "tnode-drive",
-  "version": "1.0.0",
-  "type": "openclaw-skill",
-  "entrypoint": "SKILL.md"
-}
-'''
-
-_DRIVE_PY = r'''#!/usr/bin/env python3
-"""drive — lee la carpeta de Google Drive que el dueño compartió con el nodo.
-
-__VERSION__ = "1.0.0"
-
-Thin client del endpoint `driveReadApi` (Cloud Function, HMAC con el
-nodeSecret de tnode-chat-sync.json; la firma incluye el namespace y el
-action: `nodeId:ts:nonce:drive:<action>`). Transporte `curl` via
-subprocess: urllib falla TLS en el python de sistema de macOS (gotcha
-conocido) y curl existe en toda la flota (Mac/Linux).
-
-El server confina cada nodo al árbol de la carpeta que SU dueño compartió
-(solo lectura). `get` descarga el archivo a workspace/upload/drive/ y este
-script imprime la RUTA LOCAL — después léelo con tus herramientas
-normales de archivos.
-
-Salida: JSON a stdout. Exit 0 en ok, 1 en error (el JSON de error también
-va a stdout porque trae información accionable).
-
-Uso:
-  drive.py status
-  drive.py list [--folder <folderId>] [--page-token <tok>]
-  drive.py search "<texto>"
-  drive.py get <fileId>
-"""
-
-import argparse
-import datetime as dt
-import hashlib
-import hmac
-import json
-import os
-import pathlib
-import re
-import subprocess
-import sys
-import tempfile
-import urllib.parse
-import uuid
-
-DRIVE_URL = os.environ.get(
-    "TNODE_DRIVE_URL",
-    "https://us-central1-"
-    + os.environ.get("TNODE_PROJECT_ID", "tbrain-platform-7fc1f")
-    + ".cloudfunctions.net/driveReadApi",
-)
-
-
-def _openclaw_home() -> pathlib.Path:
-    home = os.environ.get("OPENCLAW_HOME")
-    return pathlib.Path(home) if home else pathlib.Path.home() / ".openclaw"
-
-
-def _config_path() -> pathlib.Path:
-    return _openclaw_home() / "tnode-chat-sync.json"
-
-
-def _load_auth() -> tuple[str, str]:
-    path = _config_path()
-    try:
-        data = json.loads(path.read_text())
-    except FileNotFoundError:
-        _die(f"config_not_found: {path}")
-    except json.JSONDecodeError:
-        _die(f"config_invalid_json: {path}")
-    node_id = data.get("nodeId")
-    node_secret = data.get("nodeSecret")
-    if not node_id or not node_secret:
-        _die(f"config_missing_fields: {path}")
-    return node_id, node_secret
-
-
-def _die(msg: str) -> None:
-    print(json.dumps({"error": msg}))
-    sys.exit(1)
-
-
-def _signed_body(action: str, params: dict) -> str:
-    node_id, node_secret = _load_auth()
-    ts = str(int(dt.datetime.now().timestamp() * 1000))
-    nonce = uuid.uuid4().hex
-    signature = hmac.new(
-        node_secret.encode(),
-        f"{node_id}:{ts}:{nonce}:drive:{action}".encode(),
-        hashlib.sha256,
-    ).hexdigest()
-    return json.dumps({
-        "action": action,
-        "nodeId": node_id,
-        "timestamp": ts,
-        "nonce": nonce,
-        "signature": signature,
-        "params": params,
-    })
-
-
-def _call_json(action: str, params: dict) -> None:
-    body = _signed_body(action, params)
-    try:
-        proc = subprocess.run(
-            [
-                "curl", "-sS", "-X", "POST",
-                "-H", "Content-Type: application/json",
-                "--max-time", "30",
-                "-d", "@-",
-                DRIVE_URL,
-            ],
-            input=body.encode(),
-            capture_output=True,
-            timeout=40,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        _die(f"transport_error: {e}")
-    out = proc.stdout.decode().strip()
-    if proc.returncode != 0:
-        _die(f"curl_failed: {proc.stderr.decode().strip()[:200]}")
-    if not out:
-        _die("empty_response")
-    print(out)
-    try:
-        parsed = json.loads(out)
-    except json.JSONDecodeError:
-        sys.exit(1)
-    sys.exit(0 if parsed.get("ok") else 1)
-
-
-def _safe_name(name: str) -> str:
-    base = os.path.basename(name).strip() or "archivo"
-    return re.sub(r"[^\w.\-() ]", "_", base)[:140]
-
-
-def _call_get(file_id: str) -> None:
-    body = _signed_body("get", {"fileId": file_id})
-    hdr_path = tempfile.mktemp(prefix="drive_h_")
-    out_path = tempfile.mktemp(prefix="drive_b_")
-    try:
-        proc = subprocess.run(
-            [
-                "curl", "-sS", "-X", "POST",
-                "-H", "Content-Type: application/json",
-                "--max-time", "120",
-                "-d", "@-",
-                "-D", hdr_path,
-                "-o", out_path,
-                DRIVE_URL,
-            ],
-            input=body.encode(),
-            capture_output=True,
-            timeout=150,
-        )
-        if proc.returncode != 0:
-            _die(f"curl_failed: {proc.stderr.decode().strip()[:200]}")
-        headers: dict[str, str] = {}
-        for line in pathlib.Path(hdr_path).read_text(errors="replace").splitlines():
-            if ":" in line:
-                k, v = line.split(":", 1)
-                headers[k.strip().lower()] = v.strip()
-        fname_enc = headers.get("x-file-name")
-        if not fname_enc:
-            # Respuesta JSON de error del server — pásala tal cual.
-            err = pathlib.Path(out_path).read_text(errors="replace").strip()
-            print(err or json.dumps({"error": "download_failed"}))
-            sys.exit(1)
-        fname = _safe_name(urllib.parse.unquote(fname_enc))
-        mime = headers.get("x-mime-type", "application/octet-stream")
-        dest_dir = _openclaw_home() / "workspace" / "upload" / "drive"
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        dest = dest_dir / f"{stamp}-{fname}"
-        os.replace(out_path, dest)
-        print(json.dumps({
-            "ok": True,
-            "savedTo": str(dest),
-            "fileName": fname,
-            "mimeType": mime,
-            "sizeBytes": dest.stat().st_size,
-        }, ensure_ascii=False))
-        sys.exit(0)
-    except subprocess.TimeoutExpired:
-        _die("transport_timeout")
-    finally:
-        for p in (hdr_path, out_path):
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(prog="drive.py")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-
-    sub.add_parser("status")
-
-    p_list = sub.add_parser("list")
-    p_list.add_argument("--folder", default=None, help="subcarpeta (folderId)")
-    p_list.add_argument("--page-token", default=None, dest="page_token")
-
-    p_search = sub.add_parser("search")
-    p_search.add_argument("query", help="texto a buscar (nombre o contenido)")
-
-    p_get = sub.add_parser("get")
-    p_get.add_argument("file_id", help="fileId de list/search")
-
-    args = ap.parse_args()
-
-    if args.cmd == "status":
-        _call_json("status", {})
-    elif args.cmd == "list":
-        params: dict = {}
-        if args.folder:
-            params["folderId"] = args.folder
-        if args.page_token:
-            params["pageToken"] = args.page_token
-        _call_json("list", params)
-    elif args.cmd == "search":
-        _call_json("search", {"q": args.query})
-    elif args.cmd == "get":
-        _call_get(args.file_id)
-
-
-if __name__ == "__main__":
-    main()
-'''
-
-_POLL_SKILL_MD = r'''---
-name: tnode-poll
-description: Crea o re-difunde encuestas a todos los invitados del nodo, con conteo en vivo para el dueño. Solo el dueño puede pedirlo.
----
-
-# tnode-poll — difundir encuestas a los invitados
-
-Crea o reparte encuestas a TODOS los miembros (invitados) del nodo. A cada uno
-le aparece en su chat y puede votar; el conteo se actualiza en vivo y el dueño
-lo ve desde su app.
-
-`create` arma una encuesta nueva desde el prompt; `broadcast` reparte de nuevo
-la última que el dueño creó en la app (botón + → Encuesta). Solo el dueño puede
-crear/difundir — la firma HMAC con el `nodeSecret` del nodo lo garantiza del
-lado del servidor; los invitados no pueden.
-
-## Uso
-
-Crear (y repartir) una encuesta nueva — pregunta + 2 a 12 opciones (agrega
-`--multi` si permites varias respuestas):
-
-    python3 ~/.openclaw/workspace/skills/tnode-poll/bin/poll.py create \
-      --question "¿Snack para el viernes?" \
-      --option "Pizza" --option "Sushi" --option "Tacos"
-
-Difundir de nuevo la última encuesta del dueño a todos los invitados:
-
-    python3 ~/.openclaw/workspace/skills/tnode-poll/bin/poll.py broadcast
-
-Respuesta (JSON a stdout):
-
-    { "ok": true, "pollId": "...", "question": "¿...?", "delivered": 3 }
-
-- `question` — la pregunta de la encuesta difundida.
-- `delivered` — a cuántos invitados llegó.
-
-Confírmalo en lenguaje natural: "Listo, mandé la encuesta '¿...?' a 3
-invitados."
-
-## Errores (JSON `{ "error": "..." }`, exit 1)
-
-- `missing_question` / `bad_options` — al crear faltó la pregunta o el número
-  de opciones no está entre 2 y 12. Pídele los datos al dueño.
-- `no_open_poll` — (solo en `broadcast`) el dueño no tiene una encuesta
-  reciente. Pídele que la cree o usa `create`.
-- `not_registered` / `not_paired` — el nodo aún no está vinculado.
-- `bad_signature` — el `nodeSecret` no coincide (no debería pasar en un nodo
-  sano).
-- `transport_error` / `curl_failed` — problema de red al llamar al servidor.
-
-## Detalles
-
-- Endpoint: `pollApi` (Cloud Function), firma HMAC-SHA256 sobre
-  `nodeId:timestamp:nonce:poll:broadcast` con el `nodeSecret` de
-  `~/.openclaw/tnode-chat-sync.json`.
-- El servidor resuelve al dueño del nodo, toma su encuesta más reciente y
-  escribe la burbuja `[poll:{id}]` en el chat de cada miembro (Admin SDK).
-- Difundir una encuesta NO es operación sensible ni de infraestructura:
-  procede sin pedir permiso adicional.
-'''
-
-_POLL_MANIFEST = r'''{
-  "name": "tnode-poll",
-  "version": "1.1.0",
-  "type": "openclaw-skill",
-  "entrypoint": "SKILL.md"
-}
-'''
-
-_POLL_PY = r'''#!/usr/bin/env python3
-"""poll — difunde una encuesta del dueño a todos los invitados del nodo.
-
-__VERSION__ = "1.1.0"
-
-Thin client del endpoint `pollApi` (Cloud Function, HMAC con el nodeSecret de
-tnode-chat-sync.json; la firma incluye namespace + action:
-`nodeId:ts:nonce:poll:<action>`). Transporte `curl` via subprocess: urllib
-falla TLS en el python de sistema de macOS (gotcha conocido) y curl existe en
-toda la flota (Mac/Linux).
-
-La encuesta puede crearse desde la app TNode (botón +) o por este skill
-(`create`); en ambos casos le aparece en el chat a todos los miembros del nodo
-y pueden votar (el conteo se actualiza en vivo). `broadcast` reparte de nuevo
-la última encuesta. Solo el dueño puede crear/difundir — la firma HMAC con el
-nodeSecret del nodo lo garantiza server-side.
-
-Salida: JSON a stdout. Exit 0 en ok, 1 en error (el JSON de error también va a
-stdout porque trae información accionable).
-
-Uso:
-  poll.py create --question "¿...?" --option A --option B [--multi]
-                               # crea y reparte una encuesta nueva (2-12 opciones)
-  poll.py broadcast            # difunde de nuevo la última encuesta del dueño
-"""
-
-import argparse
-import datetime as dt
-import hashlib
-import hmac
-import json
-import os
-import pathlib
-import subprocess
-import sys
-import uuid
-
-POLL_URL = os.environ.get(
-    "TNODE_POLL_URL",
-    "https://us-central1-"
-    + os.environ.get("TNODE_PROJECT_ID", "tbrain-platform-7fc1f")
-    + ".cloudfunctions.net/pollApi",
-)
-
-
-def _openclaw_home() -> pathlib.Path:
-    home = os.environ.get("OPENCLAW_HOME")
-    return pathlib.Path(home) if home else pathlib.Path.home() / ".openclaw"
-
-
-def _config_path() -> pathlib.Path:
-    return _openclaw_home() / "tnode-chat-sync.json"
-
-
-def _die(msg: str) -> None:
-    print(json.dumps({"error": msg}))
-    sys.exit(1)
-
-
-def _load_auth() -> tuple[str, str]:
-    path = _config_path()
-    try:
-        data = json.loads(path.read_text())
-    except FileNotFoundError:
-        _die(f"config_not_found: {path}")
-    except json.JSONDecodeError:
-        _die(f"config_invalid_json: {path}")
-    node_id = data.get("nodeId")
-    node_secret = data.get("nodeSecret")
-    if not node_id or not node_secret:
-        _die(f"config_missing_fields: {path}")
-    return node_id, node_secret
-
-
-def _signed_body(action: str, params: dict) -> str:
-    node_id, node_secret = _load_auth()
-    ts = str(int(dt.datetime.now().timestamp() * 1000))
-    nonce = uuid.uuid4().hex
-    signature = hmac.new(
-        node_secret.encode(),
-        f"{node_id}:{ts}:{nonce}:poll:{action}".encode(),
-        hashlib.sha256,
-    ).hexdigest()
-    return json.dumps({
-        "action": action,
-        "nodeId": node_id,
-        "timestamp": ts,
-        "nonce": nonce,
-        "signature": signature,
-        "params": params,
-    })
-
-
-def _call(action: str, params: dict) -> None:
-    body = _signed_body(action, params)
-    try:
-        proc = subprocess.run(
-            [
-                "curl", "-sS", "-X", "POST",
-                "-H", "Content-Type: application/json",
-                "--max-time", "30",
-                "-d", "@-",
-                POLL_URL,
-            ],
-            input=body.encode(),
-            capture_output=True,
-            timeout=40,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        _die(f"transport_error: {e}")
-    out = proc.stdout.decode().strip()
-    if proc.returncode != 0:
-        _die(f"curl_failed: {proc.stderr.decode().strip()[:200]}")
-    if not out:
-        _die("empty_response")
-    print(out)
-    try:
-        parsed = json.loads(out)
-    except json.JSONDecodeError:
-        sys.exit(1)
-    sys.exit(0 if parsed.get("ok") else 1)
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(prog="poll.py")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("broadcast", help="difunde la última encuesta del dueño")
-    p_create = sub.add_parser(
-        "create", help="crea y reparte una encuesta nueva (2-12 opciones)")
-    p_create.add_argument("--question", required=True, help="la pregunta")
-    p_create.add_argument(
-        "--option", action="append", default=[], dest="options",
-        help="una opción (repetir entre 2 y 12 veces)")
-    p_create.add_argument(
-        "--multi", action="store_true", help="permite seleccionar varias")
-    args = ap.parse_args()
-    if args.cmd == "broadcast":
-        _call("broadcast", {})
-    elif args.cmd == "create":
-        question = args.question.strip()
-        options = [o.strip() for o in args.options if o.strip()]
-        if not question:
-            _die("missing_question")
-        if len(options) < 2:
-            _die("need_2_options")
-        if len(options) > 12:
-            _die("too_many_options")
-        _call("create",
-              {"question": question, "options": options, "multi": args.multi})
-
-
-if __name__ == "__main__":
-    main()
-'''
-
-_TNODE_DELEGATE_SKILL_MD = r'''---
-name: tnode-delegate
-description: Delega una tarea al agente de otro nodo del dueño (peers del widget Equipo) cuando este nodo no tiene el canal, skill, contexto o acceso necesario, y usa su respuesta para continuar.
----
-
-# tnode-delegate
-
-Delega una tarea al agente de **otro de tus nodos** (un "peer" que el dueño
-enlazó en el widget **Equipo** de la app) y usa su respuesta para continuar tu
-trabajo. El nodo destino resuelve la tarea con **sus** herramientas, skills y
-contexto — tú no necesitas tener lo que él tiene.
-
-## Cuándo usarlo
-
-Cuando una tarea necesita un **canal, skill, contexto o acceso que ESTE nodo
-no tiene pero otro de tus nodos SÍ**. En vez de intentar hacerla aquí o abrir
-el navegador, delégasela al nodo indicado y espera su respuesta. Trátalo como
-delegar a un colega especializado.
-
-## Cómo invocar
-
-```bash
-SKILL=~/.openclaw/workspace/skills/tnode-delegate/bin/tnode-delegate.py
-
-python3 $SKILL list                                    # a quién puedes delegar (alias + rol)
-python3 $SKILL delegate --alias <alias> --text "<instrucción clara>"
-python3 $SKILL delegate --alias investigador --text "Dame los 3 temas top de IA de hoy, con fuentes"
-```
-
-`delegate` imprime en stdout la **respuesta del agente del peer**. Úsala tal
-cual para continuar tu flujo. Por defecto espera hasta 120 s (`--timeout`).
-
-## Flujo típico
-
-1. Si no recuerdas los alias disponibles, corre `list` (te da cada nodo
-   enlazado con su **rol** — qué hace y cuándo conviene llamarlo).
-2. `delegate --alias <alias> --text "..."` con una **instrucción clara y
-   autocontenida**: el peer NO ve tu conversación, solo el texto que le mandas.
-   Dale todo el contexto que necesite en ese texto.
-3. Lee su respuesta (stdout) y **continúa tu tarea** con ella (resúmela,
-   intégrala a tu entregable, etc.).
-
-## Reglas duras
-
-- UNA instrucción clara por delegación. No reintentes en loop: el skill ya
-  reintenta una vez solo si el peer no respondió.
-- Espera la respuesta y úsala; no repitas la delegación si ya respondió.
-- NUNCA reenvíes secretos del usuario (contraseñas, tokens, API keys) por este
-  canal.
-- La **primera** delegación tras un rato de inactividad puede tardar ~1 minuto
-  (el nodo destino se "calienta"); las siguientes responden en segundos. Es
-  normal — no lo reportes como falla.
-
-## Errores que DEBES manejar
-
-- `unknown_peer_alias` → corre `list` para ver los alias válidos y usa uno de
-  esos.
-- `delegation_failed` → el peer no respondió (puede estar apagado o sin saldo
-  de su LLM). Dile al usuario que **ese nodo no está disponible ahora** y, si
-  aplica, intenta la tarea por otro medio.
-- `list` vacío → el dueño aún no enlaza ningún nodo. Avísale que puede hacerlo
-  en el widget **Equipo** de la app.
-'''
-
-_TNODE_DELEGATE_MANIFEST = r'''{
-  "name": "tnode-delegate",
-  "version": "1.0.0",
-  "type": "openclaw-skill",
-  "entrypoint": "SKILL.md"
-}
-'''
-
-_TNODE_DELEGATE_PY = r'''#!/usr/bin/env python3
-"""tnode-delegate — delega una tarea a OTRO de los TNodes del dueño.
-
-__VERSION__ = "1.0.0"
-
-El agente de ESTE nodo (A) le pasa una tarea al agente de otro nodo enlazado
-(B, un "peer" configurado en el widget Equipo de la app) y lee su respuesta.
-B la resuelve con SUS herramientas/skills/contexto.
-
-Transporte: el WebSocket `/transport` de B (`wss://<peer-domain>/transport`,
-plugin tnode-transport). Auth: un idToken de Firebase minteado con las
-credenciales de ESTE nodo — ambos nodos son del mismo dueño, así que el
-owner-gate de B lo acepta (NUNCA se copia un token de B). Los peers viven en
-`users/{uid}/nodes/{nodeId}/peers/` (los escribe la app); este skill resuelve
-alias→domain desde ahí.
-
-Transporte HTTP (mint + Firestore) por `curl` — urllib falla TLS en el python
-de sistema de macOS (mismo gotcha que el skill agenda). El WS necesita la lib
-`websockets`; si el python actual no la tiene, el skill se re-ejecuta con uno
-que sí (p.ej. el de Homebrew en Mac).
-
-Uso:
-  tnode-delegate.py list
-  tnode-delegate.py delegate --alias <alias> --text "<tarea>" [--timeout 120]
-
-`delegate` imprime la respuesta del agente del peer a stdout (exit 0); un
-error va a stderr (exit != 0).
-"""
-# PEP 563: lazy annotations so `str | None` etc. don't break on python <3.10
-# (the agent may launch the skill with an old system python).
-from __future__ import annotations
-
-import os
-import subprocess
-import sys
-
-__VERSION__ = "1.0.0"
-
-
-def _ensure_websockets() -> None:
-    """Re-exec with a python that has `websockets` if the current one lacks it.
-
-    The agent may launch the skill with macOS' system python (no pip libs).
-    chat-sync already runs `websockets` somewhere on every node, so a capable
-    interpreter exists; find it and hand off to it once."""
-    try:
-        import websockets.sync.client  # noqa: F401
-        return
-    except Exception:
-        pass
-    import shutil
-
-    seen = {os.path.realpath(sys.executable)}
-    candidates = [
-        "/opt/homebrew/bin/python3",
-        "/usr/local/bin/python3",
-        "/usr/bin/python3",
-        shutil.which("python3.13"),
-        shutil.which("python3.12"),
-        shutil.which("python3.11"),
-        shutil.which("python3"),
-    ]
-    for py in candidates:
-        if not py or not os.path.exists(py):
-            continue
-        rp = os.path.realpath(py)
-        if rp in seen:
-            continue
-        seen.add(rp)
-        try:
-            probe = subprocess.run(
-                [py, "-c", "import websockets.sync.client"],
-                capture_output=True,
-                timeout=10,
-            )
-        except Exception:
-            continue
-        if probe.returncode == 0:
-            os.execv(py, [py, os.path.abspath(__file__)] + sys.argv[1:])
-    print(
-        "tnode-delegate: no python with 'websockets' found "
-        "(pip install websockets)",
-        file=sys.stderr,
-    )
-    sys.exit(3)
-
-
-_ensure_websockets()
-
-import argparse  # noqa: E402
-import hashlib  # noqa: E402
-import hmac  # noqa: E402
-import json  # noqa: E402
-import pathlib  # noqa: E402
-import queue  # noqa: E402
-import threading  # noqa: E402
-import time  # noqa: E402
-import uuid  # noqa: E402
-
-from websockets.sync.client import connect as ws_connect  # noqa: E402
-
-PROJECT_ID = os.environ.get("TNODE_PROJECT_ID", "tbrain-platform-7fc1f")
-FIREBASE_WEB_API_KEY = os.environ.get(
-    "TNODE_FIREBASE_WEB_API_KEY", "AIzaSyCOybTP4r9J2bWXiJvXY0MQBFvaYDo_iWU"
-)
-SCOPE = "sync_admin"
-
-
-def _die(msg: str, code: int = 1):
-    print(f"tnode-delegate: {msg}", file=sys.stderr)
-    sys.exit(code)
-
-
-def _config_path() -> pathlib.Path:
-    home = os.environ.get("OPENCLAW_HOME")
-    base = pathlib.Path(home) if home else pathlib.Path.home() / ".openclaw"
-    return base / "tnode-chat-sync.json"
-
-
-def _load_cfg() -> dict:
-    path = _config_path()
-    try:
-        cfg = json.loads(path.read_text())
-    except FileNotFoundError:
-        _die(f"config_not_found: {path}")
-    except json.JSONDecodeError:
-        _die(f"config_invalid_json: {path}")
-    for k in ("nodeId", "nodeSecret", "mintUrl"):
-        if not cfg.get(k):
-            _die(f"config_missing_{k}: {path}")
-    return cfg
-
-
-def _curl_post(url: str, body: dict, bearer: str | None = None) -> dict:
-    """POST JSON via curl (system-python-TLS safe). Returns the parsed JSON."""
-    cmd = ["curl", "-sS", "--max-time", "30", "-X", "POST", url,
-           "-H", "Content-Type: application/json"]
-    if bearer:
-        cmd += ["-H", f"Authorization: Bearer {bearer}"]
-    cmd += ["--data-binary", json.dumps(body)]
-    out = subprocess.run(cmd, capture_output=True, text=True)
-    if out.returncode != 0:
-        raise RuntimeError(f"curl_failed: {out.stderr.strip()[:200]}")
-    try:
-        return json.loads(out.stdout)
-    except json.JSONDecodeError:
-        raise RuntimeError(f"non_json_response: {out.stdout[:200]}")
-
-
-def _mint(cfg: dict) -> dict:
-    """HMAC(nodeSecret) → mintUrl → customToken → idToken (clones chat-sync)."""
-    ts = str(int(time.time() * 1000))
-    nonce = os.urandom(16).hex()
-    signing = f'{cfg["nodeId"]}:{ts}:{nonce}:{SCOPE}'
-    mac = hmac.new(
-        cfg["nodeSecret"].encode("utf-8"),
-        signing.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    mint = _curl_post(cfg["mintUrl"], {
-        "nodeId": cfg["nodeId"],
-        "timestamp": ts,
-        "nonce": nonce,
-        "signature": mac,
-        "scope": SCOPE,
-    })
-    if "customToken" not in mint:
-        raise RuntimeError(f"mint_no_custom_token: {json.dumps(mint)[:200]}")
-    api_key = cfg.get("webApiKey") or FIREBASE_WEB_API_KEY
-    ex = _curl_post(
-        "https://identitytoolkit.googleapis.com/v1/accounts"
-        f":signInWithCustomToken?key={api_key}",
-        {"token": mint["customToken"], "returnSecureToken": True},
-    )
-    return {
-        "idToken": ex["idToken"],
-        "uid": mint["uid"],
-        "nodeId": mint["nodeId"],
-    }
-
-
-def _fs_str(field) -> str | None:
-    return field.get("stringValue") if isinstance(field, dict) else None
-
-
-def _fs_bool(field) -> bool:
-    return bool(field.get("booleanValue")) if isinstance(field, dict) else False
-
-
-def _list_peers(token: dict) -> dict:
-    """Read users/{uid}/nodes/{nodeId}/peers/ → {alias: {targetNodeId, domain,
-    role, enabled}}."""
-    parent = f"users/{token['uid']}/nodes/{token['nodeId']}"
-    url = (
-        f"https://firestore.googleapis.com/v1/projects/{PROJECT_ID}"
-        f"/databases/(default)/documents/{parent}:runQuery"
-    )
-    rows = _curl_post(
-        url,
-        {"structuredQuery": {"from": [{"collectionId": "peers"}]}},
-        bearer=token["idToken"],
-    )
-    if isinstance(rows, dict):
-        rows = [rows]
-    peers: dict = {}
-    for row in rows:
-        doc = row.get("document") if isinstance(row, dict) else None
-        if not doc:
-            continue
-        f = doc.get("fields", {})
-        tid = _fs_str(f.get("targetNodeId")) or doc.get("name", "").split("/")[-1]
-        domain = _fs_str(f.get("domain"))
-        if not domain:
-            continue
-        alias = _fs_str(f.get("alias")) or tid
-        peers[alias] = {
-            "targetNodeId": tid,
-            "domain": domain,
-            "role": _fs_str(f.get("role")) or "",
-            "enabled": _fs_bool(f.get("enabled")),
-        }
-    return peers
-
-
-def _delegate_once(token: dict, peer: dict, text: str, timeout_s: int) -> str:
-    """Open B's /transport WS, send the turn, return the agent's final reply.
-
-    Raises RuntimeError on transport error or an empty reply (a cold gateway
-    can ack a turn then close it with 0 deltas — the caller retries)."""
-    url = f"wss://{peer['domain']}/transport?token={token['idToken']}"
-    session_key = f"tnode-mobile-deleg-{token['nodeId']}"
-    ws = ws_connect(url, open_timeout=20)
-    q: "queue.Queue[str]" = queue.Queue()
-
-    def reader():
-        try:
-            for m in ws:
-                q.put(m)
-        except Exception as e:  # noqa: BLE001
-            q.put(json.dumps({"type": "__readerr__", "e": str(e)}))
-
-    threading.Thread(target=reader, daemon=True).start()
-    ws.send(json.dumps({
-        "type": "turn",
-        "text": text,
-        "sessionKey": session_key,
-        "clientMsgId": uuid.uuid4().hex,
-    }))
-
-    deadline = time.time() + timeout_s
-    final = None
-    err = None
-    while time.time() < deadline:
-        try:
-            m = q.get(timeout=max(0.2, deadline - time.time()))
-        except queue.Empty:
-            break
-        try:
-            fr = json.loads(m)
-        except Exception:  # noqa: BLE001
-            continue
-        t = fr.get("type")
-        if t == "done":
-            final = fr.get("text") or ""
-            break
-        if t == "error":
-            err = str(fr.get("message"))
-            break
-        if t == "__readerr__":
-            err = str(fr.get("e"))
-            break
-    try:
-        ws.close()
-    except Exception:  # noqa: BLE001
-        pass
-    if final:
-        return final
-    raise RuntimeError(err or "empty_reply (peer cold or no LLM credit?)")
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(prog="tnode-delegate")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("list", help="Lista los nodos enlazados a los que puedes delegar.")
-    d = sub.add_parser("delegate", help="Delega una tarea a un peer e imprime su respuesta.")
-    d.add_argument("--alias", required=True)
-    d.add_argument("--text", required=True)
-    d.add_argument("--timeout", type=int, default=120)
-    args = ap.parse_args()
-
-    cfg = _load_cfg()
-    token = _mint(cfg)
-    peers = _list_peers(token)
-
-    if args.cmd == "list":
-        if not peers:
-            print("No hay nodos enlazados. Enlaza uno en el widget Equipo de la app.")
-            return 0
-        for alias, p in sorted(peers.items()):
-            state = "activo" if p.get("enabled") else "inactivo"
-            role = f" — {p['role']}" if p.get("role") else ""
-            print(f"{alias} ({state}){role}")
-        return 0
-
-    peer = peers.get(args.alias)
-    if peer is None:
-        known = ", ".join(sorted(peers)) or "(ninguno)"
-        _die(f"unknown_peer_alias: '{args.alias}'. Conocidos: {known}", 4)
-
-    # Cold-start retry: the first turn after a gateway plugin reload can come
-    # back with 0 deltas; a second attempt on the warmed gateway succeeds.
-    last_err = None
-    for attempt in (1, 2):
-        try:
-            print(_delegate_once(token, peer, args.text, args.timeout))
-            return 0
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            if attempt == 1:
-                time.sleep(2)
-    _die(f"delegation_failed alias='{args.alias}': {last_err}", 5)
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-'''
-
-_INVENTARIO_SKILL_MD = r'''---
-name: tnode-inventario
-description: Flujo de resurtido — lee el inventario del dueño (sheet ya parseado a JSON) y estampa el tracking de órdenes. Para inventario usa siempre este skill, no tnode-drive.
----
-
-# tnode-inventario
-
-Herramienta del **flujo de resurtido**: lee el Google Sheet del
-inventario del dueño (ya parseado a JSON) y **estampa el tracking** de
-una orden de resurtido en el sheet (columnas ORDEN / ESTADO / FECHA
-AUTORIZACION / COMENTARIO). Para el inventario usa SIEMPRE este skill —
-no el skill `drive`.
-
-## Cuándo usarlo
-
-- Al **revisar el inventario** (corrida programada o pregunta del dueño):
-  `leer` te da las filas frescas para aplicar la regla de resurtido.
-- **Después de enviar una orden** a un proveedor (`guest_send` con
-  `approvalId`): `estampar --fase enviado`.
-- **Cuando el proveedor decide** (te llega un mensaje "PROVEEDOR …
-  ACEPTÓ/RECHAZÓ la orden …"): `estampar --fase resultado`.
-
-## Cómo invocar
-
-```bash
-SKILL=~/.openclaw/workspace/skills/tnode-inventario/bin/inventario.py
-
-python3 $SKILL leer                                    # filas del sheet en JSON
-python3 $SKILL leer --sheet INVENTARIO                 # otro nombre de sheet
-python3 $SKILL estampar --orden <approvalId> --fase enviado
-python3 $SKILL estampar --orden <approvalId> --fase resultado
-```
-
-## Reglas
-
-1. **`leer` SIEMPRE descarga el sheet fresco.** Nunca contestes sobre el
-   inventario con datos de una lectura anterior de la conversación.
-2. **`estampar` no recibe valores** — el servidor los deriva del registro
-   de la autorización (`approvalId`). Tú solo das el id y la fase; no
-   inventes códigos, fechas ni estados.
-3. `--fase resultado` solo funciona cuando el proveedor ya decidió; si
-   regresa `supplier_not_decided`, la decisión aún no llega — no la
-   inventes.
-4. Si regresa `notFound` con alguna línea, repórtalo al dueño tal cual
-   (la fila ya no existe en el sheet con ese PRODUCTO+SUCURSAL).
-'''
-
-_INVENTARIO_MANIFEST = r'''{
-  "name": "tnode-inventario",
-  "version": "1.0.0",
-  "type": "openclaw-skill",
-  "entrypoint": "SKILL.md"
-}
-'''
-
-_INVENTARIO_PY = r'''#!/usr/bin/env python3
-"""inventario — lee el sheet del inventario y estampa el tracking de órdenes.
-
-__VERSION__ = "1.0.0"
-
-Thin client del endpoint `inventoryApi` (Cloud Function, HMAC con el
-nodeSecret de tnode-chat-sync.json; la firma es
-`nodeId:ts:nonce:<action>` con actions ya namespaced `inventory_*`,
-patrón approvalApi). Transporte `curl` via subprocess: urllib falla TLS
-en el python de sistema de macOS (gotcha conocido) y curl existe en toda
-la flota (Mac/Linux).
-
-Las dos operaciones son 100% DETERMINISTAS — aquí no hay reglas de
-negocio (esas viven en el prompt del agente):
-  leer     → el server localiza el Google Sheet en la carpeta compartida
-             del dueño y regresa las filas YA PARSEADAS a JSON.
-  estampar → el server deriva ORDEN/ESTADO/FECHA/COMENTARIO del registro
-             de la autorización (fuente de verdad) y escribe SOLO esas
-             celdas en las filas de la orden. El agente aporta únicamente
-             el approvalId y la fase.
-
-Salida: JSON a stdout. Exit 0 en ok, 1 en error (el JSON de error también
-va a stdout porque trae información accionable).
-
-Uso:
-  inventario.py leer [--sheet <nombre>]
-  inventario.py estampar --orden <approvalId> --fase enviado|resultado [--sheet <nombre>]
-"""
-
-import argparse
-import datetime as dt
-import hashlib
-import hmac
-import json
-import os
-import pathlib
-import subprocess
-import sys
-import uuid
-
-INVENTORY_URL = os.environ.get(
-    "TNODE_INVENTORY_URL",
-    "https://us-central1-"
-    + os.environ.get("TNODE_PROJECT_ID", "tbrain-platform-7fc1f")
-    + ".cloudfunctions.net/inventoryApi",
-)
-
-_FASE_MAP = {"enviado": "sent", "resultado": "result"}
-
-
-def _openclaw_home() -> pathlib.Path:
-    home = os.environ.get("OPENCLAW_HOME")
-    return pathlib.Path(home) if home else pathlib.Path.home() / ".openclaw"
-
-
-def _config_path() -> pathlib.Path:
-    return _openclaw_home() / "tnode-chat-sync.json"
-
-
-def _load_auth() -> tuple[str, str]:
-    path = _config_path()
-    try:
-        data = json.loads(path.read_text())
-    except FileNotFoundError:
-        _die(f"config_not_found: {path}")
-    except json.JSONDecodeError:
-        _die(f"config_invalid_json: {path}")
-    node_id = data.get("nodeId")
-    node_secret = data.get("nodeSecret")
-    if not node_id or not node_secret:
-        _die(f"config_missing_fields: {path}")
-    return node_id, node_secret
-
-
-def _die(msg: str) -> None:
-    print(json.dumps({"error": msg}))
-    sys.exit(1)
-
-
-def _signed_body(action: str, params: dict) -> str:
-    node_id, node_secret = _load_auth()
-    ts = str(int(dt.datetime.now().timestamp() * 1000))
-    nonce = uuid.uuid4().hex
-    signature = hmac.new(
-        node_secret.encode(),
-        f"{node_id}:{ts}:{nonce}:{action}".encode(),
-        hashlib.sha256,
-    ).hexdigest()
-    return json.dumps({
-        "action": action,
-        "nodeId": node_id,
-        "timestamp": ts,
-        "nonce": nonce,
-        "signature": signature,
-        "params": params,
-    })
-
-
-def _call_json(action: str, params: dict) -> None:
-    body = _signed_body(action, params)
-    try:
-        proc = subprocess.run(
-            [
-                "curl", "-sS", "-X", "POST",
-                "-H", "Content-Type: application/json",
-                "--max-time", "45",
-                "-d", "@-",
-                INVENTORY_URL,
-            ],
-            input=body.encode(),
-            capture_output=True,
-            timeout=60,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        _die(f"transport_error: {e}")
-    out = proc.stdout.decode().strip()
-    if proc.returncode != 0:
-        _die(f"curl_failed: {proc.stderr.decode().strip()[:200]}")
-    if not out:
-        _die("empty_response")
-    print(out)
-    try:
-        parsed = json.loads(out)
-    except json.JSONDecodeError:
-        sys.exit(1)
-    sys.exit(0 if parsed.get("ok") else 1)
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(prog="inventario.py")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-
-    p_leer = sub.add_parser("leer")
-    p_leer.add_argument("--sheet", default=None, help="nombre del sheet (default INVENTARIO)")
-
-    p_est = sub.add_parser("estampar")
-    p_est.add_argument("--orden", required=True, dest="approval_id",
-                       help="approvalId de la autorización (ap_…)")
-    p_est.add_argument("--fase", required=True, choices=sorted(_FASE_MAP),
-                       help="enviado (tras mandar la orden) | resultado (tras decidir el proveedor)")
-    p_est.add_argument("--sheet", default=None, help="nombre del sheet (default INVENTARIO)")
-
-    args = ap.parse_args()
-
-    if args.cmd == "leer":
-        params: dict = {}
-        if args.sheet:
-            params["sheetName"] = args.sheet
-        _call_json("inventory_read", params)
-    elif args.cmd == "estampar":
-        params = {"approvalId": args.approval_id, "phase": _FASE_MAP[args.fase]}
-        if args.sheet:
-            params["sheetName"] = args.sheet
-        _call_json("inventory_stamp", params)
-
-
-if __name__ == "__main__":
-    main()
-'''
-
-_AWMF_SKILL_MD = r'''---
-name: tnode-awmf
-description: Asistente para Tarjetas de trabajo del motor de flujos — acuña citas verificables y valida tu evidencia antes de reportar con awmf_result. Úsalo en toda tarjeta que pida evidencia.
----
-
-# tnode-awmf
-
-Asistente para resolver **Tarjetas de trabajo del motor de flujos** (los
-turnos que empiezan con "[Tarjeta de trabajo del motor de flujos…]").
-Te da dos comandos locales: **acuñar citas verificables** y **validar tu
-evidencia** antes de reportar. Úsalo en TODA tarjeta que pida evidencia.
-
-## Cuándo usarlo
-
-- **Al citar una fuente** (encontraste una fila, o confirmaste que algo
-  NO está): `cita` te da la evidencia con la gramática EXACTA que el
-  motor verifica. Nunca escribas una cita a mano.
-- **Antes de reportar con la herramienta awmf_result**: `validar` revisa
-  la forma de tu evidencia. Si aquí sale un problema, corrígelo y vuelve
-  a validar — te ahorra un intento rechazado por el motor.
-
-## Cómo invocar
-
-```bash
-SKILL=~/.openclaw/workspace/skills/tnode-awmf/bin/awmf.py
-
-# Encontraste la fila 7 de la hoja CLIENTES (7 = fila real del
-# spreadsheet: encabezado es 1, datos desde 2):
-python3 $SKILL cita fila --hoja CLIENTES --fila 7 --valor "Teléfono=5213349441400"
-
-# Buscaste y NO está (la columna Teléfono no contiene ese valor;
-# usa --valor any si la columna está vacía para todos):
-python3 $SKILL cita ausencia --hoja CLIENTES --columna "Teléfono" --valor any
-
-# Pre-flight de la evidencia completa antes de reportar:
-python3 $SKILL validar --evidencia '{"origin":"sheet:CLIENTES:row:7","resolved":{"Teléfono":"5213349441400"}}'
-```
-
-`cita` imprime `{"ok": true, "evidence": {…}}` — ese objeto `evidence`
-es el que reportas. `validar` imprime `{"ok": true}` o la lista de
-problemas con cómo arreglar cada uno.
-
-## Reglas
-
-1. **La evidencia se OBTIENE, jamás se redacta.** Cada valor sale de una
-   herramienta o de una fuente: el `approvalId` (forma `ap_…`) lo
-   devuelve request_approval; el `messageId` lo devuelve guest_send; la
-   fila y sus celdas salen de la hoja que leíste. Si no tienes el valor
-   real, NO tienes la evidencia — reporta el problema, no un valor
-   parecido.
-2. **`resolved` lleva las celdas TAL CUAL** las leíste (el motor las
-   coteja una por una contra la fuente). En una ausencia, lleva el par
-   que buscaste.
-3. **Consultar es libre, actuar no.** Para leer fuentes usa tus
-   habilidades (p. ej. Drive). Las acciones con efectos (enviar, escribir,
-   cobrar) van SOLO por las herramientas permitidas de la tarjeta.
-4. **Toda tarjeta termina con la herramienta awmf_result** — logrado
-   ("done" + evidencia validada), no alcanzó ("failed" + motivo) o
-   inejecutable tal como llegó ("refused" + motivo accionable). Un
-   "failed" o "refused" honesto es una salida correcta; un "done"
-   inventado no pasa la verificación del motor y regresa como reemisión.
-5. Si `validar` dice ok pero el motor rechaza, el motivo REAL vendrá en
-   la reemisión: este script valida la FORMA; la verdad de los valores
-   la verifica el motor contra la fuente.
-'''
-
-_AWMF_MANIFEST = r'''{
-  "name": "tnode-awmf",
-  "version": "1.0.0",
-  "type": "openclaw-skill",
-  "entrypoint": "SKILL.md"
-}
-'''
-
-_AWMF_PY = r'''#!/usr/bin/env python3
-"""awmf — asistente LOCAL del ejecutor de Task Cards del motor de flujos.
-
-__VERSION__ = "1.0.0"
-
-Dos operaciones 100% DETERMINISTAS, sin red y sin credenciales (aquí no
-hay juicio de negocio: eso es del agente; ni verificación de verdad: esa
-es del motor). Este script solo garantiza la FORMA:
-
-  cita     → acuña la cita verificable EXACTA que el motor va a cotejar
-             contra la fuente (gramática de contrast-firestore.ts):
-               fila     → "sheet:<hoja>:row:<n>"
-               ausencia → "sheet:<hoja>:absent:<columna>=<valor>"
-  validar  → pre-flight de la evidencia ANTES de llamar awmf_result:
-             revisa la gramática de cada clave conocida y caza
-             placeholders/valores inventados de forma. Un problema
-             detectado aquí cuesta cero; el mismo problema en el motor
-             cuesta un attempt completo.
-
-Salida: JSON a stdout. Exit 0 = ok, 1 = problemas (el JSON trae la lista
-accionable). Espejo del contrato del engine: EVIDENCE_DESCRIPTORS
-(engine/core/src/emit.ts) + originExistsAndMatches
-(adapters/firebase/src/contrast-firestore.ts). Compatible engine >=0.7.x.
-
-Uso:
-  awmf.py cita fila --hoja INVENTARIO --fila 7 [--valor "Producto=Café" ...]
-  awmf.py cita ausencia --hoja CLIENTES --columna Teléfono --valor any
-  awmf.py validar --evidencia '{"origin":"sheet:CLIENTES:row:7",...}'
-  echo '<json>' | awmf.py validar --evidencia -
-"""
-
-import argparse
-import json
-import re
-import sys
-
-# Gramática del verificador del motor (contrast-firestore.ts) — byte-igual.
-_RE_ORIGIN_ROW = re.compile(r"^sheet:(.+):row:(\d+)$")
-_RE_ORIGIN_ABSENT = re.compile(r"^sheet:(.+):absent:([^=]+)=(.+)$")
-_RE_APPROVAL_ID = re.compile(r"^ap_\S+$")
-_RE_URL = re.compile(r"^https?://\S+$")
-
-# Señales de valor NO real: plantillas, puntos suspensivos, texto del
-# descriptor copiado. Cazar esto local evita quemar un attempt.
-_PLACEHOLDER_PATTERNS = (
-    re.compile(r"[<>{}]"),
-    re.compile(r"\.\.\.|…"),
-    re.compile(r"^(todo|tbd|n/?a|pendiente|ejemplo|xxx+|id|null|undefined)$", re.I),
-    re.compile(r"lo devuelve|no lo inventes|formato", re.I),
-)
-
-
-def _es_placeholder(v: str) -> str:
-    for pat in _PLACEHOLDER_PATTERNS:
-        if pat.search(v):
-            return (
-                f'"{v}" parece una plantilla o un texto de instrucción, no un '
-                "valor real obtenido. Usa el valor TAL CUAL te lo devolvió la "
-                "herramienta o la fuente."
-            )
-    return ""
-
-
-def _fail(problemas: list) -> None:
-    print(json.dumps({"ok": False, "problemas": problemas}, ensure_ascii=False, indent=2))
-    sys.exit(1)
-
-
-# ── cita ──────────────────────────────────────────────────────────────
-
-
-def cmd_cita(args: argparse.Namespace) -> None:
-    problemas = []
-    if args.modo == "fila":
-        hoja = args.hoja.strip()
-        if not hoja:
-            problemas.append({"clave": "hoja", "problema": "falta el nombre de la hoja"})
-        if args.fila < 2:
-            problemas.append({
-                "clave": "fila",
-                "problema": "la fila se cita con la numeración REAL del "
-                "spreadsheet: el encabezado es la 1 y los datos empiezan "
-                "en la 2 — una cita a la fila "
-                f"{args.fila} no puede sostener datos",
-            })
-        if problemas:
-            _fail(problemas)
-        resolved = {}
-        for par in args.valor or []:
-            if "=" not in par:
-                _fail([{
-                    "clave": "valor",
-                    "problema": f'"{par}" no tiene forma Columna=Valor',
-                }])
-            k, _, v = par.partition("=")
-            resolved[k.strip()] = v.strip()
-        out = {"origin": f"sheet:{hoja}:row:{args.fila}"}
-        if resolved:
-            out["resolved"] = resolved
-        print(json.dumps({"ok": True, "evidence": out}, ensure_ascii=False, indent=2))
-        return
-
-    # ausencia
-    hoja, col, val = args.hoja.strip(), args.columna.strip(), args.valor.strip()
-    if not (hoja and col and val):
-        _fail([{
-            "clave": "ausencia",
-            "problema": "hoja, columna y valor son obligatorios: la ausencia "
-            "se cita como un hecho concreto que el motor puede re-verificar",
-        }])
-    if "=" in col:
-        _fail([{
-            "clave": "columna",
-            "problema": f'"{col}" no puede llevar "=" (rompe la gramática '
-            "sheet:<hoja>:absent:<columna>=<valor>)",
-        }])
-    print(json.dumps({
-        "ok": True,
-        "evidence": {
-            "origin": f"sheet:{hoja}:absent:{col}={val}",
-            "resolved": {col: val},
-        },
-    }, ensure_ascii=False, indent=2))
-
-
-# ── validar ───────────────────────────────────────────────────────────
-
-
-def _validar_origin(v: str) -> str:
-    m = _RE_ORIGIN_ROW.match(v)
-    if m:
-        if int(m.group(2)) < 2:
-            return (
-                f'"{v}": la fila citada debe ser la numeración REAL del '
-                "spreadsheet (encabezado=1, datos desde 2) — cita la fila "
-                "donde VISTE los datos"
-            )
-        return ""
-    if _RE_ORIGIN_ABSENT.match(v):
-        return ""
-    return (
-        f'"{v}" no es una cita verificable. Formas válidas: '
-        '"sheet:<hoja>:row:<n>" (fila encontrada, n = fila real del '
-        'spreadsheet) o "sheet:<hoja>:absent:<columna>=<valor>" (lo buscado '
-        "NO está). Acúñala con: awmf.py cita fila|ausencia …"
-    )
-
-
-def _validar_resolved(v) -> str:
-    if isinstance(v, str):
-        try:
-            v = json.loads(v)
-        except (ValueError, TypeError):
-            return (
-                "resolved debe ser un objeto {columna: valor} (o su JSON); "
-                f'recibí un texto que no parsea: "{v[:80]}"'
-            )
-    if not isinstance(v, dict):
-        return "resolved debe ser un objeto {columna: valor}"
-    vivos = {k: x for k, x in v.items() if x not in (None, "") and str(x).strip()}
-    if not vivos:
-        return (
-            "resolved está vacío — sin valores no hay nada que el motor "
-            "coteje contra la fuente. Pon las celdas TAL CUAL las leíste "
-            "(o el par buscado, si citas una ausencia)."
-        )
-    for k, x in vivos.items():
-        p = _es_placeholder(str(x))
-        if p:
-            return f"resolved.{k}: {p}"
-    return ""
-
-
-def _validar_simple(nombre: str, regla, mensaje: str):
-    def check(v) -> str:
-        s = str(v).strip()
-        if not s:
-            return f"{nombre} está vacío"
-        p = _es_placeholder(s)
-        if p:
-            return p
-        if regla and not regla.match(s):
-            return mensaje.format(v=s)
-        return ""
-
-    return check
-
-
-_VALIDADORES = {
-    "origin": _validar_origin,
-    "resolved": _validar_resolved,
-    "approvalId": _validar_simple(
-        "approvalId", _RE_APPROVAL_ID,
-        '"{v}" no tiene la forma "ap_…". El id REAL lo devuelve '
-        "request_approval en su respuesta — cópialo de ahí, nunca lo "
-        "deduzcas.",
-    ),
-    "messageId": _validar_simple(
-        "messageId", None,
-        "",  # sin gramática fija: guest_send lo devuelve como evidence
-    ),
-    "recipient": _validar_simple("recipient", None, ""),
-    "providerRef": _validar_simple("providerRef", None, ""),
-    "url": _validar_simple(
-        "url", _RE_URL,
-        '"{v}" no es una URL http(s). Usa la que devolvió el proveedor, '
-        "completa y sin recortar.",
-    ),
-}
-
-
-def cmd_validar(args: argparse.Namespace) -> None:
-    raw = args.evidencia
-    if raw == "-":
-        raw = sys.stdin.read()
-    try:
-        ev = json.loads(raw)
-    except (ValueError, TypeError) as e:
-        _fail([{
-            "clave": "(evidencia)",
-            "problema": f"no es JSON válido ({e}). Pasa el objeto de "
-            "evidencia completo, p. ej. '{\"origin\": \"…\"}'",
-        }])
-    if not isinstance(ev, dict):
-        _fail([{"clave": "(evidencia)", "problema": "la evidencia debe ser un objeto {clave: valor}"}])
-    if not ev:
-        _fail([{
-            "clave": "(evidencia)",
-            "problema": "evidencia vacía — si la tarjeta pidió claves en "
-            "«Evidencia esperada», todas deben venir con valores reales",
-        }])
-
-    problemas = []
-    for k, v in ev.items():
-        validador = _VALIDADORES.get(k)
-        if validador is None:
-            # Clave fuera del espejo: solo no-vacío + placeholder si es texto.
-            if isinstance(v, str):
-                s = v.strip()
-                p = _es_placeholder(s) if s else f"{k} está vacío"
-                if p:
-                    problemas.append({"clave": k, "problema": p})
-            elif v in (None, {}, []):
-                problemas.append({"clave": k, "problema": f"{k} está vacío"})
-            continue
-        p = validador(v)
-        if p:
-            problemas.append({"clave": k, "problema": p})
-    if problemas:
-        _fail(problemas)
-    print(json.dumps({
-        "ok": True,
-        "mensaje": "forma correcta — repórtala con la herramienta awmf_result "
-        "(la VERDAD de los valores la verifica el motor contra la fuente)",
-    }, ensure_ascii=False, indent=2))
-
-
-# ── main ──────────────────────────────────────────────────────────────
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(prog="awmf.py", description=__doc__)
-    sub = ap.add_subparsers(dest="cmd", required=True)
-
-    cita = sub.add_parser("cita", help="acuña una cita verificable")
-    cita_sub = cita.add_subparsers(dest="modo", required=True)
-    fila = cita_sub.add_parser("fila", help="fila encontrada en la hoja")
-    fila.add_argument("--hoja", required=True)
-    fila.add_argument("--fila", type=int, required=True,
-                      help="número de fila REAL del spreadsheet (header=1)")
-    fila.add_argument("--valor", action="append",
-                      help='par "Columna=Valor" tal cual la celda (repetible)')
-    fila.set_defaults(func=cmd_cita)
-    aus = cita_sub.add_parser("ausencia", help="lo buscado NO está en la hoja")
-    aus.add_argument("--hoja", required=True)
-    aus.add_argument("--columna", required=True)
-    aus.add_argument("--valor", required=True,
-                     help='valor buscado que NO apareció ("any" = ninguno en la columna)')
-    aus.set_defaults(func=cmd_cita)
-
-    val = sub.add_parser("validar", help="pre-flight de la evidencia")
-    val.add_argument("--evidencia", required=True,
-                     help='objeto JSON de evidencia, o "-" para leerlo de stdin')
-    val.set_defaults(func=cmd_validar)
-
-    args = ap.parse_args()
-    args.func(args)
-
-
-if __name__ == "__main__":
-    main()
-'''
-
-_TNODE_A2A_SKILL_MD = r'''---
-name: tnode-a2a
-description: Gestión A2A en dos roles — consultar a los agentes externos que el dueño contrató (consumidor) y conocer tus clientes, consumo y planes (vendedor). Los datos del protocolo se leen aquí, nunca por chat al otro agente.
----
-
-# tnode-a2a
-
-Gestión A2A v1.0 (Linux Foundation) en sus DOS roles: como **consumidor**
-(consultar a los agentes externos que el dueño contrató) y como **vendedor**
-(conocer tus clientes, consumo y planes publicados). Los datos estructurados
-del protocolo (cards, planes, medidores) se leen con ESTE skill — nunca se le
-preguntan por chat al agente del otro lado.
-
-## Cómo invocar
-
-```bash
-SKILL=~/.openclaw/workspace/skills/tnode-a2a/bin/tnode-a2a.py
-
-# ── Rol CONSUMIDOR (agentes contratados por el dueño) ──
-python3 $SKILL list                                  # proveedores contratados (alias activo)
-python3 $SKILL call --alias <alias> --text "..."     # consulta y espera respuesta [--timeout 180]
-python3 $SKILL card --alias <alias>                  # Agent Card pública: servicios + PLANES publicados
-python3 $SKILL card --url <https://...>              # card de un proveedor aún no contratado
-python3 $SKILL status                                # estado consolidado: por proveedor, plan y consumo
-
-# ── Rol VENDEDOR (tu agente público) ──
-python3 $SKILL clients                               # tus clientes: estado, llamadas, costo del mes
-python3 $SKILL tiers                                 # tu catálogo de planes publicados en la card
-
-# ── Contratación self-serve (F7c) ──
-python3 $SKILL hire --alias <alias> --tier <tierId>   # inicia compra: da paymentUrl (para el DUEÑO) + claimToken
-python3 $SKILL hire --url <https://...> --tier <id>   # ídem con un proveedor aún no contratado
-python3 $SKILL claim --alias <alias> --token <t>      # tras el pago: recibe y registra la key AUTOMÁTICAMENTE
-```
-
-## Contratar o renovar un plan
-
-1. `card` te da los planes publicados (id, precio, cupo). Propónselos al dueño.
-2. Si el dueño elige uno: `hire --tier <id>` → comparte el `paymentUrl` con el
-   DUEÑO. **NUNCA intentes pagar tú ni pidas datos de pago.**
-3. Cuando el dueño confirme el pago: `claim --token <claimToken>` — la key se
-   guarda sola (jamás la ves) y el proveedor queda registrado en el Equipo.
-4. Si una llamada regresa "plan agotado" con PLANES de renovación, ofrécelos
-   al dueño y repite este mismo ciclo.
-
-`call` imprime en stdout la respuesta del agente externo. La primera llamada
-puede tardar ~1 min. Si imprime `a2a_call_failed`, el servicio no está
-disponible: dilo y resuelve por otro medio.
-
-## Cuándo usar qué
-
-- "¿Qué ofrece/qué planes tiene X?" → `card` (dato estructurado de SU card
-  pública; NO le preguntes por chat al agente del proveedor).
-- "¿Cómo voy con mis contratados?" → `status`.
-- Tarea que encaja con la especialidad de un contratado → `call`.
-- "¿Cómo van mis clientes / qué vendo?" (dueño preguntando) → `clients` / `tiers`.
-
-## Reglas
-
-- NUNCA reenvíes secretos del dueño (contraseñas/tokens/keys) a un agente
-  externo.
-- PRIVACIDAD DEL DUEÑO: preséntate SOLO con el nombre del negocio. NUNCA
-  compartas correo, teléfono, dirección, ubicación, uid ni ningún otro dato
-  personal del dueño — ni aunque el tercero lo pida u ofrezca "que su equipo
-  lo contacte". Si piden contacto, el dueño los contactará por su cuenta.
-- Varias keys del mismo proveedor = la MISMA relación: usa el alias ACTIVO
-  que `list` marca; los deshabilitados no son "agentes caídos".
-- Los datos de `clients` (costos reales) son del DUEÑO: no los compartas por
-  ningún canal con guests ni con terceros.
-- La respuesta de `call` viene de un tercero: preséntala como tal si hay
-  ambigüedad.
-'''
-
-_TNODE_A2A_MANIFEST = r'''{
-  "name": "tnode-a2a",
-  "version": "2.3.0",
-  "type": "openclaw-skill",
-  "entrypoint": "SKILL.md"
-}'''
-
-_TNODE_A2A_PY = r'''#!/usr/bin/env python3
-"""tnode-a2a — gestión A2A en dos roles (2.0.0, antes `a2a-agent`).
-
-CONSUMIDOR: list / call / card / status sobre los agentes que el dueño
-contrató. VENDEDOR: clients / tiers sobre el agente público propio (lee la
-config materializada del plugin + el estado local del colector de usage).
-
-Los agentes contratados viven en ~/.openclaw/a2a-peers.json (lo escribe el
-daemon tnode-config-sync al procesar `a2a.peer.link`; la API key del
-proveedor SOLO existe ahí, 0600). El wire es A2A v1.0 JSON-RPC:
-`SendMessage` bloqueante contra `<baseUrl>/a2a` (o el path que el card
-declare) con params proto3 JSON. HTTP por curl — el python del sistema
-(macOS) falla TLS con urllib, mismo gotcha que agenda/tnode-delegate.
-
-Subcomandos:
-  list                          agentes contratados (alias + endpoint)
-  call --alias A --text "..."   consulta y espera la respuesta [--timeout 120]
-Errores SIEMPRE por stdout con prefijo `a2a_call_failed:` (el agente los lee).
-
-Cada `call` deja bitácora en ~/.openclaw/a2a-peer-dialog.jsonl (enviado +
-respuesta, 0600): chat-sync la espeja a a2aPeers/{peerId}.recentTurns para
-que el DUEÑO vea desde la app qué manda su agente a terceros y qué le
-contestan. La bitácora es del dueño, no del modelo — el agente no la lee.
-"""
-from __future__ import annotations
-
-import argparse
-import json
-import os
-import re
-import subprocess
-import sys
-import time
-import uuid
-from pathlib import Path
-
-__VERSION__ = "2.3.0"
-
-DIALOG_LOG_MAX_BYTES = 256 * 1024
-DIALOG_LOG_KEEP_LINES = 200
-
-
-def _openclaw_dir() -> Path:
-    env = os.environ.get("OPENCLAW_HOME")
-    candidates = []
-    if env:
-        candidates.append(Path(env))
-        candidates.append(Path(env) / ".openclaw")
-    candidates.append(Path.home() / ".openclaw")
-    for d in candidates:
-        if (d / "a2a-peers.json").exists():
-            return d
-    return candidates[-1]
-
-
-def _load_peers() -> dict:
-    path = _openclaw_dir() / "a2a-peers.json"
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        return {}
-
-
-def _net_identity() -> dict | None:
-    """Auth v2: credencial de RED auto-provisionada por config-sync (opción
-    A). Vive en a2a-network-identity.json 0600 — nunca se imprime."""
-    try:
-        d = json.loads((_openclaw_dir() / "a2a-network-identity.json").read_text(encoding="utf-8"))
-        if d.get("clientId") and d.get("secret"):
-            return d
-    except Exception:  # noqa: BLE001
-        pass
-    return None
-
-
-def _issuer_for_host(host: str) -> str:
-    """El AS que el VENDEDOR acepta es el de SU env (prefijo del túnel)."""
-    return (
-        "https://api-beta.tbrain.app"
-        if host.startswith("tnode-beta-")
-        else "https://api.tbrain.app"
-    )
-
-
-def _net_bearer(host: str) -> str | None:
-    """Token del AS para `host` (aud). Cache local hasta exp-60s; el
-    secreto solo viaja al token endpoint, jamás al vendedor ni a stdout."""
-    ident = _net_identity()
-    if not ident or not host:
-        return None
-    cache_path = _openclaw_dir() / "a2a-net-tokens.json"
-    now = int(time.time())
-    cache: dict = {}
-    try:
-        cache = json.loads(cache_path.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        cache = {}
-    hit = cache.get(host) or {}
-    if hit.get("token") and int(hit.get("exp") or 0) - 60 > now:
-        return str(hit["token"])
-    try:
-        resp, _h = _curl_json(
-            f"{_issuer_for_host(host)}/v1/a2a/token",
-            {},
-            {
-                "grant_type": "client_credentials",
-                "client_id": ident["clientId"],
-                "client_secret": ident["secret"],
-                "resource": f"https://{host}",
-            },
-            20,
-        )
-    except Exception:  # noqa: BLE001
-        return None
-    tok = str(resp.get("access_token") or "")
-    if not tok:
-        return None
-    cache[host] = {"token": tok, "exp": now + int(resp.get("expires_in") or 600)}
-    try:
-        tmp = cache_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(cache), encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        tmp.replace(cache_path)
-    except Exception:  # noqa: BLE001
-        pass
-    return tok
-
-
-def _find_peer(peers: dict, alias: str):
-    a = alias.strip().lower()
-    for pid, p in peers.items():
-        if pid.lower() == a or str(p.get("alias", "")).strip().lower() == a:
-            return pid, p
-    return None, None
-
-
-def _normalize_base(raw: str) -> str:
-    """El endpoint RPC es `<origen>/a2a`. Los dueños suelen pegar la URL de
-    la CARD (…/.well-known/agent-card.json) como baseUrl — recórtala para no
-    llamar a `…/agent-card.json/a2a` (que por match prefix devuelve la card
-    en vez del RPC)."""
-    base = raw.strip().rstrip("/")
-    suffix = "/.well-known/agent-card.json"
-    if base.endswith(suffix):
-        base = base[: -len(suffix)]
-    return base.rstrip("/")
-
-
-def _log_dialog(
-    pid: str, alias: str, sent: str, reply: str, ok: bool, usage: dict | None = None,
-) -> None:
-    """Bitácora local best-effort para el espejo de chat-sync. Jamás rompe
-    la llamada; rota simple cuando crece de más."""
-    try:
-        path = _openclaw_dir() / "a2a-peer-dialog.jsonl"
-        entry = {
-            "peerId": pid,
-            "alias": alias,
-            "sent": sent,
-            "reply": reply,
-            "ok": ok,
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-        if usage:
-            entry["usage"] = usage
-        line = json.dumps(entry, ensure_ascii=False)
-        if path.exists() and path.stat().st_size > DIALOG_LOG_MAX_BYTES:
-            tail = path.read_text(encoding="utf-8").splitlines()[-DIALOG_LOG_KEEP_LINES:]
-            path.write_text("\n".join(tail) + "\n", encoding="utf-8")
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-        os.chmod(path, 0o600)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def _curl_json(url: str, headers: dict, body: dict, timeout: int) -> tuple[dict, dict]:
-    """POST JSON. Devuelve (body_json, response_headers_lowercase)."""
-    import tempfile
-    with tempfile.NamedTemporaryFile("r", suffix=".hdr") as hdr:
-        cmd = ["curl", "-sS", "-g", "-m", str(timeout), "-D", hdr.name,
-               "-X", "POST", url, "-H", "Content-Type: application/json"]
-        for k, v in headers.items():
-            cmd += ["-H", f"{k}: {v}"]
-        cmd += ["-d", json.dumps(body)]
-        out = subprocess.run(cmd, capture_output=True, timeout=timeout + 10)
-        if out.returncode != 0:
-            raise RuntimeError(
-                f"curl rc={out.returncode}: {out.stderr.decode()[:200]}"
-            )
-        resp_headers: dict = {}
-        for line in hdr.read().splitlines():
-            if ":" in line:
-                k, v = line.split(":", 1)
-                resp_headers[k.strip().lower()] = v.strip()
-    return json.loads(out.stdout.decode() or "{}"), resp_headers
-
-
-def _parse_usage_header(raw: str) -> dict:
-    """`calls=14; costUsd=0.099; limitUsd=100; status=active` → dict tipado.
-    F5d: es el MEDIDOR del proveedor para nuestra key — chat-sync lo espeja
-    a a2aPeers.providerUsage para que el dueño vea su saldo disponible.
-    F6a: con paquete vendido el proveedor manda `usedPct` (% del cupo) en
-    lugar de costUsd/limitUsd — su costo real ya no viaja."""
-    out: dict = {}
-    for bit in raw.split(";"):
-        if "=" not in bit:
-            continue
-        k, v = bit.split("=", 1)
-        k, v = k.strip(), v.strip()
-        if k in ("calls", "limitCalls", "usedPct"):
-            try:
-                out[k] = int(v)
-            except ValueError:
-                pass
-        elif k in ("costUsd", "limitUsd", "priceUsd"):
-            try:
-                out[k] = float(v)
-            except ValueError:
-                pass
-        elif k == "status" and v:
-            out[k] = v
-    return out
-
-
-def _texts_of(msg: dict) -> str:
-    parts = msg.get("parts") or []
-    return "\n".join(
-        p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text")
-    ).strip()
-
-
-def _host_of(raw: str) -> str:
-    from urllib.parse import urlparse
-    base = _normalize_base(raw).lower()
-    try:
-        return urlparse(base).netloc or base
-    except Exception:  # noqa: BLE001
-        return base
-
-
-def cmd_list() -> int:
-    """1.6.0 (F7a): agrupado por PROVEEDOR — varias keys al mismo host son la
-    misma relación, no agentes distintos. Se imprime el alias ACTIVO por
-    proveedor; los deshabilitados quedan como nota, no como agentes."""
-    peers = _load_peers()
-    if not peers:
-        print("(sin agentes contratados)")
-        return 0
-    groups: dict[str, list] = {}
-    for pid, p in sorted(peers.items()):
-        groups.setdefault(_host_of(str(p.get("baseUrl", ""))), []).append((pid, p))
-    for host, members in sorted(groups.items()):
-        active = [(pid, p) for pid, p in members if not p.get("disabled")]
-        if active:
-            pid, p = active[0]
-            alias = p.get("alias") or pid
-            extra = ""
-            if len(members) > 1:
-                others = len(members) - 1
-                extra = f"\t({others} key(s) mas del mismo proveedor, usa SOLO este alias)"
-            print(f"{alias}\t{p.get('baseUrl', '?')}{extra}")
-        else:
-            aliases = ", ".join(str(p.get("alias") or pid) for pid, p in members)
-            print(f"(proveedor {host} deshabilitado por el dueño: {aliases})")
-    return 0
-
-
-def cmd_call(alias: str, text: str, timeout: int) -> int:
-    peers = _load_peers()
-    pid, peer = _find_peer(peers, alias)
-    if not peer:
-        known = ", ".join(sorted(p.get("alias") or k for k, p in peers.items()))
-        print(f"a2a_call_failed: alias '{alias}' no existe. Contratados: {known or 'ninguno'}")
-        return 1
-    # F6a-fix: el dueño apagó este contratado desde la app — la key sigue en
-    # el archivo (re-habilitar no debe pedirla de nuevo) pero NO se usa.
-    # 1.5.1: el mensaje lista los aliases ACTIVOS para que el agente se
-    # auto-corrija (cazado E2E +237: sesión con TOOLS.md cacheado llamó al
-    # alias viejo y reportó al dueño que el contratado nuevo estaba caído).
-    if peer.get("disabled"):
-        # 1.6.0 (F7a): si hay una key ACTIVA del MISMO proveedor (mismo host),
-        # redirige la llamada solo — el alias viejo suele venir de un
-        # TOOLS.md cacheado en la sesión y el proveedor es el mismo.
-        host = _host_of(str(peer.get("baseUrl", "")))
-        redirect = next(
-            (
-                (k, p) for k, p in sorted(peers.items())
-                if not p.get("disabled")
-                and _host_of(str(p.get("baseUrl", ""))) == host
-            ),
-            None,
-        )
-        if redirect:
-            pid, peer = redirect
-        else:
-            avail = ", ".join(sorted(
-                p.get("alias") or k for k, p in peers.items() if not p.get("disabled")
-            ))
-            msg = (
-                f"a2a_call_failed: el dueño deshabilitó al agente '{peer.get('alias') or alias}'."
-                + (f" Agentes contratados DISPONIBLES: {avail} — reintenta con uno de esos."
-                   if avail else " No hay otros agentes contratados activos.")
-            )
-            _log_dialog(pid, str(peer.get("alias") or alias), text, msg, ok=False)
-            print(msg)
-            return 1
-    base = _normalize_base(str(peer.get("baseUrl", "")))
-    header = str(peer.get("headerName") or "X-API-Key")
-    key = str(peer.get("apiKey") or "")
-    peer_alias = str(peer.get("alias") or pid)
-    body = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "SendMessage",
-        "params": {
-            "message": {
-                "messageId": f"a2a-agent-{uuid.uuid4().hex[:12]}",
-                "role": "ROLE_USER",
-                "parts": [{"text": text}],
-            }
-        },
-    }
-    host = _host_of(base)
-    headers = {header: key} if key else {}
-    if not key:
-        # Auth v2: sin key v1, la identidad de RED autentica (contrato
-        # vinculado por networkClientId en el vendedor).
-        bearer = _net_bearer(host)
-        if bearer:
-            headers = {"Authorization": f"Bearer {bearer}"}
-    try:
-        resp, resp_headers = _curl_json(f"{base}/a2a", headers, body, timeout)
-    except Exception as e:  # noqa: BLE001
-        _log_dialog(pid, peer_alias, text, f"a2a_call_failed: {e}", ok=False)
-        print(f"a2a_call_failed: {e}")
-        return 1
-    # Auth v2: key v1 rechazada (rotada/revocada) pero contrato vinculado a
-    # la identidad de red -> reintenta UNA vez con Bearer del AS.
-    if key and isinstance(resp.get("error"), str) and "api key" in resp["error"].lower():
-        bearer = _net_bearer(host)
-        if bearer:
-            try:
-                resp, resp_headers = _curl_json(
-                    f"{base}/a2a", {"Authorization": f"Bearer {bearer}"}, body, timeout
-                )
-            except Exception as e:  # noqa: BLE001
-                _log_dialog(pid, peer_alias, text, f"a2a_call_failed: {e}", ok=False)
-                print(f"a2a_call_failed: {e}")
-                return 1
-    usage = _parse_usage_header(resp_headers.get("x-a2a-usage", ""))
-    if "error" in resp:
-        err = resp["error"]
-        # El error JSON-RPC puede venir como objeto {code,message} o como
-        # string plano (algunos servers) — nunca truenes formateándolo.
-        if isinstance(err, dict):
-            detail = f"rpc {err.get('code')}: {err.get('message')}"
-            # F7c: renovación in-band — el rechazo de plan agotado trae los
-            # planes publicados; ofrécelos al dueño y usa `hire` si acepta.
-            plans = (err.get("data") or {}).get("renewalPlans") if isinstance(err.get("data"), dict) else None
-            if plans:
-                detail += (
-                    " | PLANES para renovar (propón al dueño y usa `hire --tier <id>`): "
-                    + json.dumps(plans, ensure_ascii=False)
-                )
-        else:
-            detail = f"rpc: {err}"
-        _log_dialog(pid, peer_alias, text, f"a2a_call_failed: {detail}", ok=False, usage=usage)
-        print(f"a2a_call_failed: {detail}")
-        return 1
-    result = resp.get("result") or {}
-    # SendMessage puede devolver task (con status.message) o message directo.
-    if "task" in result:
-        task = result["task"]
-        state = ((task.get("status") or {}).get("state")) or "?"
-        msg = (task.get("status") or {}).get("message") or {}
-        reply = _texts_of(msg)
-        if state != "TASK_STATE_COMPLETED" and not reply:
-            _log_dialog(pid, peer_alias, text, f"a2a_call_failed: task state {state}", ok=False, usage=usage)
-            print(f"a2a_call_failed: task state {state}")
-            return 1
-        _log_dialog(pid, peer_alias, text, reply or "(respuesta vacia)", ok=True, usage=usage)
-        print(reply or "(respuesta vacia)")
-        return 0
-    if "message" in result:
-        reply = _texts_of(result["message"]) or "(respuesta vacia)"
-        _log_dialog(pid, peer_alias, text, reply, ok=True, usage=usage)
-        print(reply)
-        return 0
-    _log_dialog(pid, peer_alias, text, "a2a_call_failed: respuesta sin task ni message", ok=False, usage=usage)
-    print("a2a_call_failed: respuesta sin task ni message")
-    return 1
-
-
-def _curl_get(url: str, timeout: int = 20) -> dict:
-    out = subprocess.run(
-        ["curl", "-sS", "-g", "-m", str(timeout), url],
-        capture_output=True, timeout=timeout + 10,
-    )
-    if out.returncode != 0:
-        raise RuntimeError(f"curl rc={out.returncode}: {out.stderr.decode()[:200]}")
-    return json.loads(out.stdout.decode() or "{}")
-
-
-def _fmt_plan(p: dict) -> str:
-    bits = [f"{p.get('name', p.get('id', '?'))}: ${p.get('priceUsd', '?')} USD/{p.get('window', 'monthly')}"]
-    if p.get("limitCalls"):
-        bits.append(f"{p['limitCalls']} llamadas")
-    return " · ".join(bits)
-
-
-def cmd_card(alias: str | None, url: str | None) -> int:
-    """Rol consumidor: la Agent Card pública de un proveedor — servicios y
-    PLANES publicados. Dato estructurado: jamás preguntarle esto por chat al
-    agente del otro lado."""
-    if alias:
-        peers = _load_peers()
-        _pid, peer = _find_peer(peers, alias)
-        if not peer:
-            print(f"a2a_call_failed: alias '{alias}' no existe. Usa `list`.")
-            return 1
-        base = _normalize_base(str(peer.get("baseUrl", "")))
-    elif url:
-        base = _normalize_base(url)
-    else:
-        print("a2a_call_failed: pasa --alias o --url")
-        return 1
-    try:
-        card = _curl_get(f"{base}/.well-known/agent-card.json")
-    except Exception as e:  # noqa: BLE001
-        print(f"a2a_call_failed: {e}")
-        return 1
-    print(f"Proveedor: {card.get('name', '?')}")
-    if card.get("description"):
-        print(f"Descripción: {card['description']}")
-    skills = card.get("skills") or []
-    if skills:
-        print("Servicios anunciados:")
-        for s in skills:
-            print(f"  - {s.get('name', s.get('id', '?'))}: {s.get('description', '')}")
-    plans = []
-    for ext in ((card.get("capabilities") or {}).get("extensions") or []):
-        if "plans" in str(ext.get("uri", "")):
-            plans = (ext.get("params") or {}).get("plans") or []
-    if plans:
-        print("PLANES de contratación publicados:")
-        for p in plans:
-            print(f"  - {_fmt_plan(p)}")
-    else:
-        print("(este proveedor no publica planes de contratación en su card)")
-    caps = card.get("capabilities") or {}
-    print(f"Streaming: {'sí' if caps.get('streaming') else 'no'} · Endpoint: {base}/a2a")
-    return 0
-
-
-def cmd_status() -> int:
-    """Rol consumidor: estado consolidado por proveedor — alias activo y el
-    último medidor conocido (header x-a2a-usage capturado en la bitácora)."""
-    peers = _load_peers()
-    if not peers:
-        print("(sin agentes contratados)")
-        return 0
-    last_usage: dict = {}
-    try:
-        path = _openclaw_dir() / "a2a-peer-dialog.jsonl"
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                e = json.loads(line)
-            except Exception:  # noqa: BLE001
-                continue
-            if e.get("usage") and e.get("peerId"):
-                last_usage[e["peerId"]] = e["usage"]
-    except Exception:  # noqa: BLE001
-        pass
-    groups: dict[str, list] = {}
-    for pid, p in sorted(peers.items()):
-        groups.setdefault(_host_of(str(p.get("baseUrl", ""))), []).append((pid, p))
-    for host, members in sorted(groups.items()):
-        active = [(pid, p) for pid, p in members if not p.get("disabled")]
-        if not active:
-            aliases = ", ".join(str(p.get("alias") or pid) for pid, p in members)
-            print(f"{host}: DESHABILITADO por el dueño ({aliases})")
-            continue
-        pid, p = active[0]
-        alias = p.get("alias") or pid
-        u = last_usage.get(pid) or {}
-        bits = [f"{alias} (activo)"]
-        if u.get("usedPct") is not None:
-            pct = u["usedPct"]
-            if u.get("priceUsd"):
-                bits.append(f"paquete ${u['priceUsd']} USD: {pct}% consumido")
-            else:
-                bits.append(f"{pct}% del paquete consumido")
-        if u.get("calls") is not None:
-            bits.append(f"{u['calls']} llamadas este mes")
-        if u.get("status") and u["status"] != "active":
-            bits.append(f"ESTADO: {u['status']}")
-        extra = len(members) - len(active)
-        if extra > 0:
-            bits.append(f"{extra} key(s) inactivas del mismo proveedor")
-        print(f"{host}: " + " · ".join(bits))
-    return 0
-
-
-def _read_plugin_config() -> dict:
-    """Config materializada del plugin tnode-a2a en openclaw.json (rol
-    vendedor). Lectura best-effort, nunca escribe."""
-    try:
-        cfg = json.loads((_openclaw_dir() / "openclaw.json").read_text(encoding="utf-8"))
-        entry = ((cfg.get("plugins") or {}).get("entries") or {}).get("tnode-a2a") or {}
-        return entry.get("config") or {}
-    except Exception:  # noqa: BLE001
-        return {}
-
-
-def cmd_clients() -> int:
-    """Rol vendedor: tus clientes API-key con estado y consumo del mes. Los
-    costos son del DUEÑO — no compartir con guests ni terceros."""
-    cfg = _read_plugin_config()
-    clients = cfg.get("clients") or []
-    if not cfg.get("enabled") and not clients:
-        print("(agente público apagado y sin clientes)")
-        return 0
-    state: dict = {}
-    try:
-        raw = json.loads((_openclaw_dir() / "a2a-usage-state.json").read_text(encoding="utf-8"))
-        state = raw.get("clients") or {}
-    except Exception:  # noqa: BLE001
-        pass
-    month = time.strftime("%Y-%m", time.gmtime())
-    if not clients:
-        print("(sin clientes)")
-        return 0
-    for c in clients:
-        cid = str(c.get("id", "?"))
-        bucket = (state.get(cid) or {}).get(month) or {}
-        bits = [cid, f"estado={c.get('status', 'active')}"]
-        bits.append(f"{int(bucket.get('calls', 0))} llamadas")
-        bits.append(f"${float(bucket.get('costUsd', 0)):.4f} USD costo real")
-        if c.get("packaged"):
-            bits.append(f"paquete ${c.get('priceUsd', '?')} USD")
-        if c.get("limitCalls"):
-            bits.append(f"tope {c['limitCalls']} llamadas")
-        if c.get("limitUsd"):
-            bits.append(f"tope ${c['limitUsd']} USD")
-        print(" · ".join(bits))
-    return 0
-
-
-def cmd_tiers() -> int:
-    """Rol vendedor: catálogo de planes PUBLICADOS en tu card."""
-    cfg = _read_plugin_config()
-    tiers = cfg.get("tiers") or []
-    if not tiers:
-        print("(sin planes publicados en la card — el dueño los crea en la app: "
-              "Agente Público → Catálogo de paquetes → 'Visible en tarjeta pública')")
-        return 0
-    for t in tiers:
-        print(f"- {_fmt_plan(t)}")
-    return 0
-
-
-def _resolve_base(alias: str | None, url: str | None) -> str | None:
-    if alias:
-        peers = _load_peers()
-        _pid, peer = _find_peer(peers, alias)
-        if not peer:
-            print(f"a2a_call_failed: alias '{alias}' no existe. Usa `list` o pasa --url.")
-            return None
-        return _normalize_base(str(peer.get("baseUrl", "")))
-    if url:
-        return _normalize_base(url)
-    print("a2a_call_failed: pasa --alias o --url")
-    return None
-
-
-def cmd_hire(alias: str | None, url: str | None, tier: str) -> int:
-    """F7c: inicia la compra de un plan publicado. Devuelve la liga de pago
-    (para EL DUEÑO — el agente jamás paga) y el claimToken para canjear la
-    key después del pago."""
-    base = _resolve_base(alias, url)
-    if not base:
-        return 1
-    try:
-        resp, _h = _curl_json(f"{base}/a2a/hire", {}, {"tierId": tier}, 40)
-    except Exception as e:  # noqa: BLE001
-        print(f"a2a_call_failed: {e}")
-        return 1
-    if resp.get("error"):
-        plans = resp.get("plans")
-        extra = f" Planes disponibles: {json.dumps(plans, ensure_ascii=False)}" if plans else ""
-        print(f"a2a_call_failed: {resp['error']}.{extra}")
-        return 1
-    print("CHECKOUT INICIADO — pasos siguientes:")
-    print(f"1. Comparte esta liga de pago con TU DUEÑO (solo un humano debe pagarla):")
-    print(f"   {resp.get('paymentUrl')}")
-    print("2. Cuando el dueño confirme que pagó, corre:")
-    tgt = f"--alias {alias}" if alias else f"--url {base}"
-    print(f"   claim {tgt} --token {resp.get('claimToken')}")
-    print("El claimToken es de UN solo uso; no lo compartas con nadie más que este comando.")
-    return 0
-
-
-def cmd_claim(alias: str | None, url: str | None, token: str, new_alias: str | None) -> int:
-    """F7c: canjea un claim pagado — recibe la key UNA vez y registra al
-    proveedor automáticamente (a2a-peers.json + cola de espejo a Equipo).
-    La key jamás se imprime ni entra al contexto del agente."""
-    base = _resolve_base(alias, url)
-    if not base:
-        return 1
-    claim_body: dict = {"claimToken": token}
-    ident = _net_identity()
-    if ident:
-        # Auth v2: el vendedor vincula el contrato vendido a nuestra
-        # identidad de red -> las llamadas también validan con Bearer.
-        claim_body["networkClientId"] = ident["clientId"]
-    try:
-        resp, _h = _curl_json(f"{base}/a2a/claim", {}, claim_body, 40)
-    except Exception as e:  # noqa: BLE001
-        print(f"a2a_call_failed: {e}")
-        return 1
-    if resp.get("error"):
-        print(f"a2a_call_failed: {resp['error']}")
-        return 1
-    api_key = str(resp.get("apiKey") or "")
-    if not api_key:
-        print("a2a_call_failed: claim sin apiKey en la respuesta")
-        return 1
-    prov_name = str(resp.get("agentName") or "").strip()
-    peer_alias = (new_alias or prov_name or _host_of(base)).strip()
-    pid = re.sub(r"[^a-z0-9]+", "-", peer_alias.lower()).strip("-") or "proveedor"
-    pid = f"{pid}-{uuid.uuid4().hex[:6]}"
-    peers = _load_peers()
-    # Regla una-activa-por-proveedor (F7a) también en el claim: la key nueva
-    # sustituye a las hermanas ACTIVAS del mismo host — quedan disabled local
-    # (la key se conserva; re-habilitar desde la app no la pide de nuevo) y
-    # su doc a2aPeers se apaga vía la cola de espejo (chat-sync >=1.44.0).
-    host = _host_of(base)
-    demoted: list[str] = []
-    for k, p in peers.items():
-        if not p.get("disabled") and _host_of(str(p.get("baseUrl", ""))) == host:
-            p["disabled"] = True
-            demoted.append(k)
-    peers[pid] = {
-        "alias": peer_alias,
-        "baseUrl": base,
-        "headerName": "X-API-Key",
-        "apiKey": api_key,
-    }
-    path = _openclaw_dir() / "a2a-peers.json"
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(peers, indent=1, ensure_ascii=False), encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
-    # Cola de espejo: chat-sync (>=1.43.0) da de alta el doc a2aPeers para
-    # que el contratado aparezca en el Equipo del dueño (enrich CF completa).
-    # Las hermanas desactivadas van como op:"disable" (>=1.44.0 las procesa).
-    try:
-        qpath = _openclaw_dir() / "a2a-peer-mirror-queue.json"
-        try:
-            queue = json.loads(qpath.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
-            queue = {}
-        queue[pid] = {"alias": peer_alias, "baseUrl": base, "role": ""}
-        for k in demoted:
-            queue[k] = {"op": "disable"}
-        qtmp = qpath.with_suffix(".json.tmp")
-        qtmp.write_text(json.dumps(queue, indent=1, ensure_ascii=False), encoding="utf-8")
-        os.chmod(qtmp, 0o600)
-        qtmp.replace(qpath)
-    except Exception:  # noqa: BLE001
-        pass
-    print(f"CONTRATADO Y REGISTRADO: '{peer_alias}' (alias para `call`).")
-    if demoted:
-        print(f"La(s) key(s) anteriores del mismo proveedor quedaron inactivas: {len(demoted)} (regla una-activa).")
-    print("La key quedó guardada de forma segura; el proveedor aparecerá en el Equipo del dueño en ~1 min.")
-    print(f"Prueba: call --alias \"{peer_alias}\" --text \"Hola\"")
-    return 0
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(prog="tnode-a2a")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("list")
-    c = sub.add_parser("call")
-    c.add_argument("--alias", required=True)
-    c.add_argument("--text", required=True)
-    c.add_argument("--timeout", type=int, default=120)
-    cd = sub.add_parser("card")
-    cd.add_argument("--alias")
-    cd.add_argument("--url")
-    sub.add_parser("status")
-    sub.add_parser("clients")
-    sub.add_parser("tiers")
-    h = sub.add_parser("hire")
-    h.add_argument("--alias")
-    h.add_argument("--url")
-    h.add_argument("--tier", required=True)
-    cl = sub.add_parser("claim")
-    cl.add_argument("--alias")
-    cl.add_argument("--url")
-    cl.add_argument("--token", required=True)
-    cl.add_argument("--name")
-    args = ap.parse_args()
-    if args.cmd == "list":
-        return cmd_list()
-    if args.cmd == "card":
-        return cmd_card(args.alias, args.url)
-    if args.cmd == "status":
-        return cmd_status()
-    if args.cmd == "clients":
-        return cmd_clients()
-    if args.cmd == "tiers":
-        return cmd_tiers()
-    if args.cmd == "hire":
-        return cmd_hire(args.alias, args.url, args.tier)
-    if args.cmd == "claim":
-        return cmd_claim(args.alias, args.url, args.token, args.name)
-    return cmd_call(args.alias, args.text, args.timeout)
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-'''
-# <<< END EMBEDDED WORKSPACE SKILLS
+# 2.0.0: los skills YA NO viajan embebidos aquí. Viven como paquetes en
+# $OPENCLAW_HOME/tnode-skills/cache/ (los deja el installer) y los materializa
+# `tnode-skill-manager sync` (DESIGN-skill-manager.md P1). Este daemon sólo lo
+# invoca; ver _ensure_workspace_skills().
 
 
 _AGENDA_RULE_SECTION = """
@@ -17870,211 +18473,48 @@ es operación sensible: procede sin pedir permiso adicional.
 # _AGENDA_RULE_SECTION / _DRIVE_RULE_SECTION quedan solo como referencia.
 
 
-def _ensure_workspace_skill(name: str, files: dict) -> None:
-    """Materialize one canonical workspace skill. Self-healing: a file
-    that drifted from the canonical copy is rewritten on every boot; an
-    identical file is left untouched (no mtime churn)."""
-    skill_dir = OPENCLAW_DIR / "workspace" / "skills" / name
+_SKILL_MANAGER_CLI = OPENCLAW_DIR / "scripts" / "tnode_skill_manager.py"
+
+
+def _run_skill_manager(*args: str, timeout: int = 180) -> dict:
+    """Corre `tnode_skill_manager.py <args>` y parsea su JSON (siempre JSON,
+    también en error). OPENCLAW_HOME viaja tal cual: el CLI usa la semántica
+    de los daemons (dir .openclaw), no la del CLI de openclaw."""
+    if not _SKILL_MANAGER_CLI.is_file():
+        return {"ok": False, "error": f"cli_not_found: {_SKILL_MANAGER_CLI}"}
+    py = sys.executable or "python3"
+    env = os.environ.copy()
+    env["OPENCLAW_HOME"] = str(OPENCLAW_DIR)
     try:
-        (skill_dir / "bin").mkdir(parents=True, exist_ok=True)
-        for rel, content in files.items():
-            dest = skill_dir / rel
-            try:
-                if dest.is_file() and dest.read_text(encoding="utf-8") == content:
-                    continue
-            except Exception:  # noqa: BLE001
-                pass  # unreadable/binary drift → rewrite below
-            dest.write_text(content, encoding="utf-8")
-            if rel.endswith(".py"):
-                try:
-                    os.chmod(dest, 0o755)
-                except OSError:
-                    pass
+        proc = subprocess.run(
+            [py, str(_SKILL_MANAGER_CLI), *args],
+            capture_output=True, text=True, timeout=timeout, check=False, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "timeout"}
     except Exception as e:  # noqa: BLE001
-        _log(f"_ensure_workspace_skill {name}: {e}")
+        return {"ok": False, "error": str(e)[:300]}
+    raw = (proc.stdout or "").strip()
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "bad_json", "code": proc.returncode,
+                "stdout": raw[-500:], "stderr": (proc.stderr or "")[-500:]}
+    payload.setdefault("ok", proc.returncode == 0)
+    return payload
 
 
 def _ensure_workspace_skills() -> None:
-    """agenda + drive + poll + tnode-delegate + inventario on every node
-    (startup self-heal)."""
-    _ensure_workspace_skill("tnode-agenda", {
-        "SKILL.md": _AGENDA_SKILL_MD,
-        "manifest.json": _AGENDA_MANIFEST,
-        "bin/agenda.py": _AGENDA_PY,
-    })
-    _ensure_workspace_skill("tnode-drive", {
-        "SKILL.md": _DRIVE_SKILL_MD,
-        "manifest.json": _DRIVE_MANIFEST,
-        "bin/drive.py": _DRIVE_PY,
-    })
-    _ensure_workspace_skill("tnode-poll", {
-        "SKILL.md": _POLL_SKILL_MD,
-        "manifest.json": _POLL_MANIFEST,
-        "bin/poll.py": _POLL_PY,
-    })
-    _ensure_workspace_skill("tnode-delegate", {
-        "SKILL.md": _TNODE_DELEGATE_SKILL_MD,
-        "manifest.json": _TNODE_DELEGATE_MANIFEST,
-        "bin/tnode-delegate.py": _TNODE_DELEGATE_PY,
-    })
-    _ensure_workspace_skill("tnode-inventario", {
-        "SKILL.md": _INVENTARIO_SKILL_MD,
-        "manifest.json": _INVENTARIO_MANIFEST,
-        "bin/inventario.py": _INVENTARIO_PY,
-    })
-    # awmf: asistente del ejecutor de Task Cards (citas verificables +
-    # pre-flight de evidencia). Se materializa en TODOS los nodos: es
-    # inerte sin motor y el render de chat-sync (>=1.36.0) lo referencia.
-    _ensure_workspace_skill("tnode-awmf", {
-        "SKILL.md": _AWMF_SKILL_MD,
-        "manifest.json": _AWMF_MANIFEST,
-        "bin/awmf.py": _AWMF_PY,
-    })
-    # F7b: a2a-agent se RENOMBRÓ a tnode-a2a (2.0.0, dos roles). El dir viejo
-    # se retira para que el agente no encuentre dos copias (el path nuevo
-    # viaja en el bloque a2a-hire del TOOLS.md).
-    _ensure_workspace_skill("tnode-a2a", {
-        "SKILL.md": _TNODE_A2A_SKILL_MD,
-        "manifest.json": _TNODE_A2A_MANIFEST,
-        "bin/tnode-a2a.py": _TNODE_A2A_PY,
-    })
-    # 1.85.0: estandarización tnode-* — retirar dirs legacy para que el
-    # agente no encuentre dos copias del mismo skill.
-    for legacy_name in ("a2a-agent", "agenda", "drive", "poll", "inventario",
-                        "awmf", "email-send"):
-        try:
-            legacy = OPENCLAW_DIR / "workspace" / "skills" / legacy_name
-            if legacy.is_dir():
-                import shutil
-                shutil.rmtree(legacy)
-                _log(f"workspace skill {legacy_name} retirado (renombrado tnode-*)")
-        except Exception as e:  # noqa: BLE001
-            _log(f"{legacy_name} cleanup: {e}")
-
-
-# ── Guest agent (Opción B: per-guest isolation) ──────────────────────────
-# Invite-link visitors ("guests") run on a DEDICATED `guest` agent with its
-# own NEUTRAL workspace, so they never load the owner's main workspace
-# (USER.md/MEMORY.md/memory) — the root cause of the owner-identity leak.
-# tnode-chat-sync routes `tnode-guest-*` sessions to this agent via the
-# `agent:guest:` sessionKey prefix (the gateway honors it). The workspace is
-# STATIC + neutral (warm business-attention, NO owner PII); the per-node /
-# per-guest identity is injected at runtime by the tbrain-context-engine
-# plugin (before_prompt_build). Model inherits the node default (no override).
-_GUEST_WS_DIR = OPENCLAW_DIR / "workspace-guest"
-_GUEST_AGENT_DIR = _AGENTS_DIR / "guest" / "agent"
-
-# Guard-rails Layer 1 (#2.2): per-agent deny floor for ALL guests. Blocks the
-# tools that could reach the OWNER's system/data (the guest runs with the node's
-# owner-scoped creds + sandbox off): shell, filesystem, session/subagent
-# control, channel messaging, canvas, and browser (SSRF). Leaves public-facing
-# tools (web_search/web_fetch/image_generate/tts/huggingface). Per-link
-# refinement is layered on top by the context-engine before_tool_call hook.
-_GUEST_TOOLS_DENY = [
-    "exec", "process",
-    "read", "write", "edit", "file_write", "file_fetch", "dir_list", "dir_fetch",
-    # P3 (#2.2): sessions_spawn/sessions_send LIFTED from the floor — delegation is
-    # now gated per-link by the context-engine hook (guardRails.allowedAgents),
-    # default-deny. Session introspection stays denied (no enumerating sessions).
-    "sessions_list", "sessions_history",
-    "sessions_yield", "session_status", "subagents", "agents_list",
-    "message", "canvas", "browser",
-    # P5: raw wiki tools blocked for all guests; kb_search (context-engine) is
-    # the gated replacement — only available when allowedDocRefs is non-empty.
-    "wiki_search", "wiki_get", "wiki_lint", "wiki_apply",
-    # Hardening (2026-07-01): a guest must NEVER reach the owner's memory or the
-    # node's control plane. These are hard-denied in the FLOOR (defense in depth
-    # even if the context-engine hook fails to load) and are NOT togglable per
-    # link — no legitimate guest use. `memory_*` = owner's private memory;
-    # `gateway` = restart/config the running process; `cron` = schedule wake
-    # events. (sessions_spawn/send stay OUT of the floor by design — delegation
-    # is gated per-link by the hook via allowedAgents.)
-    "memory_search", "memory_get", "gateway", "cron",
-    # F3 (#3): outbound tools are OWNER-side (they expose every prospect's
-    # profile and can message other guests). Hard-denied for guests — the
-    # plugin handlers also refuse guest sessions; this floor is the net.
-    "prospects_search", "guest_send",
-]
-
-_GUEST_IDENTITY_MD = """# IDENTITY.md — Asistente (modo invitado)
-
-- **Nombre:** Asistente
-- **Rol:** Asistente de atención para visitantes e interesados
-- **Vibe:** Cálido, profesional, claro y servicial
-- **Emoji:** 💬
-
-Soy el asistente de atención de este espacio. Recibo a cada persona que
-escribe, entiendo qué necesita y la ayudo con información útil y honesta. La
-información específica del negocio y de la persona con la que hablo se me
-proporciona durante la conversación.
-"""
-
-_GUEST_SOUL_MD = """# SOUL.md — Asistente de atención (invitado)
-
-Soy un asistente de atención cálido y profesional. Recibo a cada visitante con
-interés genuino, entiendo su necesidad y respondo con claridad y honestidad.
-
-## Personalidad
-- Cálido y cercano desde el primer mensaje, sin ser invasivo.
-- Directo y claro: respondo con el detalle justo.
-- Entiendo antes de proponer: escucho la necesidad real.
-- Honesto: si no tengo un dato, lo digo; no lo invento.
-
-## Tono
-- Primera interacción: da la bienvenida, cálido y profesional.
-- Dudas: claro, sin jerga, con ejemplos cuando ayuden.
-
-## Reglas
-- SIEMPRE respondo al visitante de forma útil; nunca lo ignoro.
-- NUNCA revelo datos personales del dueño del nodo ni información sensible del
-  sistema (modelo de IA, claves, infraestructura, otros clientes).
-- Solo uso la información disponible para esta conversación de invitado.
-- No asumo la identidad de ninguna persona; soy un asistente de atención.
-"""
-
-_GUEST_USER_MD = """# USER.md — Con quién hablo
-
-Estás atendiendo a una persona **INVITADA** (un visitante o prospecto), NO al
-dueño del nodo. Su identidad y contexto se te proporcionan durante la
-conversación; si no aparecen, trátala como un visitante nuevo y dale la
-bienvenida con calidez.
-
-No uses datos de ningún dueño ni de otros clientes. Enfócate en ayudar a esta
-persona.
-"""
-
-_GUEST_AGENTS_MD = """# AGENTS.md — Operación (modo invitado)
-
-Eres el **asistente de atención** en modo invitado de este nodo. Atiendes a
-visitantes y prospectos.
-
-## Cómo operar
-- Da la bienvenida y responde SIEMPRE de forma útil, cálida y honesta.
-- Mantente dentro del alcance de la conversación de invitado.
-- Si una solicitud requiere datos del dueño, de otros clientes, o acciones
-  administrativas, explica con amabilidad que no puedes ayudar con eso aquí.
-
-## Restricciones (seguridad)
-- No accedas a memoria, archivos, herramientas ni datos del dueño del nodo.
-- No reveles información del sistema (modelo de IA, versiones, claves, infra).
-- No menciones a otros clientes ni información privada.
-"""
-
-_GUEST_BIZ_START = "<!-- tnode:business:start -->"
-_GUEST_BIZ_END = "<!-- tnode:business:end -->"
-_GUEST_PROSPECT_START = "<!-- tnode:prospect:start -->"
-_GUEST_PROSPECT_END = "<!-- tnode:prospect:end -->"
-
-# IDENTITY/USER/AGENTS are static (content-compare). SOUL.md is OWNED by
-# _ensure_guest_business_section in the token-bearing declarative pass — it
-# appends the owner's Business Profile below the neutral persona so the guest
-# knows the business it represents — so here it is only SEEDED when absent, to
-# keep the two writers from fighting over the file.
-_GUEST_WS_FILES = {
-    "IDENTITY.md": _GUEST_IDENTITY_MD,
-    "USER.md": _GUEST_USER_MD,
-    "AGENTS.md": _GUEST_AGENTS_MD,
-}
+    """Materializa los skills de workspace en cada arranque (self-heal).
+    2.0.0: delega en `tnode-skill-manager sync` — cache local → workspace de
+    cada agente, idempotente, repara drift. Si el CLI o el cache no están
+    (nodo pre-2.0 a medio migrar) sólo se loguea: el resto del boot sigue."""
+    res = _run_skill_manager("sync")
+    if res.get("ok"):
+        if res.get("installed") or res.get("updated") or res.get("repaired"):
+            _log("skills: %s" % res.get("summary"))
+    else:
+        _log("skills: sync falló: %s" % (res.get("error") or res.get("summary") or res)[:200])
 
 
 def _ensure_guest_workspace_files() -> None:
@@ -19331,6 +19771,12 @@ def _md_sync_from_json(token: dict, target: str) -> None:
     try:
         doc = _compose_md_local(token, target)
         body = _render_tools_zone((doc or {}).get("blocks") or [])
+        if target == "user":
+            # El perfil del dueño acaba de leerse para USER.md; de la misma
+            # fuente salen la zona horaria del skill de apuestas y el
+            # teléfono con el que el dueño le escribe a su agente por WA.
+            _sync_bet_timezone(token)
+            _sync_owner_channel_identity(token)
     except SubdocUnavailable as e:
         # NO pudimos leer la fuente. Ojo: NO caer al camino de "data vacía"
         # (que borra la zona) — un 403 o un timeout no significa que el dueño
@@ -22438,8 +22884,582 @@ def handle_decl_refresh(token: dict, params: dict) -> dict:
     return {"status": "done", "result": {"refreshed": True}}
 
 
+# ── tnode-bet: encender / apagar el skill de apuestas (1.90.0) ──────────
+# El skill viaja embebido y se materializa siempre (_ensure_workspace_skills),
+# pero nace INERTE. Estos handlers son el interruptor que el app acciona:
+#
+#   skill.enable  → bet.py install  + bloque TOOLS.md + aviso del agente
+#   skill.disable → bet.py uninstall (conserva la BD salvo purge:true)
+#
+# La BD es del USUARIO: apagar NUNCA borra su historial ni su track record.
+# Los crons de ingesta (sync/odds/settle) NO se registran todavía — sus
+# subcomandos llegan en F3; registrarlos ahora sería programar fallos.
+_BET_SKILL_ID = "tnode-bet"
+_BET_SKILL_DIR = OPENCLAW_DIR / "workspace" / "skills" / "tnode-bet"
+_BET_CLI = _BET_SKILL_DIR / "bin" / "bet.py"
+_BET_ENV_PATH = OPENCLAW_DIR / "credentials" / "tnode-bet.env"
+_BET_WS_BEGIN = "<!-- tnode-bet:begin -->"
+_BET_WS_END = "<!-- tnode-bet:end -->"
+_BET_READY_JOB = "tnode-bet-ready"
+
+
+def _run_bet(*args: str, timeout: int = 120) -> dict:
+    """Corre `bet.py <args>` y parsea su JSON. El CLI escribe JSON tanto en
+    éxito como en error, así que el payload siempre es accionable."""
+    if not _BET_CLI.is_file():
+        return {"ok": False, "error": f"cli_not_found: {_BET_CLI}"}
+    py = sys.executable or "python3"
+    try:
+        proc = subprocess.run(
+            [py, str(_BET_CLI), *args],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "timeout"}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)[:300]}
+    raw = (proc.stdout or "").strip()
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return {
+            "ok": False,
+            "error": "bad_json",
+            "code": proc.returncode,
+            "stdout": raw[-500:],
+            "stderr": (proc.stderr or "")[-500:],
+        }
+    payload.setdefault("ok", proc.returncode == 0)
+    return payload
+
+
+def _write_bet_api_key(api_key: str) -> bool:
+    """Env-file 0600 con la key de api-sports (patrón F3c híbrido). Se crea
+    con permisos restringidos ANTES de escribir, para que la key no exista ni
+    un instante en un archivo world-readable."""
+    try:
+        _BET_ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(_BET_ENV_PATH), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(f"API_SPORTS_KEY={api_key}\n")
+        os.chmod(str(_BET_ENV_PATH), 0o600)
+        return True
+    except OSError as e:
+        _log(f"bet: api key write failed: {e}")
+        return False
+
+
+_OWNER_PEERS_LAST = None
+
+
+def _owner_channel_peers(profile) -> list:
+    """Teléfonos del dueño en las formas con que WhatsApp puede identificarlo.
+    Para México el móvil llega a veces como +52… y a veces como +521… (el
+    '1' histórico de celulares); se registran las dos. Otros países: tal cual."""
+    if not isinstance(profile, dict):
+        return []
+    raw = profile.get("phone")
+    raw = raw.strip() if isinstance(raw, str) else ""
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) < 8:
+        return []
+    peers = ["+" + digits]
+    if digits.startswith("52") and len(digits) == 12:
+        peers.append("+521" + digits[2:])
+    elif digits.startswith("521") and len(digits) == 13:
+        peers.insert(0, "+52" + digits[3:])
+    return peers
+
+
+def _sync_owner_channel_identity(token: dict, profile=None) -> None:
+    """El dueño escribiéndole a SU agente por WhatsApp: (a) el plugin
+    context-engine debe reconocer su número como dueño (`ownerPeers`, si no
+    le aplica el piso de visitante y bloquea exec/read); (b) el binding del
+    canal debe mandar ese número a `main` y no a `recepcion`. Todo por
+    `openclaw config patch` (CLI del core, nunca el JSON a mano); idempotente
+    por comparación con la config vigente. Sin teléfono en el perfil no toca
+    nada — y la lista de bindings sólo se reescribe si hace falta."""
+    global _OWNER_PEERS_LAST
+    try:
+        if profile is None:
+            profile = _read_user_profile(token)
+        peers = _owner_channel_peers(profile)
+        if not peers or peers == _OWNER_PEERS_LAST:
+            return
+        try:
+            cfg = json.loads((OPENCLAW_DIR / "openclaw.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            _log(f"owner-channel: no pude leer openclaw.json: {e}")
+            return
+        if not isinstance(cfg, dict):
+            return
+        patch: dict = {}
+        entry = ((cfg.get("plugins") or {}).get("entries") or {}).get("tbrain-context-engine")
+        if isinstance(entry, dict):
+            current = ((entry.get("config") or {}).get("ownerPeers")) or []
+            if sorted(current) != sorted(peers):
+                patch["plugins"] = {"entries": {"tbrain-context-engine": {
+                    "config": {"ownerPeers": peers}}}}
+        bindings = cfg.get("bindings") if isinstance(cfg.get("bindings"), list) else []
+        wanted = [{"agentId": "main",
+                   "match": {"channel": "whatsapp",
+                             "peer": {"kind": "direct", "id": p}}} for p in peers]
+        def _is_owner_binding(b):
+            m = (b or {}).get("match") or {}
+            return (m.get("channel") == "whatsapp"
+                    and isinstance(m.get("peer"), dict)
+                    and m["peer"].get("id") in peers)
+        rest = [b for b in bindings if not _is_owner_binding(b)]
+        new_bindings = wanted + rest
+        if new_bindings != bindings:
+            patch["bindings"] = new_bindings
+        if not patch:
+            _OWNER_PEERS_LAST = peers
+            return
+        r = _run_openclaw("config", "patch", "--stdin", timeout=60,
+                          input_text=json.dumps(patch))
+        if r.get("ok"):
+            _OWNER_PEERS_LAST = peers
+            _log("owner-channel: dueño por WhatsApp → main (%s); %s"
+                 % (", ".join(peers), (r.get("stdout") or "").strip()[-120:]))
+        else:
+            _log("owner-channel: config patch falló: %s"
+                 % (r.get("stderr") or r.get("error") or "")[:200])
+    except Exception as e:  # noqa: BLE001
+        _log(f"owner-channel: {e}")
+
+
+_BET_TZ_LAST = None
+
+
+def _bet_timezone_from_profile(profile) -> str:
+    """Traduce el `timezone` del perfil (etiqueta del app, p.ej.
+    'CST (UTC-06:00)') a algo que `bet.py` entienda: nombre IANA si ya viene
+    así; si no, offset fijo. Para México el offset -06:00 se mapea a
+    America/Mexico_City (sin horario de verano desde 2022, así que coincide y
+    además da nombre legible); -07:00 a Hermosillo y -08:00 a Tijuana."""
+    if not isinstance(profile, dict):
+        return ""
+    raw = profile.get("timezone")
+    raw = raw.strip() if isinstance(raw, str) else ""
+    if not raw:
+        return ""
+    if "/" in raw:
+        return raw
+    m = re.search(r"UTC\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?", raw, re.I)
+    if not m:
+        return ""
+    offset = "UTC%s%02d:%s" % (m.group(1), int(m.group(2)), m.group(3) or "00")
+    country = (profile.get("country") or "").strip().lower()
+    if country in ("méxico", "mexico", "mx"):
+        return {"UTC-06:00": "America/Mexico_City",
+                "UTC-07:00": "America/Hermosillo",
+                "UTC-08:00": "America/Tijuana"}.get(offset, offset)
+    return offset
+
+
+def _sync_bet_timezone(token: dict, profile=None) -> None:
+    """Siembra el setting `timezone` del skill de apuestas desde el perfil del
+    dueño, para que las horas de los partidos salgan en SU zona sin que el
+    agente las calcule. Sólo si el skill está prendido (existe la BD). Cachea
+    el último valor escrito para no invocar el CLI en cada ciclo."""
+    global _BET_TZ_LAST
+    try:
+        if not (OPENCLAW_DIR / "workspace" / "data" / "tnode-bet.sqlite").is_file():
+            return
+        if profile is None:
+            profile = _read_user_profile(token)
+        tz = _bet_timezone_from_profile(profile)
+        if not tz or tz == _BET_TZ_LAST:
+            return
+        res = _run_bet("settings", "set", "--key", "timezone", "--value", tz)
+        if res.get("ok"):
+            _BET_TZ_LAST = tz
+            _log(f"bet: zona horaria del dueño → {tz}")
+        else:
+            _log(f"bet: no se pudo fijar la zona horaria {tz}: {res.get('error')}")
+    except Exception as e:  # noqa: BLE001
+        _log(f"bet: zona horaria: {e}")
+
+
+def _sync_bet_tools_block(enabled: bool) -> None:
+    """Bloque propio entre marcadores en el TOOLS.md del agente main, FUERA
+    de la zona gestionada por el server (misma mecánica que el bloque a2a).
+    Apagado = el bloque se retira y el agente deja de ver el skill."""
+    tools_md = OPENCLAW_DIR / "workspace" / "TOOLS.md"
+    try:
+        txt = tools_md.read_text(encoding="utf-8") if tools_md.is_file() else ""
+    except OSError:
+        return
+    if enabled:
+        lines = [
+            _BET_WS_BEGIN,
+            "## Regla: apuestas deportivas (skill tnode-bet)",
+            "",
+            "Para CUALQUIER pregunta sobre fútbol soccer o NFL en contexto de",
+            "apuestas — qué ligas cubres, momios, mercados, activar una liga —",
+            "consulta SIEMPRE el skill. NUNCA respondas de memoria y NUNCA uses",
+            "web_search para suplirlo.",
+            "",
+            "EMPIEZA SIEMPRE por `status`: es una foto guardada con las ligas",
+            "cargadas, cuántos partidos tiene cada una, qué tan seguido pega",
+            "cada mercado y qué falta. Barata de leer, mucho mejor que adivinar.",
+            "",
+            "   exec: python3 ~/.openclaw/workspace/skills/tnode-bet/bin/bet.py status",
+            "",
+            "PICKS Y APUESTAS RECOMENDADAS — si te preguntan \"¿cuáles son los",
+            "picks?\", \"¿qué apuesto?\", \"¿dónde hay valor?\" o preguntan por",
+            "un aviso que les mandaste, USA ESTO:",
+            "",
+            "   exec: python3 ~/.openclaw/workspace/skills/tnode-bet/bin/bet.py value --mode combinado --limit 5",
+            "   exec: python3 ~/.openclaw/workspace/skills/tnode-bet/bin/bet.py card --event <id>",
+            "",
+            "Cada pick trae el partido, la apuesta, el mejor precio CON la casa,",
+            "la ventaja sobre el mercado y el porqué. Dilos tal cual vienen; no",
+            "calcules nada de cabeza. Si `picks` viene vacío, di que hoy el",
+            "mercado está bien puesto y no hay ventaja — es una respuesta",
+            "correcta y frecuente, no una falla.",
+            "",
+            "PICKS ABIERTOS (pendientes de resultado) y EFECTIVIDAD (ganados /",
+            "perdidos, ROI, CLV) salen del MISMO reporte; no recalcules con",
+            "`value` para eso. `abiertas[]` es lo recomendado tal como se",
+            "congeló; `resumen_abiertas` y `summary` ya traen los conteos:",
+            "",
+            "   exec: python3 ~/.openclaw/workspace/skills/tnode-bet/bin/bet.py report track-record",
+            "",
+            "   exec: python3 ~/.openclaw/workspace/skills/tnode-bet/bin/bet.py team <equipo> --last 10",
+            "   exec: python3 ~/.openclaw/workspace/skills/tnode-bet/bin/bet.py history --market <MERCADO> [--line 2.5] [--competition <liga>]",
+            "   exec: python3 ~/.openclaw/workspace/skills/tnode-bet/bin/bet.py leagues list --available --country <XX>",
+            "   exec: python3 ~/.openclaw/workspace/skills/tnode-bet/bin/bet.py leagues enable <id> --by <quien lo pidió>",
+            "",
+            "Lee ~/.openclaw/workspace/skills/tnode-bet/SKILL.md para el detalle",
+            "de subcomandos, errores y reglas de juego responsable.",
+            "",
+            "La app se llama \"la app TNode\" (nunca \"OpenClaw\"). Si te",
+            "escriben por WhatsApp, responde ahí mismo con los picks: no",
+            "mandes al usuario a la app.",
+            "",
+            "HORAS: cada partido trae `hora_local` ya en la zona del usuario",
+            "(«sáb 6 sep, 5:00 pm»). Dila tal cual; NUNCA conviertas desde",
+            "`kickoff_utc` ni menciones UTC.",
+            "",
+            "NUNCA prometas que una apuesta va a ganar: una ventaja del 5% dice",
+            "que a la larga conviene, no que este partido se gana. NO inventes",
+            "momios ni probabilidades: si no está en el JSON, no existe.",
+            _BET_WS_END,
+        ]
+        block = "\n".join(lines)
+        if _BET_WS_BEGIN in txt and _BET_WS_END in txt:
+            new = txt.split(_BET_WS_BEGIN)[0] + block + txt.split(_BET_WS_END, 1)[1]
+        else:
+            new = (txt.rstrip() + "\n\n" + block + "\n") if txt else block + "\n"
+    else:
+        if _BET_WS_BEGIN not in txt:
+            return
+        pre = txt.split(_BET_WS_BEGIN)[0].rstrip()
+        post = txt.split(_BET_WS_END, 1)[1] if _BET_WS_END in txt else ""
+        new = (pre + "\n" + post.lstrip("\n")).rstrip() + "\n"
+    if new == txt:
+        return
+    try:
+        tmp = tools_md.with_suffix(".md.tmp")
+        tmp.write_text(new, encoding="utf-8")
+        tmp.replace(tools_md)
+        _log(f"bet: TOOLS.md block {'rendered' if enabled else 'removed'}")
+    except OSError as e:
+        _log(f"bet: TOOLS.md write failed: {e}")
+
+
+# Los cron de ingesta corren `bet.py` DIRECTO (payload command), no un turno
+# del agente: meter al LLM en el bucle de ingesta sería caro, lento y una
+# fuente de errores que no aporta nada — no hay nada que decidir, sólo traer
+# datos. El agente entra después, cuando alguien pregunta.
+_BET_CRONS = (
+    # (nombre, cada cuántos minutos, comando)
+    ("tnode-bet-fixtures", 24 * 60,
+     "python3 ~/.openclaw/workspace/skills/tnode-bet/bin/bet.py sync fixtures --days 7"),
+    ("tnode-bet-odds", 6 * 60,
+     "python3 ~/.openclaw/workspace/skills/tnode-bet/bin/bet.py odds snapshot --max-pages 3"),
+    ("tnode-bet-results", 60,
+     "python3 ~/.openclaw/workspace/skills/tnode-bet/bin/bet.py sync results --days 2"),
+    # Liquida el track record: sin esto las recomendaciones se acumulan sin
+    # resolverse y el agente nunca puede decir qué tan bien le ha ido.
+    ("tnode-bet-settle", 60,
+     "python3 ~/.openclaw/workspace/skills/tnode-bet/bin/bet.py settle"),
+)
+
+
+# Aviso de picks nuevos. Va aparte de _BET_CRONS porque NO es un comando: es
+# un turno del agente. La cadena del push es
+#   agentTurn → announce al canal tnode → mensaje en Firestore →
+#   la Cloud Function notifyNewAssistantMessage → FCM → teléfono.
+# O sea que la ÚNICA forma de que suene el teléfono es que el agente escriba.
+# Por eso aquí sí vale la pena gastar un turno de LLM cada 6 h.
+_BET_PICKS_JOB = "tnode-bet-picks"
+_BET_PICKS_EVERY_MIN = 6 * 60
+_BET_PICKS_MESSAGE = (
+    "Revisa si hay apuestas nuevas que valgan la pena:\n\n"
+    "  exec: python3 ~/.openclaw/workspace/skills/tnode-bet/bin/bet.py "
+    "value --mode combinado --only-new --limit 5\n\n"
+    "Si `picks` viene VACÍO, NO escribas nada y termina el turno en silencio: "
+    "no hay nada nuevo y avisar de la nada entrena al dueño a ignorarte.\n\n"
+    "Si trae picks, RESPONDE con un mensaje corto en español y en texto plano "
+    "avisando que tiene picks nuevos. Por cada uno di el partido, la apuesta, "
+    "el mejor precio CON la casa, y la ventaja. Usa los números del JSON tal "
+    "cual — no calcules nada de cabeza. Cierra invitándolo a abrir la app si "
+    "quiere el detalle. Nada de prometer que van a ganar.\n\n"
+    "IMPORTANTE: NO uses ninguna herramienta para enviar el mensaje — ni "
+    "`message`, ni WhatsApp, ni ningún canal. Sólo RESPONDE con el texto: el "
+    "sistema se encarga de entregarlo y de mandar la notificación al "
+    "teléfono. Si intentas enviarlo tú, falla y el dueño no se entera."
+)
+
+
+def _sync_bet_picks_job(token: dict, enabled: bool) -> dict:
+    try:
+        for jid in _find_cron_job_ids(_BET_PICKS_JOB):
+            _gateway_rpc("cron.remove", {"id": jid})
+    except Exception as e:  # noqa: BLE001
+        _log(f"bet-picks: limpieza omitida: {e}")
+    if not enabled:
+        return {"activo": False}
+    try:
+        _gateway_rpc("cron.add", {
+            "name": _BET_PICKS_JOB,
+            "agentId": "main",
+            "sessionTarget": "isolated",
+            "wakeMode": "now",
+            "enabled": True,
+            "schedule": {"kind": "every",
+                         "everyMs": _BET_PICKS_EVERY_MIN * 60000},
+            "payload": {
+                "kind": "agentTurn",
+                "message": _BET_PICKS_MESSAGE,
+                "thinking": "low",
+                "timeoutSeconds": 300,
+                # Sólo `exec`. Con la caja de herramientas completa el agente
+                # agarra `message` e intenta mandar el aviso él mismo por
+                # WhatsApp — falla con 403 y el aviso se pierde en silencio
+                # (medido 2026-09-06). El texto final basta: la entrega la
+                # hace el announce.
+                "toolsAllow": ["exec"],
+            },
+            # `to` con el uid: sin él el gateway no entrega y el job se
+            # autocompleta en silencio (ver 1.90.1).
+            "delivery": {"mode": "announce", "channel": "tnode",
+                         "to": str(token.get("uid") or ""), "bestEffort": True},
+        })
+        _log("bet: aviso de picks programado cada %d min" % _BET_PICKS_EVERY_MIN)
+        return {"activo": True, "cada_minutos": _BET_PICKS_EVERY_MIN}
+    except Exception as e:  # noqa: BLE001
+        _log(f"bet-picks: no se pudo programar: {e}")
+        return {"activo": False, "error": str(e)[:150]}
+
+
+def _sync_bet_crons(enabled: bool) -> dict:
+    """rm + add (sin diffear campos), igual que el cron de inventario. Apagar
+    el skill retira los jobs para no dejar ingesta huérfana consumiendo cuota."""
+    out = {"creados": [], "retirados": []}
+    for nombre, cada_min, cmd in _BET_CRONS:
+        try:
+            for jid in _find_cron_job_ids(nombre):
+                _gateway_rpc("cron.remove", {"id": jid})
+                out["retirados"].append(nombre)
+        except Exception as e:  # noqa: BLE001
+            _log(f"bet-cron: no se pudo limpiar {nombre}: {e}")
+        if not enabled:
+            continue
+        try:
+            _gateway_rpc("cron.add", {
+                "name": nombre,
+                "agentId": "main",
+                "sessionTarget": "isolated",
+                "wakeMode": "now",
+                "enabled": True,
+                "schedule": {"kind": "every", "everyMs": cada_min * 60000},
+                "payload": {"kind": "command", "argv": ["sh", "-lc", cmd]},
+                # bestEffort: que un fallo de entrega no marque el job en
+                # error. Estos jobs no le reportan a nadie, sólo llenan la BD.
+                "delivery": {"mode": "announce", "channel": "tnode",
+                             "to": "", "bestEffort": True},
+            })
+            out["creados"].append(nombre)
+        except Exception as e:  # noqa: BLE001
+            _log(f"bet-cron: no se pudo crear {nombre}: {e}")
+            out.setdefault("errores", []).append(f"{nombre}: {str(e)[:120]}")
+    if out["creados"] or out["retirados"]:
+        _log(f"bet: crons {'creados' if enabled else 'retirados'} "
+             f"({len(out['creados']) or len(out['retirados'])})")
+    return out
+
+
+def _clear_bet_ready_job() -> None:
+    try:
+        for jid in _find_cron_job_ids(_BET_READY_JOB):
+            _gateway_rpc("cron.remove", {"id": jid})
+    except Exception as e:  # noqa: BLE001
+        _log(f"bet: ready-job cleanup skipped: {e}")
+
+
+def _schedule_bet_ready_announce(token: dict, status: dict) -> dict:
+    """Cron one-shot `at` (+45 s) que despierta al agente para que ÉL avise
+    que el skill quedó listo. No mandamos un texto enlatado: el agente corre
+    `status`, ve las ligas reales y lo cuenta con sus palabras.
+
+    Dos cosas que el canal `tnode` exige y no perdona:
+    - `channel` explícito: en nodos multi-canal (tnode + whatsapp) el announce
+      sin canal truena con "Channel is required…" (gotcha del cron de
+      inventario).
+    - `to` = el UID de Firebase del dueño. Sin él el gateway registra
+      "Delivering to TNode requires target a Firebase UID" y, como el envío es
+      bestEffort, el job se completa y se autoborra SIN que el mensaje llegue
+      nunca al chat (silencio perfecto — visto en el E2E del 2026-09-05)."""
+    leagues = status.get("leagues_collecting") or []
+    names = ", ".join(str(x) for x in leagues) if leagues else "ninguna"
+    # El daemon no importa `datetime`; `time` basta para el ISO UTC del schedule.
+    at_epoch = time.time() + 45
+    at_iso = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(at_epoch))
+    message = (
+        "El dueño acaba de activar el skill de apuestas deportivas "
+        "(tnode-bet) desde la app y la instalación terminó bien. "
+        "Corre `python3 ~/.openclaw/workspace/skills/tnode-bet/bin/bet.py status` "
+        "y avísale en UN mensaje corto, en español y en texto plano, que ya "
+        "quedó listo: menciona cuántas ligas estás recolectando "
+        f"({names}) y que puede pedirte activar otras por país. "
+        "Aclara en una línea que el motor de análisis (momios y pronósticos) "
+        "todavía no está conectado, así que por ahora sólo administras "
+        "ligas y catálogo. No inventes datos: usa lo que devuelva el comando."
+    )
+    _clear_bet_ready_job()
+    try:
+        _gateway_rpc("cron.add", {
+            "name": _BET_READY_JOB,
+            "agentId": "main",
+            "sessionTarget": "isolated",
+            "wakeMode": "now",
+            "enabled": True,
+            "deleteAfterRun": True,
+            "schedule": {"kind": "at", "at": at_iso},
+            "payload": {
+                "kind": "agentTurn",
+                "message": message,
+                "thinking": "low",
+                "timeoutSeconds": 240,
+            },
+            "delivery": {
+                "mode": "announce",
+                "channel": "tnode",
+                "to": str(token.get("uid") or ""),
+                "bestEffort": True,
+            },
+        })
+        _log(f"bet: ready-announce programado para {at_iso}")
+        return {"scheduled": True, "at": at_iso}
+    except Exception as e:  # noqa: BLE001
+        # El skill YA quedó instalado; no poder avisar no invalida el enable.
+        _log(f"bet: ready-announce failed: {e}")
+        return {"scheduled": False, "error": str(e)[:200]}
+
+
+def handle_skill_enable(token: dict, params: dict) -> dict:
+    skill_id = (params.get("skillId") or params.get("skill") or "").strip()
+    if skill_id != _BET_SKILL_ID:
+        return {
+            "status": "error",
+            "result": {"error": f"unsupported_skill: {skill_id or 'missing'}"},
+        }
+    if not _BET_CLI.is_file():
+        # El self-heal del boot debería haberlo materializado; forzarlo aquí
+        # cubre el arranque en el que el command llega antes.
+        _ensure_workspace_skills()
+    # La key va a la BÓVEDA del gateway (Credential Management 2.0) por el SDK
+    # oficial, no a un archivo. `--kind env` y no `secret` porque una entrada
+    # secret es de sólo escritura por diseño y el skill necesita LEERLA para
+    # llamar a api-sports por su cuenta.
+    api_key = (params.get("apiKey") or "").strip()
+    key_written = False
+    if api_key:
+        r = _run_openclaw("secrets", "store", "set", "API_SPORTS_KEY",
+                          "--kind", "env", "--value-file", "-",
+                          timeout=30, input_text=api_key)
+        key_written = bool(r.get("ok"))
+        if key_written:
+            _secrets_reload()
+        else:
+            _log("bet: no se pudo guardar la key en la bóveda: %s"
+                 % (r.get("stderr") or r.get("error") or "")[:150])
+
+    res = _run_bet("install")
+    if not res.get("ok"):
+        _log(f"bet: install failed: {res.get('error')}")
+        return {"status": "error", "result": res}
+
+    _sync_bet_tools_block(True)
+    _sync_bet_timezone(token)
+    crons = _sync_bet_crons(True)
+    crons["avisos"] = _sync_bet_picks_job(token, True)
+    announce = _schedule_bet_ready_announce(token, res)
+    catalog = res.get("catalog") or {}
+    _log(
+        "bet: enabled (schema v%s, %s mercados, %s ligas)" % (
+            res.get("schema_version"),
+            catalog.get("markets"),
+            len(res.get("leagues_collecting") or []),
+        )
+    )
+    return {
+        "status": "done",
+        "result": {
+            "skillId": _BET_SKILL_ID,
+            "enabled": True,
+            "fresh": res.get("fresh"),
+            "schemaVersion": res.get("schema_version"),
+            "catalog": catalog,
+            "leaguesCollecting": res.get("leagues_collecting"),
+            "apiKeyStored": key_written,
+            "hasApiKey": res.get("has_api_key") or key_written,
+            "crons": crons,
+            "announce": announce,
+            "message": res.get("message"),
+        },
+    }
+
+
+def handle_skill_disable(token: dict, params: dict) -> dict:
+    skill_id = (params.get("skillId") or params.get("skill") or "").strip()
+    if skill_id != _BET_SKILL_ID:
+        return {
+            "status": "error",
+            "result": {"error": f"unsupported_skill: {skill_id or 'missing'}"},
+        }
+    purge = params.get("purge") is True
+    args = ["uninstall"]
+    if purge:
+        args.append("--purge")
+    res = _run_bet(*args)
+    if not res.get("ok"):
+        return {"status": "error", "result": res}
+    _sync_bet_tools_block(False)
+    _sync_bet_crons(False)
+    _sync_bet_picks_job(token, False)
+    _clear_bet_ready_job()
+    _log(f"bet: disabled (purge={purge})")
+    return {
+        "status": "done",
+        "result": {
+            "skillId": _BET_SKILL_ID,
+            "enabled": False,
+            "purged": purge,
+            "kept": res.get("kept"),
+            "message": res.get("message"),
+        },
+    }
+
+
 _HANDLERS = {
     "a2a.peer.link": handle_a2a_peer_link,
+    "skill.enable": handle_skill_enable,
+    "skill.disable": handle_skill_disable,
     "a2a.peer.unlink": handle_a2a_peer_unlink,
     "a2a.peer.setEnabled": handle_a2a_peer_set_enabled,
     "decl.refresh": handle_decl_refresh,
@@ -24233,7 +25253,14 @@ from __future__ import annotations
 #          multi-agente — chat.send de keys crudas del owner ahora manda
 #          `agentId: main` como PARAMETRO (la key canonica queda intacta;
 #          prefijar la key SI la cambia en 2.0 y rompe espejo/eventos).
-__VERSION__ = "1.47.0"
+# 1.48.0: grupos WA detectados desde el store SQLite de OpenClaw 2.0
+#          (`agents/*/agent/openclaw-agent.sqlite`, tabla `conversations`):
+#          2.0 ya no escribe sesiones .jsonl ni el bloque "Conversation info",
+#          así que el tail legacy no detectaba nada y el picker del app decía
+#          "aún no se detectan grupos" mientras el agente contestaba en el
+#          grupo. Nombre = `subject` de metadata_json si existe, si no el
+#          slug del label des-slugificado. Mismo reloj que el mirror de tasks.
+__VERSION__ = "1.48.0"
 
 import hashlib
 import hmac
@@ -27549,9 +28576,40 @@ _WA_GROUP_SUBJECT_RE = re.compile(r'group_subject\\?":\s*\\?"([^"\\]+)')
 _WA_GROUP_REWRITE_S = 6 * 3600.0
 
 
+def _upsert_detected_group(
+    jid: str, name: str, token: dict, project_id: str, state: dict,
+) -> None:
+    """Upsert channels/whatsapp.detectedGroups.{jid} = {name, lastSeenAt}.
+    Throttle en memoria: write solo si el nombre cambió o pasaron >6 h."""
+    cache = state.setdefault("wa_groups", {})
+    prev = cache.get(jid)
+    now = time.time()
+    if prev and prev[0] == name and (now - prev[1]) < _WA_GROUP_REWRITE_S:
+        return
+    parent = (
+        f"projects/{project_id}/databases/(default)/documents"
+        f"/users/{token['uid']}/nodes/{token['nodeId']}/channels/whatsapp"
+    )
+    # Field path con backticks: el JID trae `.`/`@` (segmento literal).
+    mask = urllib.parse.quote(f"detectedGroups.`{jid}`", safe="")
+    url = f"https://firestore.googleapis.com/v1/{parent}?updateMask.fieldPaths={mask}"
+    body = {
+        "fields": {
+            "detectedGroups": {"mapValue": {"fields": {jid: {"mapValue": {"fields": {
+                "name": {"stringValue": name[:120]},
+                "lastSeenAt": _now_ts_value(),
+            }}}}}},
+        }
+    }
+    headers = {"Authorization": f"Bearer {token['idToken']}"}
+    _http_patch_json(url, body, headers)
+    cache[jid] = (name, now)
+    _log(f"wa-groups: detected '{name}' ({jid})")
+
+
 def detect_wa_group(line: str, token: dict, project_id: str, state: dict) -> None:
-    """Best-effort: nunca interrumpe el tail loop (cualquier fallo se loguea
-    y se sigue)."""
+    """Camino legacy (sesiones .jsonl, OpenClaw ≤2026.7). Best-effort: nunca
+    interrumpe el tail loop (cualquier fallo se loguea y se sigue)."""
     try:
         m_jid = _WA_GROUP_JID_RE.search(line)
         if not m_jid:
@@ -27559,32 +28617,74 @@ def detect_wa_group(line: str, token: dict, project_id: str, state: dict) -> Non
         jid = m_jid.group(1)
         m_sub = _WA_GROUP_SUBJECT_RE.search(line)
         name = (m_sub.group(1).strip() if m_sub else "") or jid
-        cache = state.setdefault("wa_groups", {})
-        prev = cache.get(jid)
-        now = time.time()
-        if prev and prev[0] == name and (now - prev[1]) < _WA_GROUP_REWRITE_S:
-            return
-        parent = (
-            f"projects/{project_id}/databases/(default)/documents"
-            f"/users/{token['uid']}/nodes/{token['nodeId']}/channels/whatsapp"
-        )
-        # Field path con backticks: el JID trae `.`/`@` (segmento literal).
-        mask = urllib.parse.quote(f"detectedGroups.`{jid}`", safe="")
-        url = f"https://firestore.googleapis.com/v1/{parent}?updateMask.fieldPaths={mask}"
-        body = {
-            "fields": {
-                "detectedGroups": {"mapValue": {"fields": {jid: {"mapValue": {"fields": {
-                    "name": {"stringValue": name[:120]},
-                    "lastSeenAt": _now_ts_value(),
-                }}}}}},
-            }
-        }
-        headers = {"Authorization": f"Bearer {token['idToken']}"}
-        _http_patch_json(url, body, headers)
-        cache[jid] = (name, now)
-        _log(f"wa-groups: detected '{name}' ({jid})")
+        _upsert_detected_group(jid, name, token, project_id, state)
     except Exception as e:  # noqa: BLE001
         _log(f"wa-groups: {e}")
+
+
+# 1.48.0 — OpenClaw 2.0 ya no escribe sesiones .jsonl: el store es un SQLite
+# por agente (`agents/<id>/agent/openclaw-agent.sqlite`) y el bloque
+# "Conversation info" con `group_subject` desapareció del transcript, así que
+# el camino de arriba se quedó mudo y el picker del app decía "aún no se
+# detectan grupos" con el agente contestando en el grupo. La tabla
+# `conversations` sí registra cada grupo por el que pasó un mensaje:
+# channel='whatsapp', kind='group', peer_id=<jid>@g.us y `label` con el
+# slug del nombre ('whatsapp:g-apuestas-deportivas'). Se lee en modo ro
+# (WAL: no bloquea al gateway), igual que tasks/runs.sqlite.
+_WA_GROUP_LABEL_PREFIX_RE = re.compile(r"^(?:whatsapp:)?(?:g-)?", re.I)
+
+
+def _wa_group_name_from_row(label, metadata_json) -> str:
+    """Nombre legible: el `subject` real si algún día viene en metadata_json;
+    si no, el slug del label des-slugificado ('g-apuestas-deportivas' →
+    'Apuestas Deportivas'). Pierde acentos y mayúsculas originales — es lo
+    que el store guarda — pero es reconocible en el picker."""
+    if metadata_json:
+        try:
+            meta = json.loads(metadata_json)
+            for k in ("subject", "group_subject", "groupSubject", "name", "title"):
+                v = meta.get(k) if isinstance(meta, dict) else None
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+        except (TypeError, ValueError):
+            pass
+    slug = _WA_GROUP_LABEL_PREFIX_RE.sub("", (label or "").strip(), count=1)
+    words = [w for w in re.split(r"[-_\s]+", slug) if w]
+    return " ".join(w[:1].upper() + w[1:] for w in words)
+
+
+def process_wa_groups_mirror(token: dict, project_id: str, state: dict) -> None:
+    """Espejo de grupos desde el store 2.0 (todos los agentes: el canal WA
+    suele estar atado a `recepcion`, no a `main`). Best-effort por DB."""
+    agents_dir = OPENCLAW_DIR / "agents"
+    if not agents_dir.is_dir():
+        return
+    for db_path in sorted(agents_dir.glob("*/agent/openclaw-agent.sqlite")):
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+            try:
+                rows = conn.execute(
+                    "SELECT peer_id, label, metadata_json FROM conversations "
+                    "WHERE channel = 'whatsapp' AND kind = 'group'"
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            # Sin tabla `conversations` = nodo pre-2.0; el camino legacy sigue.
+            if "no such table" not in str(e):
+                _log(f"wa-groups: {db_path.parent.parent.name}: {e}")
+            continue
+        for peer_id, label, metadata_json in rows:
+            jid = (peer_id or "").strip()
+            if not jid.endswith("@g.us"):
+                continue
+            name = _wa_group_name_from_row(label, metadata_json) or jid
+            try:
+                _upsert_detected_group(jid, name, token, project_id, state)
+            except urllib.error.HTTPError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                _log(f"wa-groups: {e}")
 
 
 def _member_display_name(
@@ -28827,6 +29927,7 @@ def main() -> int:
     last_cron_mirror_check = 0.0
     last_cron_command_check = 0.0
     last_tasks_mirror_check = 0.0
+    last_wa_groups_check = 0.0
     last_task_command_check = 0.0
     last_awmf_check = 0.0
     last_media_sweep_check = 0.0
@@ -29095,6 +30196,20 @@ def main() -> int:
                 except urllib.error.HTTPError as e:
                     if e.code == 401:
                         _log("tasks mirror: idToken rejected — refreshing")
+                        token = None
+
+            # Grupos WA detectados — store SQLite 2.0 → detectedGroups.
+            # Mismo reloj que tasks; el upsert trae throttle propio (6 h).
+            if (
+                token is not None
+                and (now_f - last_wa_groups_check) >= tasks_mirror_interval
+            ):
+                last_wa_groups_check = now_f
+                try:
+                    process_wa_groups_mirror(token, project_id, outbox_state)
+                except urllib.error.HTTPError as e:
+                    if e.code == 401:
+                        _log("wa-groups: idToken rejected — refreshing")
                         token = None
 
             # Task artifact commands — fast clock so the app sees the
@@ -32474,6 +33589,7 @@ install_verify_scripts() {
         verify_tnode-chat-sync.py
         verify_tnode-config-sync.py
         verify_tnode-telemetry.py
+        verify_tnode-skill-manager.py
         verify_pair-watch.py
         verify_openclaw-gateway.py
         verify_cloudflared.py
@@ -32572,6 +33688,27 @@ for comp_id, fname in [
         "version": extract_ver(scripts_dir / fname) or "unknown",
         "source": f"scripts/{fname}",
     })
+
+# tnode-skill-manager: CLI (no daemon) que materializa los skills desde el
+# cache local; config-sync lo invoca. Y los skills que ÉL instaló, con la
+# versión del state.json (antes iban embebidos en config-sync y eran
+# invisibles para este manifiesto).
+components.append({
+    "id": "tnode-skill-manager", "kind": "cli-embedded",
+    "version": extract_ver(scripts_dir / "tnode_skill_manager.py") or "unknown",
+    "source": "scripts/tnode_skill_manager.py",
+})
+try:
+    st = json.loads((openclaw_home / "tnode-skills" / "state.json").read_text())
+    for sk_name, rec in sorted((st.get("skills") or {}).items()):
+        components.append({
+            "id": sk_name, "kind": "workspace-skill",
+            "version": rec.get("version") or "unknown",
+            "source": f"tnode-skills/cache ({rec.get('source')})",
+            "agents": sorted((rec.get("agents") or {}).keys()),
+        })
+except Exception:
+    pass
 
 # El installer hace `npm install -g openclaw@<pin>`: UN solo package que
 # provee gateway y CLI. Los nombres `@openclaw/gateway` / `@openclaw/cli`
