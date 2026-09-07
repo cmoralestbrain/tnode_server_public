@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.139.0"
+TNODE_SETUP_VERSION="1.139.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -12145,7 +12145,7 @@ write_tnode_skill_manager_py() {
 #!/usr/bin/env python3
 """tnode-skill-manager — ciclo de vida de los skills TNode en el nodo.
 
-__VERSION__ = "1.2.0"
+__VERSION__ = "1.2.1"
 
 Saca los skills de config-sync. Antes viajaban embebidos como constantes
 dentro del daemon (~8,000 líneas) y se materializaban en cada arranque; ahora
@@ -12191,7 +12191,7 @@ import sys
 import tarfile
 import time
 
-__VERSION__ = "1.2.0"
+__VERSION__ = "1.2.1"
 
 STATE_SCHEMA = 1
 MANIFEST_SCHEMA = 2
@@ -12468,7 +12468,10 @@ def _install_from_cache(name: str, entry: dict, agent: str, st: dict, *, hooks: 
         "audience": manifest.get("audience", "dueño"),
     })
     agents = rec.setdefault("agents", {})
-    arec = agents.setdefault(agent, {"enabled": True})
+    # 1.2.1: `install` sobre un agente donde la skill ya estaba pero
+    # DESHABILITADA debe re-habilitarla. setdefault dejaba enabled=false.
+    arec = agents.setdefault(agent, {})
+    arec["enabled"] = True
     hook_res = None
     if hooks and (manifest.get("lifecycle") or {}).get("install"):
         hook_res = run_hook(dest, manifest["lifecycle"]["install"])
@@ -12630,7 +12633,7 @@ def cmd_install(args):
         rec.update({"version": m.get("version"), "sha256": None, "source": str(src),
                     "installedAt": rec.get("installedAt") or _now(), "updatedAt": _now(),
                     "audience": m.get("audience", "dueño")})
-        rec.setdefault("agents", {}).setdefault(args.agent, {"enabled": True})
+        rec.setdefault("agents", {}).setdefault(args.agent, {})["enabled"] = True
         hook = run_hook(dest, (m.get("lifecycle") or {}).get("install")) if not args.no_hooks else None
         save_state(st)
         _out({"action": "install", "skill": name, "agent": args.agent, "version": m.get("version"),
