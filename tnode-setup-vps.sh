@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.137.0"
+TNODE_SETUP_VERSION="1.138.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -12145,7 +12145,7 @@ write_tnode_skill_manager_py() {
 #!/usr/bin/env python3
 """tnode-skill-manager — ciclo de vida de los skills TNode en el nodo.
 
-__VERSION__ = "1.0.0"
+__VERSION__ = "1.1.0"
 
 Saca los skills de config-sync. Antes viajaban embebidos como constantes
 dentro del daemon (~8,000 líneas) y se materializaban en cada arranque; ahora
@@ -12153,9 +12153,10 @@ viven como paquetes en un CACHE local y este CLI los reconcilia contra el
 workspace de cada agente. config-sync sólo invoca `sync`.
 
 Diseño: skills/DESIGN-skill-manager.md (P0, 2026-09-06). Esta versión cubre
-la fase P1: fuente `cache`, `state.json`, `sync/list/verify/install/enable/
-disable/uninstall/blocks/create`. La fuente `catalog` (R2 + componentsCatalog
-con punteros prod/beta) llega en P2; la colocación en `recepcion` y el
+las fases P1 y P2: fuente `cache`, `state.json`, `sync/list/verify/install/
+enable/disable/uninstall/blocks/create`, y `fetch --catalog` (P2: baja al cache
+las versiones que dictan los punteros de Firestore `skillsCatalog/{skill}`
+del proyecto del nodo, servidas por el espejo público de tnode_server); la colocación en `recepcion` y el
 allowlist del canal, en P3.
 
 Layout en el nodo (OPENCLAW_HOME = el dir .openclaw, como en los daemons):
@@ -12175,6 +12176,8 @@ Reglas:
 - `audience` ausente en el manifest = sólo dueño (fail-closed).
 """
 
+from __future__ import annotations  # `X | None` en firmas: la Mini corre 3.9 fuera del daemon
+
 import argparse
 import hashlib
 import io
@@ -12188,7 +12191,7 @@ import sys
 import tarfile
 import time
 
-__VERSION__ = "1.0.0"
+__VERSION__ = "1.1.0"
 
 STATE_SCHEMA = 1
 MANIFEST_SCHEMA = 2
@@ -12709,6 +12712,87 @@ def cmd_uninstall(args):
           "summary": f"{args.skill} retirado de {', '.join(agents)}"})
 
 
+def _curl_download(url: str, dest: pathlib.Path, timeout: int = 90) -> None:
+    """curl y no urllib: el python del sistema en macOS trae un TLS que falla
+    contra algunos hosts (gotcha de agenda/backfill)."""
+    proc = subprocess.run(
+        ["curl", "-fsSL", "--max-time", str(timeout), "-o", str(dest), url],
+        capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise OSError(f"download_failed rc={proc.returncode}: {(proc.stderr or '')[-200:]}")
+
+
+def cmd_fetch(args):
+    """P2: trae al cache las versiones que dicta el CATÁLOGO (punteros del
+    canal de este nodo, que config-sync baja de Firestore a un archivo).
+    Verifica sha256 antes de aceptar el paquete; un tgz que no coincide se
+    descarta y el cache queda como estaba. No materializa: eso es `sync`."""
+    try:
+        cat = json.loads(pathlib.Path(args.catalog).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        _die(f"catalog_invalid: {e}")
+    index = load_index()
+    index.setdefault("skills", {})
+    cdir = cache_dir()
+    cdir.mkdir(parents=True, exist_ok=True)
+    fetched, skipped, errors = [], [], []
+    for name, ptr in sorted((cat.get("skills") or {}).items()):
+        want_ver, want_sha, url = ptr.get("version"), (ptr.get("sha256") or "").lower(), ptr.get("url")
+        if not (name and want_ver and want_sha and url):
+            errors.append({"skill": name, "error": "pointer_incomplete"})
+            continue
+        cur = index["skills"].get(name) or {}
+        if cur.get("version") == want_ver and cur.get("sha256") == want_sha and (cdir / cur.get("file", "")).is_file():
+            skipped.append(f"{name}@{want_ver}")
+            continue
+        fname = f"{name}-{want_ver}.tgz"
+        tmp = cdir / (fname + ".part")
+        try:
+            _curl_download(url, tmp)
+            data = tmp.read_bytes()
+            got = _sha256_bytes(data)
+            if got != want_sha:
+                tmp.unlink(missing_ok=True)
+                errors.append({"skill": name, "error": f"sha_mismatch: esperado {want_sha[:12]} recibido {got[:12]}"})
+                continue
+            # manifest + shas por archivo, leyendo el tgz recién bajado
+            files = {}
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+                for m in tf.getmembers():
+                    if not m.isfile():
+                        continue
+                    parts = pathlib.PurePosixPath(m.name).parts
+                    if len(parts) < 2 or parts[0] != name or ".." in parts:
+                        raise ValueError(f"package_bad_member: {m.name}")
+                    fh = tf.extractfile(m)
+                    files["/".join(parts[1:])] = _sha256_bytes(fh.read() if fh else b"")
+            manifest = {}
+            if "manifest.json" in files:
+                with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+                    manifest = json.loads(tf.extractfile(f"{name}/manifest.json").read().decode("utf-8"))
+            if manifest.get("version") != want_ver:
+                tmp.unlink(missing_ok=True)
+                errors.append({"skill": name, "error": f"manifest_version {manifest.get('version')} != pointer {want_ver}"})
+                continue
+            os.replace(tmp, cdir / fname)
+            old_file = cur.get("file")
+            index["skills"][name] = {"version": want_ver, "file": fname, "sha256": want_sha,
+                                     "audience": manifest.get("audience", "dueño"), "files": files,
+                                     "source": "catalog", "url": url, "fetchedAt": _now()}
+            if old_file and old_file != fname:
+                (cdir / old_file).unlink(missing_ok=True)
+            fetched.append({"skill": name, "from": cur.get("version"), "to": want_ver})
+        except (OSError, ValueError) as e:
+            tmp.unlink(missing_ok=True)
+            errors.append({"skill": name, "error": str(e)[:200]})
+    if fetched:
+        index["builtAt"] = "catalog-" + _now()
+        (cdir / "index.json").write_text(json.dumps(index, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _out({"action": "fetch", "fetched": fetched, "skipped": skipped, "errors": errors,
+          "summary": "%d bajados, %d ya al día, %d con error" % (len(fetched), len(skipped), len(errors))},
+         0 if not errors else 1)
+
+
 def cmd_blocks(args):
     """Bloques declarativos para el compositor de config-sync (§5). P1: sólo
     los skills que traen `blocks.tools` (archivo en su dir) y están
@@ -12819,6 +12903,10 @@ def main():
     p.add_argument("--purge", action="store_true")
     p.set_defaults(fn=cmd_uninstall)
 
+    p = sub.add_parser("fetch", help="baja al cache lo que dicta el catálogo (P2)")
+    p.add_argument("--catalog", required=True, help="JSON {skills: {name: {version, sha256, url}}}")
+    p.set_defaults(fn=cmd_fetch)
+
     p = sub.add_parser("blocks")
     p.add_argument("--agent", default="main")
     p.set_defaults(fn=cmd_blocks)
@@ -12857,7 +12945,7 @@ SKILLMGRPYEOF
 # materializa en el workspace de cada agente en cada arranque de
 # config-sync (DESIGN-skill-manager.md P1). Antes los skills viajaban como
 # constantes dentro de tnode-config-sync.
-# skills-cache-sha256: b66ad9a8b4696e638fcb5d69ae85da2b76964f588db4c40f1212632379cc1a35
+# skills-cache-sha256: 784a52fe913f9f3933e34d02f3813de4cfe224993812cdc0c9732c6350f7dac4
 _skills_cache_b64() {
 cat <<'SKILLS_CACHE_B64_EOF'
 aW5kZXguanNvbgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
@@ -12869,7 +12957,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB7
-CiAgInNjaGVtYSI6IDEsCiAgImJ1aWx0QXQiOiAiY2FjaGUtNzliM2EyNjcwMDIzIiwKICAic2tp
+CiAgInNjaGVtYSI6IDEsCiAgImJ1aWx0QXQiOiAiY2FjaGUtODUyYmM0MDkxNTI1IiwKICAic2tp
 bGxzIjogewogICAgInRub2RlLWFnZW5kYSI6IHsKICAgICAgInZlcnNpb24iOiAiMS4wLjAiLAog
 ICAgICAiZmlsZSI6ICJ0bm9kZS1hZ2VuZGEtMS4wLjAudGd6IiwKICAgICAgInNoYTI1NiI6ICI3
 Y2IzZWFiYmFkMzAyNjc0MTcxODk0YmM3ZDlkMzYzNzQwYzE0NDE2YWU5MDBlNzA2NDk2YjZmMGI4
@@ -12888,15 +12976,15 @@ NzAwNGUxNzhiMTM4MmMiLAogICAgICAgICJiaW4vZHJpdmUucHkiOiAiMWRjZjFjMGNkMjY1OGRj
 YWFhZjdmYjIxODMxMTRjN2EzYTVmYTljMDY1MWMxZjU2YTExNzM3MTgzYzM5Y2VlYiIsCiAgICAg
 ICAgIm1hbmlmZXN0Lmpzb24iOiAiNmJjYzIyMjhhNzYwNjAzMDc1YWY4YTg2MWQzNGRkMmQ3YjRj
 ZjkwZDI1MDZlMzY1MjkyZjA1NTMwNWEzZDI1NCIKICAgICAgfQogICAgfSwKICAgICJ0bm9kZS1w
-b2xsIjogewogICAgICAidmVyc2lvbiI6ICIxLjEuMCIsCiAgICAgICJmaWxlIjogInRub2RlLXBv
-bGwtMS4xLjAudGd6IiwKICAgICAgInNoYTI1NiI6ICJjNDc0MjBjYWJjNDhlMzkyNjJmY2NiYmFm
-NTIzZjFiMGU3YTUzYjg5OWQ1MWE2MDAxNjE5YzYzYTliMGQ4NzFlIiwKICAgICAgImF1ZGllbmNl
-IjogImFtYm9zIiwKICAgICAgImZpbGVzIjogewogICAgICAgICJTS0lMTC5tZCI6ICI2M2Q4NjQy
-OTJkODI0ODEyZThhYTQ1MDgzZjRjYjJmYzY1MGMwNDJjNDgzZTNjYzc2YzNiNGExYzBiY2M2NGMz
+b2xsIjogewogICAgICAidmVyc2lvbiI6ICIxLjEuMSIsCiAgICAgICJmaWxlIjogInRub2RlLXBv
+bGwtMS4xLjEudGd6IiwKICAgICAgInNoYTI1NiI6ICI3OWY2MjJhNTQ3ZmI2MTkwZGE4YTBjZWYx
+MTEzNTJjNjZhNzJhODM3ZDNiZWE3MTQ5YTI3MzRkNTU2YmI0NTlmIiwKICAgICAgImF1ZGllbmNl
+IjogImFtYm9zIiwKICAgICAgImZpbGVzIjogewogICAgICAgICJTS0lMTC5tZCI6ICJkOWUwOTli
+ZDI4MTlmNjIzZGI3ZWFhZTg0ZTM2NjczZjFmNjU2YmQxMWEzMWU5NWJjMTNhMGZhYTU0YzRhNDM1
 IiwKICAgICAgICAiYmluL3BvbGwucHkiOiAiOTc2ODAyZTIwZTA3YzEyOWM3ZTA1N2Y5NDk3MTdj
 ZTM3MGQwODVjYjk1M2FjMTM3MjUxOTE1ODNiNmVmMWE0MCIsCiAgICAgICAgIm1hbmlmZXN0Lmpz
-b24iOiAiMWYzMGNlNGIxYmIyNzk0ZGQ2MDRkODMwMWIxZjc4M2Q1MDYxY2U5NjcyZDVhMjlhZGNi
-MmM2YmI4YzRjM2JmMSIKICAgICAgfQogICAgfSwKICAgICJ0bm9kZS1kZWxlZ2F0ZSI6IHsKICAg
+b24iOiAiNjJlNTBmMDkzMThkY2FlYmRjNDdlOTcxNDY1MzhjYjNiYTNjZGQ1YTYzYjkzM2ZiNzU4
+Yzc4NTQ0NDgyNDdjZCIKICAgICAgfQogICAgfSwKICAgICJ0bm9kZS1kZWxlZ2F0ZSI6IHsKICAg
 ICAgInZlcnNpb24iOiAiMS4wLjAiLAogICAgICAiZmlsZSI6ICJ0bm9kZS1kZWxlZ2F0ZS0xLjAu
 MC50Z3oiLAogICAgICAic2hhMjU2IjogImMzOWE5N2UxNzFiMGNjZGI2MDM0OGQwMDY4OGVhZWM0
 ZjVhZGYxNWZlN2JlMzM4YTU0MWRjYzhhMTIzZTNhOGEiLAogICAgICAiYXVkaWVuY2UiOiAiZHVl
@@ -14953,78 +15041,78 @@ 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
-LXBvbGwtMS4xLjAudGd6AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+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
-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
+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
-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
+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
@@ -15711,6 +15799,17 @@ from __future__ import annotations
 #          + FIX _guest_agent_present leia agents.list legacy — en 2.0
 #          nativo devolvia False siempre y el startup self-heal quedaba
 #          en retry-loop infinito (~3s) desde el nacimiento del nodo.
+# 2.1.0   — P2 skill-manager: los nodos se actualizan solos desde el catálogo.
+#           Cada 10 min lee `skillsCatalog/{skill}` del proyecto (version +
+#           sha256 + url del espejo público), lo baja a
+#           tnode-skills/catalog.json y, si cambió, `tnode-skill-manager fetch`
+#           (sha256 verificado) + `sync`. Punteros los escribe
+#           publish_skills.py (beta primero, prod al promover).
+# 2.0.1   — owner-channel: el perfil de PROD guarda el teléfono nacional sin
+#           lada ("8182595889") y se sembraba "+8182595889". Un número de 10
+#           dígitos sin '+' se trata como mexicano (+52 y +521). Los bindings
+#           main←whatsapp:direct se consideran todos nuestros y se
+#           reconstruyen, para que una siembra mala no quede huérfana.
 # 2.0.0   — los skills SALEN de este daemon. Se retira el bloque EMBEDDED
 #           WORKSPACE SKILLS (~8,400 líneas de constantes) y
 #           _ensure_workspace_skill(); _ensure_workspace_skills() ahora invoca
@@ -15823,7 +15922,7 @@ from __future__ import annotations
 #          quedó listo. Apagar conserva la BD (el historial es del usuario);
 #          sólo `purge:true` la borra. Mismo patrón que agenda/drive/poll:
 #          los archivos viajan en el daemon y se auto-materializan al boot.
-__VERSION__ = "2.0.0"
+__VERSION__ = "2.1.0"
 
 import hashlib
 import hmac
@@ -18513,6 +18612,65 @@ def _run_skill_manager(*args: str, timeout: int = 180) -> dict:
     return payload
 
 
+_SKILLS_CATALOG_PATH = OPENCLAW_DIR / "tnode-skills" / "catalog.json"
+_SKILLS_CATALOG_LAST = 0.0
+SKILLS_CATALOG_INTERVAL_S = float(os.environ.get("TNODE_SKILLS_CATALOG_S", "600"))
+
+
+def _sync_skills_catalog(token: dict, force: bool = False) -> None:
+    """P2 (2.1.0): punteros de skills del proyecto de este nodo
+    (`skillsCatalog/{skill}` = version + sha256 + url en el espejo público).
+    Se bajan a tnode-skills/catalog.json; si cambió, `tnode-skill-manager
+    fetch` trae los paquetes al cache (verifica sha256) y `sync` los
+    materializa. Cada 10 min; un fallo de red deja el archivo intacto y se
+    reintenta al siguiente ciclo. Sin catálogo (proyecto sin docs) no toca
+    nada: el cache horneado sigue mandando."""
+    global _SKILLS_CATALOG_LAST
+    now = time.time()
+    if not force and (now - _SKILLS_CATALOG_LAST) < SKILLS_CATALOG_INTERVAL_S:
+        return
+    _SKILLS_CATALOG_LAST = now
+    if not _SKILL_MANAGER_CLI.is_file():
+        return
+    try:
+        url = f"{_firestore_base()}/skillsCatalog?pageSize=200"
+        doc = _http_request("GET", url, headers={"Authorization": f"Bearer {token['idToken']}"}, timeout=30)
+    except Exception as e:  # noqa: BLE001
+        _log(f"skills-catalog: no se pudo leer skillsCatalog: {e}")
+        return
+    skills = {}
+    for d in (doc or {}).get("documents") or []:
+        f = _fs_unwrap({"mapValue": {"fields": d.get("fields") or {}}})
+        name = f.get("skill") or d.get("name", "").rsplit("/", 1)[-1]
+        if name and f.get("version") and f.get("sha256") and f.get("url"):
+            skills[name] = {"version": f["version"], "sha256": f["sha256"], "url": f["url"],
+                            "releaseTag": f.get("releaseTag")}
+    if not skills:
+        return
+    body = json.dumps({"schema": 1, "project": PROJECT_ID, "skills": skills}, ensure_ascii=False, indent=2, sort_keys=True)
+    try:
+        prev = _SKILLS_CATALOG_PATH.read_text(encoding="utf-8") if _SKILLS_CATALOG_PATH.is_file() else ""
+    except OSError:
+        prev = ""
+    if prev == body and not force:
+        return
+    try:
+        _SKILLS_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _SKILLS_CATALOG_PATH.write_text(body + "\n", encoding="utf-8")
+    except OSError as e:
+        _log(f"skills-catalog: no pude escribir catalog.json: {e}")
+        return
+    res = _run_skill_manager("fetch", "--catalog", str(_SKILLS_CATALOG_PATH), timeout=600)
+    if not res.get("ok"):
+        _log("skills-catalog: fetch: %s" % (res.get("summary") or res.get("error") or res)[:300])
+        if res.get("errors"):
+            _log("skills-catalog: errores: %s" % json.dumps(res["errors"], ensure_ascii=False)[:400])
+    if res.get("fetched"):
+        _log("skills-catalog: %s" % ", ".join("%s %s→%s" % (x["skill"], x.get("from"), x["to"]) for x in res["fetched"]))
+        s2 = _run_skill_manager("sync")
+        _log("skills: %s" % (s2.get("summary") or s2.get("error")))
+
+
 def _ensure_workspace_skills() -> None:
     """Materializa los skills de workspace en cada arranque (self-heal).
     2.0.0: delega en `tnode-skill-manager sync` — cache local → workspace de
@@ -19786,6 +19944,7 @@ def _md_sync_from_json(token: dict, target: str) -> None:
             # teléfono con el que el dueño le escribe a su agente por WA.
             _sync_bet_timezone(token)
             _sync_owner_channel_identity(token)
+            _sync_skills_catalog(token)
     except SubdocUnavailable as e:
         # NO pudimos leer la fuente. Ojo: NO caer al camino de "data vacía"
         # (que borra la zona) — un 403 o un timeout no significa que el dueño
@@ -22972,6 +23131,13 @@ def _owner_channel_peers(profile) -> list:
     digits = re.sub(r"\D", "", raw)
     if len(digits) < 8:
         return []
+    # 2.0.1: en prod el perfil guarda el número NACIONAL sin lada
+    # ("8182595889"); sembrar "+8182595889" no identifica a nadie. Un número
+    # de 10 dígitos sin '+' es mexicano salvo que el país diga otra cosa.
+    country = (profile.get("country") or "").strip().lower()
+    if len(digits) == 10 and not raw.startswith("+"):
+        if country in ("", "méxico", "mexico", "mx"):
+            digits = "52" + digits
     peers = ["+" + digits]
     if digits.startswith("52") and len(digits) == 12:
         peers.append("+521" + digits[2:])
@@ -23014,10 +23180,14 @@ def _sync_owner_channel_identity(token: dict, profile=None) -> None:
                    "match": {"channel": "whatsapp",
                              "peer": {"kind": "direct", "id": p}}} for p in peers]
         def _is_owner_binding(b):
+            # Todo binding main←whatsapp:direct es nuestro (lo sembró este
+            # daemon): así una siembra previa con número mal formado se
+            # reemplaza en vez de quedarse huérfana.
             m = (b or {}).get("match") or {}
-            return (m.get("channel") == "whatsapp"
-                    and isinstance(m.get("peer"), dict)
-                    and m["peer"].get("id") in peers)
+            peer = m.get("peer") if isinstance(m.get("peer"), dict) else {}
+            return ((b or {}).get("agentId") == "main"
+                    and m.get("channel") == "whatsapp"
+                    and peer.get("kind") == "direct")
         rest = [b for b in bindings if not _is_owner_binding(b)]
         new_bindings = wanted + rest
         if new_bindings != bindings:

@@ -1,0 +1,107 @@
+{
+  "schema": 1,
+  "builtAt": "cache-852bc4091525",
+  "skills": {
+    "tnode-agenda": {
+      "version": "1.0.0",
+      "file": "tnode-agenda-1.0.0.tgz",
+      "sha256": "7cb3eabbad302674171894bc7d9d363740c14416ae900e706496b6f0b8bfaae8",
+      "audience": "ambos",
+      "files": {
+        "SKILL.md": "e5bbe1b9ec51700debf0fac330e693c55d62eb078a81027547b58dea2d78652f",
+        "bin/agenda.py": "a5ab1f9354ef68c6b9d29e53cdde6061a4007be8035dd78328adc499ecdf083b",
+        "manifest.json": "6cfc3f9045caa0a4c85f5516b963cda1ca50dd2ffc58169be984048181aae0ee"
+      }
+    },
+    "tnode-drive": {
+      "version": "1.0.0",
+      "file": "tnode-drive-1.0.0.tgz",
+      "sha256": "556b58ed2459dca1de4b07e873e2ff3a1917e644d717f6aafc6f3f5ea5552d32",
+      "audience": "dueño",
+      "files": {
+        "SKILL.md": "c2ad83370d370420b7163779c7fef10463db3ae546cbb387437004e178b1382c",
+        "bin/drive.py": "1dcf1c0cd2658dcaaaf7fb2183114c7a3a5fa9c0651c1f56a11737183c39ceeb",
+        "manifest.json": "6bcc2228a760603075af8a861d34dd2d7b4cf90d2506e365292f055305a3d254"
+      }
+    },
+    "tnode-poll": {
+      "version": "1.1.1",
+      "file": "tnode-poll-1.1.1.tgz",
+      "sha256": "79f622a547fb6190da8a0cef111352c66a72a837d3bea7149a2734d556bb459f",
+      "audience": "ambos",
+      "files": {
+        "SKILL.md": "d9e099bd2819f623db7eaae84e36673f1f656bd11a31e95bc13a0faa54c4a435",
+        "bin/poll.py": "976802e20e07c129c7e057f949717ce370d085cb953ac13725191583b6ef1a40",
+        "manifest.json": "62e50f09318dcaebdc47e97146538cb3ba3cdd5a63b933fb758c7854448247cd"
+      }
+    },
+    "tnode-delegate": {
+      "version": "1.0.0",
+      "file": "tnode-delegate-1.0.0.tgz",
+      "sha256": "c39a97e171b0ccdb60348d00688eaec4f5adf15fe7be338a541dcc8a123e3a8a",
+      "audience": "dueño",
+      "files": {
+        "SKILL.md": "3d45e75859abef746b409fb58efaee9ab754c1bd64d9225c8e1a9b126d5a6afa",
+        "bin/tnode-delegate.py": "cc9618b1ef7de5b4e764120e948cfc43522aa01edf796b1b1697f03d5d3c51c1",
+        "manifest.json": "f52449c072ac6f7b84e671fffe965ddec1e351e4c1f39789400d0b4739c8ad1e"
+      }
+    },
+    "tnode-inventario": {
+      "version": "1.0.0",
+      "file": "tnode-inventario-1.0.0.tgz",
+      "sha256": "589c8a1ba4e5b8c69cbf5a1ed21c1f37f18b8492faebad4759d3a8aaeda542fa",
+      "audience": "dueño",
+      "files": {
+        "SKILL.md": "9d7180a959dfa31f7615f0653ac8effb28b54e69db973a4989ec14aa41ea87b5",
+        "bin/inventario.py": "1664ac3365f3ec0fec51fb1fef4043ff7b7097603fd9fb1d7497feff9539a38d",
+        "manifest.json": "fbff5182a52a22bf1bcb2f2885811b1e749c5e4233a2242b6794f2c50f45ee80"
+      }
+    },
+    "tnode-awmf": {
+      "version": "1.0.0",
+      "file": "tnode-awmf-1.0.0.tgz",
+      "sha256": "22e85a85adee141726e45e6e1e200715bb7e61104e51b5223de200f9e2cbbd91",
+      "audience": "dueño",
+      "files": {
+        "SKILL.md": "43680d1cf73e4db0a83bad58a60bdf5971f317b6e86eb4a0832d4ea120dd4b95",
+        "bin/awmf.py": "b73a764581136ed9a59a57722194062fc05a40c51a1d1abc71735d82b23d2fbc",
+        "manifest.json": "0a13e00d82126d3bfc261b83206aefd44495dd828ce33edfcc7694e13837b76d"
+      }
+    },
+    "tnode-a2a": {
+      "version": "2.3.0",
+      "file": "tnode-a2a-2.3.0.tgz",
+      "sha256": "de184c5fa835cba2b905e6f035e490e0865b64a7f04f3690e32f2c3887d3d6da",
+      "audience": "dueño",
+      "files": {
+        "SKILL.md": "abe776441296c608dbe6c2d9d9be1a23490bffb28b05acd1c8c855fc9bb73255",
+        "bin/tnode-a2a.py": "4c8bb262454342c9115a3a72fbcdef4971a731721d89ace21fa2ecf09a708acf",
+        "manifest.json": "c17e8a29de3cf0a1691487ab8e6d256e6ed5914224baddce3cf318712c6aa4f1"
+      }
+    },
+    "tnode-bet": {
+      "version": "1.16.0",
+      "file": "tnode-bet-1.16.0.tgz",
+      "sha256": "14e513a88b318e8be8856b9c6a2f9e5220146f70efad2d04927b4547f95bd70c",
+      "audience": "dueño",
+      "files": {
+        "SKILL.md": "aaac5e22ec87e8e9b1e8e711edfe139718b1a08a2692acaf4978f4ac3dc6cdd7",
+        "bin/apisports.py": "86ce078f4668a70641040d5af2587ed5891f097244ecb7ff89e9bec3cbe5f56b",
+        "bin/backfill.py": "0d713ccc050801eb66e2ce69f9a1bb0142de3cb99d0a2c7c8000caf9b2b1cc3b",
+        "bin/bet.py": "417b03e8cfbf7d38ee7aabe12ba9ea942ea34255126be38b96de6bf51e52186f",
+        "bin/db.py": "47a6873844c042c2c3a0d3c251cbfd218fdc0730810245314261a05a10d23f81",
+        "bin/models.py": "ef3dd66fa627809dda12cf0202f3d0aaf495112101a52b9ea6bd8f15a081d0fc",
+        "bin/value.py": "cbe259a20fea022afe365ddcc9b7b92e0c020887ed5d3847ad350967951386b4",
+        "manifest.json": "a9fe3ee6cc15661f70a75824746eb31ac8f78069cf9f8b1c140db834c9f5c38c",
+        "migrations/002_null_line_unique.sql": "1b6c1bae41a173f28ddfca61c1a767c8d45d9a3c4fd702bedff4f718da29ddad",
+        "migrations/003_status_snapshot.sql": "62b0b7b84db8fe8a35dc457bd628d6659b60cc1a65a430bc0ba8f07b5a6792e2",
+        "migrations/004_verified_provider_ids.sql": "d3e2142bd58ce00d56fa5054cbd9d487249b9ef6e289e258cf9309a3aedfbeab",
+        "migrations/005_track_record_names.sql": "71b7ed58879cc3606e0f7cc651eb6d80ebd2ff6d0b60bc05405d1e4e544ffd7a",
+        "migrations/006_notified_picks.sql": "d971750f97ae9f77a960638f0e192733640b2b8b59b2d57786c7d845324e13e1",
+        "migrations/007_one_pick_one_row.sql": "c79c33acd02c92b432302a5b8517d4f3dce2665391a6355bf432d279678d5c71",
+        "schema.sql": "928f6f13c555437d39ed1ff8bdf042ee0ece7be67ac43c2bf9623a859fab7509",
+        "seed.sql": "1a605d6d7209d72c95023c73514726e96adff98f982621b796cba9a3eca00ccd"
+      }
+    }
+  }
+}
