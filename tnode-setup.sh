@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.141.0"
+TNODE_SETUP_VERSION="1.142.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -110,6 +110,14 @@ OPENCLAW_WA_PLUGIN_VERSION="${OPENCLAW_WA_PLUGIN_VERSION-${OPENCLAW_PIN_VERSION%
 # que update_plugins_if_stale pueda compararlo: el installer se ejecuta via
 # `curl | bash`, asi que $0 es "bash" y no se puede releer el propio fichero.
 OPENCLAW_WS_PLUGIN_VERSION="${OPENCLAW_WS_PLUGIN_VERSION-0.2.2}"
+# web-search (@ollama/openclaw-web-search) busca y lee páginas a través de un
+# servidor Ollama LOCAL (127.0.0.1:11434). En un VPS/nodo sin ollama el plugin
+# es peso muerto (1.141.0: en HEB β estaba enabled y ni cargaba). Solo aplica
+# donde exista el binario; la búsqueda web de los agentes va por el skill
+# tnode-web-search (ddgr), no por este plugin.
+_websearch_applicable() {
+    command -v ollama >/dev/null 2>&1
+}
 # Lo pone update_plugins_if_stale cuando reinstala algun plugin, para que
 # ensure_openclaw_gateway_fresh reinicie el gateway. Un plugin nuevo en disco no
 # lo carga el proceso en marcha —el propio CLI lo dice: "Restart the gateway to
@@ -1535,6 +1543,15 @@ ad.setdefault("sessionStore", {})["agentId"] = "main"
 pe = d.setdefault("plugins", {}).setdefault("entries", {})
 for pid in ("tnode", "tbrain-context-engine"):
     pe.setdefault(pid, {}).setdefault("hooks", {})["allowConversationAccess"] = True
+# 1.142.0: 2.0 auto-habilita ~46 plugins stock; en un VPS el LLM va SOLO por
+# openrouter y no hay pantalla/voz/ollama, asi que browser/canvas/cua/
+# geolocation/talk-voice y los providers directos son RSS muerto (HEB beta:
+# picos >850 MiB en 2 GB). Solo Linux: en Mac (Mini) el owner puede usar
+# LM Studio/ollama via estos providers. Mismo shape que `plugins disable`.
+if "$OS" == "Linux":
+    for pid in ("browser", "canvas", "cua-computer", "geolocation", "talk-voice",
+                "anthropic", "openai", "xai", "ollama", "openclaw-web-search"):
+        pe.setdefault(pid, {})["enabled"] = False
 ch = d.setdefault("channels", {}).setdefault("tnode", {})
 ch.update({"enabled": True, "mode": "live", "name": "TNode"})
 json.dump(d, open(p, "w"), indent=2)
@@ -10393,7 +10410,7 @@ update_plugins_if_stale() {
     # web-search no va en el bundle Path B (se empaqueta de npm y se transpila),
     # asi que se compara contra el pin de install_websearch_plugin.
     local ws_pin="$OPENCLAW_WS_PLUGIN_VERSION"
-    if [[ -n "$ws_pin" ]]; then
+    if [[ -n "$ws_pin" ]] && _websearch_applicable; then
         inst="$(_plugin_pkg_version "$ext_dir/openclaw-web-search")"
         if [[ -n "$inst" && "$inst" != "$ws_pin" ]]; then
             info "plugin openclaw-web-search: $inst → $ws_pin"
@@ -10439,7 +10456,7 @@ enable_pathb_plugins() {
     # openclaw-web-search rides along: baked into extensions/ like the Path B
     # plugins, it loses its plugins.entries to the same pre-snapshot cleanup.
     # No-critico: warn y seguir.
-    if [[ -d "$ext_dir/openclaw-web-search" ]]; then
+    if [[ -d "$ext_dir/openclaw-web-search" ]] && _websearch_applicable; then
         if enable_plugin openclaw-web-search; then
             info "Path B: openclaw-web-search enabled (SDK)"
         else
@@ -10551,7 +10568,9 @@ openclaw_configure_as_tnode() {
     chown -R "$TNODE_USER":"$TNODE_USER" "$OPENCLAW_HOME" 2>/dev/null || true
 
     # Install web-search plugin as tnode (creates openclaw.json)
-    if [[ -d "$OPENCLAW_HOME/extensions/openclaw-web-search" ]]; then
+    if ! _websearch_applicable; then
+        info "Plugin web-search omitido (sin ollama en este nodo)"
+    elif [[ -d "$OPENCLAW_HOME/extensions/openclaw-web-search" ]]; then
         success "Plugin web-search ya instalado"
     else
         run_with_progress "Instalando plugin web-search" --estimate 30 install_websearch_plugin || true
