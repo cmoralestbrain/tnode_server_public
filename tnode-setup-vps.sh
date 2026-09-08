@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.140.4"
+TNODE_SETUP_VERSION="1.141.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -16064,6 +16064,14 @@ from __future__ import annotations
 #          + FIX _guest_agent_present leia agents.list legacy — en 2.0
 #          nativo devolvia False siempre y el startup self-heal quedaba
 #          en retry-loop infinito (~3s) desde el nacimiento del nodo.
+# 2.4.0   — (a) `profile.timezoneIana` (IANA detectada por el app con
+#          flutter_timezone) gana sobre la etiqueta 'CST (UTC-06:00)' al
+#          sembrar el setting `timezone` de tnode-bet: fuera de México la
+#          etiqueta daba offset fijo sin horario de verano. (b) SOUL de
+#          recepcion: se presenta como asistente virtual CON inteligencia
+#          artificial en el primer mensaje y nunca niega serlo (Aviso de
+#          Privacidad = leyenda IA en el primer mensaje de WA/TG; AUP
+#          prohíbe negar que es IA). Sin cambio de esquema ni de handlers.
 # 2.3.2   — FIX: 2.0.0 borró el bloque de constantes del agente guest
 #          (_GUEST_WS_DIR/_GUEST_AGENT_DIR/_GUEST_TOOLS_DENY/_GUEST_*_MD/
 #          _GUEST_BIZ_*/_GUEST_PROSPECT_*/_GUEST_WS_FILES) pero dejó sus
@@ -16210,7 +16218,7 @@ from __future__ import annotations
 #          quedó listo. Apagar conserva la BD (el historial es del usuario);
 #          sólo `purge:true` la borra. Mismo patrón que agenda/drive/poll:
 #          los archivos viajan en el daemon y se auto-materializan al boot.
-__VERSION__ = "2.3.2"
+__VERSION__ = "2.4.0"
 
 import hashlib
 import hmac
@@ -19619,8 +19627,12 @@ conozco su nombre ni su relación con el negocio.
   inventario, precios de compra, ni de la operación.
 
 ## Mi flujo de bienvenida (onboarding)
-1. Saludo cordial y breve. Me presento: "Soy la asistente digital del negocio".
-2. Transparencia: aviso que guardaré sus datos e intereses para atenderle mejor.
+1. Saludo cordial y breve. Me presento SIEMPRE en el primer mensaje como lo
+   que soy: "Soy la asistente virtual del negocio; funciono con inteligencia
+   artificial". Es un aviso legal obligatorio: nunca lo omito ni lo suavizo.
+2. Transparencia: aviso que la conversación se procesa con IA y que guardaré
+   sus datos e intereses para atenderle mejor. Si quiere hablar con una
+   persona, le digo que le paso el mensaje al equipo.
 3. Pregunto su nombre y en qué le puedo ayudar.
 4. Conforme conversa, identifico: qué le interesa, qué urgencia tiene, cómo
    prefiere que lo contacten, y cualquier problema que menciona.
@@ -19630,8 +19642,10 @@ conozco su nombre ni su relación con el negocio.
 ## Límites
 - No prometo acciones: no confirmo pedidos, no cobro, no agendo, no doy precios
   que no me hayan dado. Solo converso, oriento y tomo nota.
-- No hablo de tecnología, modelos de IA ni herramientas internas. Si preguntan
-  qué soy: "la asistente digital del negocio".
+- No hablo de tecnología, modelos de IA ni herramientas internas (qué modelo,
+  qué proveedor, qué herramientas tengo). Si preguntan qué soy, lo digo sin
+  rodeos: "la asistente virtual del negocio, con inteligencia artificial".
+  NUNCA niego ser una IA ni me hago pasar por una persona.
 - Respondo en el idioma del visitante (español por defecto), mensajes cortos,
   tono cálido y profesional de WhatsApp.
 
@@ -23827,6 +23841,13 @@ def _bet_timezone_from_profile(profile) -> str:
     además da nombre legible); -07:00 a Hermosillo y -08:00 a Tijuana."""
     if not isinstance(profile, dict):
         return ""
+    # 2.4.0: el app manda `timezoneIana` (America/Mexico_City) detectada en el
+    # teléfono — gana sobre la etiqueta (que sólo trae abreviatura+offset y
+    # no distingue horario de verano fuera de México).
+    iana = profile.get("timezoneIana")
+    iana = iana.strip() if isinstance(iana, str) else ""
+    if iana and re.fullmatch(r"[A-Za-z_]+(?:/[A-Za-z0-9_+\-]+){1,2}", iana):
+        return iana
     raw = profile.get("timezone")
     raw = raw.strip() if isinstance(raw, str) else ""
     if not raw:
@@ -33918,13 +33939,23 @@ Modes:
                        (empty trustedNetworks list → fail-open, behaves as auto)
 
 Stdlib only (Python 3.9+).
+
+1.1.0 — retry-after-dependent: el PRIMER spawn de sub-agente en un nodo
+        fresco encola dos requests (A = scopes extra del sub-agente, B =
+        "scope upgrade" que da autoridad para aprobar A). Aprobar A primero
+        falla con `scope upgrade pending approval (requestId: <B>)`; antes
+        aprobábamos B y NUNCA reintentábamos A → el spawn moría con 1008 y
+        sólo el segundo intento del usuario pasaba. Ahora: detectar el
+        requestId dependiente en el stderr, aprobarlo, esperar y reintentar
+        el original (una vez). Ver feedback_scope_upgrade_first_spawn.
 """
-__VERSION__ = "1.0.0"
+__VERSION__ = "1.1.0"
 
 import fcntl
 import ipaddress
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -34083,7 +34114,25 @@ def decide(req: dict, cfg: dict) -> str:
 # ─────────────────────────────────────────────
 # Approve action
 # ─────────────────────────────────────────────
+_DEPENDENT_RE = re.compile(
+    r"scope upgrade pending approval[^\n]*?requestId[:=]\s*([0-9a-fA-F-]{8,})"
+)
+
+
+def dependent_request_id(stderr: str) -> str | None:
+    """requestId del "scope upgrade" que bloquea un approve, o None."""
+    m = _DEPENDENT_RE.search(stderr or "")
+    return m.group(1) if m else None
+
+
 def run_approve(request_id: str, cfg: dict) -> bool:
+    ok, _ = run_approve_ex(request_id, cfg)
+    return ok
+
+
+def run_approve_ex(request_id: str, cfg: dict) -> "tuple[bool, str]":
+    """Como run_approve, pero devuelve también el stderr (para detectar el
+    requestId dependiente de un scope upgrade)."""
     timeout = cfg.get("approveTimeoutMs", 15000) / 1000.0
     try:
         result = subprocess.run(
@@ -34098,18 +34147,42 @@ def run_approve(request_id: str, cfg: dict) -> bool:
         )
     except FileNotFoundError:
         log("error", f"openclaw binary not found at {OPENCLAW_BIN}")
-        return False
+        return False, ""
     except subprocess.TimeoutExpired:
         log("error", f"approve timed out after {timeout}s")
-        return False
+        return False, ""
 
+    stderr = (result.stderr or "").strip()
     if result.returncode != 0:
-        log("error", f"approve failed (rc={result.returncode}): {result.stderr.strip()}")
-        return False
+        log("error", f"approve failed (rc={result.returncode}): {stderr}")
+        return False, stderr
 
     if result.stdout.strip():
         log("debug", f"approve stdout: {result.stdout.strip()}")
-    return True
+    return True, stderr
+
+
+def approve_with_dependents(request_id: str, cfg: dict, seen: set) -> bool:
+    """Aprueba `request_id`; si el CLI responde que primero hay que aprobar
+    un scope upgrade dependiente, lo aprueba, espera a que el gateway rote
+    el token y reintenta el original UNA vez (1.1.0)."""
+    ok, stderr = run_approve_ex(request_id, cfg)
+    if ok:
+        return True
+    dep = dependent_request_id(stderr)
+    if not dep or dep == request_id:
+        return False
+    log("info", f"{request_id[:8]} depende del scope upgrade {dep[:8]} — aprobándolo primero")
+    dep_ok, _ = run_approve_ex(dep, cfg)
+    if not dep_ok:
+        return False
+    seen.add(dep)
+    log("info", f"✓ approved dependent {dep[:8]}")
+    time.sleep(cfg.get("dependentRetryDelayMs", 1500) / 1000.0)
+    ok, _ = run_approve_ex(request_id, cfg)
+    if ok:
+        log("info", f"✓ approved {request_id[:8]} tras el scope upgrade")
+    return ok
 
 
 # ─────────────────────────────────────────────
@@ -34152,7 +34225,7 @@ def main() -> int:
             )
 
             if decision == "approve":
-                ok = run_approve(request_id, cfg)
+                ok = approve_with_dependents(request_id, cfg, seen)
                 if ok:
                     log("info", f"✓ approved {request_id[:8]}")
                     seen.add(request_id)
