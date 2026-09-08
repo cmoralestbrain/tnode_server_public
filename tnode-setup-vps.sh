@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.142.0"
+TNODE_SETUP_VERSION="1.143.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -16120,6 +16120,14 @@ from __future__ import annotations
 #          + FIX _guest_agent_present leia agents.list legacy — en 2.0
 #          nativo devolvia False siempre y el startup self-heal quedaba
 #          en retry-loop infinito (~3s) desde el nacimiento del nodo.
+# 2.5.0   — Telegram cae en recepcion (canal F3): _ensure_platform_agents
+#          siembra un binding recepcion←telegram junto al de whatsapp (uno por
+#          canal, idempotente), y _sync_owner_channel_identity manda al MAIN
+#          al dueño también por Telegram: su id numérico = allowFrom[:1] del
+#          link en modo `owner` (channels state) → binding
+#          main←telegram:direct:<id> + ownerPeers del context-engine (que ya
+#          acepta ids de Telegram). SOUL/IDENTITY de recepcion nombran ambos
+#          canales. Sin handlers nuevos: el link del bot ya existía.
 # 2.4.0   — (a) `profile.timezoneIana` (IANA detectada por el app con
 #          flutter_timezone) gana sobre la etiqueta 'CST (UTC-06:00)' al
 #          sembrar el setting `timezone` de tnode-bet: fuera de México la
@@ -16274,7 +16282,7 @@ from __future__ import annotations
 #          quedó listo. Apagar conserva la BD (el historial es del usuario);
 #          sólo `purge:true` la borra. Mismo patrón que agenda/drive/poll:
 #          los archivos viajan en el daemon y se auto-materializan al boot.
-__VERSION__ = "2.4.0"
+__VERSION__ = "2.5.0"
 
 import hashlib
 import hmac
@@ -19664,7 +19672,7 @@ _WF_AUTHOR_MODEL_ENTRY = {
 _RECEPCION_WS_FILES = {
     "IDENTITY.md": """# IDENTITY
 Soy la **Recepcionista digital** del negocio. Atiendo los canales de mensajería
-(WhatsApp) dando la bienvenida a visitantes y prospectos.
+(WhatsApp y Telegram) dando la bienvenida a visitantes y prospectos.
 """,
     "AGENTS.md": """# AGENTS
 Trabajo sola. No delego a otros agentes ni menciono su existencia.
@@ -19672,7 +19680,8 @@ Trabajo sola. No delego a otros agentes ni menciono su existencia.
     "SOUL.md": """# SOUL — Recepcionista de canales
 
 ## Quién soy
-Soy la recepcionista digital del negocio. Atiendo mensajes entrantes de WhatsApp.
+Soy la recepcionista digital del negocio. Atiendo mensajes entrantes de WhatsApp
+y Telegram.
 La persona que me escribe es un VISITANTE: no sé quién es y NO debo asumir que
 conozco su nombre ni su relación con el negocio.
 
@@ -19921,13 +19930,20 @@ def _ensure_platform_agents() -> bool:
         author_entry["model"] = {"primary": _WF_AUTHOR_MODEL}
     _ensure_entry(author_entry)
 
+    # 2.5.0: recepcion atiende WhatsApp Y Telegram (F3 del canal). Un binding
+    # por canal; el orden importa para el gateway (primer match gana), y los
+    # bindings del dueño (main←canal:direct:<peer>) van ANTES — los siembra
+    # _sync_owner_channel_identity al frente de la lista.
     bindings = cfg.setdefault("bindings", [])
-    if isinstance(bindings, list) and not any(
-        isinstance(b, dict) and b.get("agentId") == "recepcion"
-        for b in bindings
-    ):
-        bindings.append({"agentId": "recepcion", "match": {"channel": "whatsapp"}})
-        changed = True
+    if isinstance(bindings, list):
+        for chan in ("whatsapp", "telegram"):
+            if not any(
+                isinstance(b, dict) and b.get("agentId") == "recepcion"
+                and (b.get("match") or {}).get("channel") == chan
+                for b in bindings
+            ):
+                bindings.append({"agentId": "recepcion", "match": {"channel": chan}})
+                changed = True
 
     # dmScope seguro: solo se corrige el default INSEGURO ("main"/ausente,
     # el bug del 2026-08-03); un valor deliberado distinto se respeta.
@@ -23824,6 +23840,23 @@ def _owner_channel_peers(profile) -> list:
     return peers
 
 
+def _owner_telegram_ids() -> list:
+    """IDs numéricos de Telegram del dueño: los que él mismo registró al
+    vincular el bot en modo `owner` (channels.telegram.link, accessMode
+    owner ⇒ allowFrom[:1]). En modo `list`/`open` no hay dueño identificable
+    y el canal completo cae en recepcion."""
+    try:
+        tg = (_read_channels_state() or {}).get("telegram") or {}
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(tg, dict) or tg.get("status") != "linked":
+        return []
+    if (tg.get("accessMode") or "") != "owner":
+        return []
+    ids = [str(x).strip() for x in (tg.get("allowFrom") or []) if str(x).strip().isdigit()]
+    return ids[:1]
+
+
 def _sync_owner_channel_identity(token: dict, profile=None) -> None:
     """El dueño escribiéndole a SU agente por WhatsApp: (a) el plugin
     context-engine debe reconocer su número como dueño (`ownerPeers`, si no
@@ -23836,7 +23869,9 @@ def _sync_owner_channel_identity(token: dict, profile=None) -> None:
     try:
         if profile is None:
             profile = _read_user_profile(token)
-        peers = _owner_channel_peers(profile)
+        wa_peers = _owner_channel_peers(profile)
+        tg_ids = _owner_telegram_ids()
+        peers = wa_peers + tg_ids
         if not peers or peers == _OWNER_PEERS_LAST:
             return
         try:
@@ -23856,15 +23891,18 @@ def _sync_owner_channel_identity(token: dict, profile=None) -> None:
         bindings = cfg.get("bindings") if isinstance(cfg.get("bindings"), list) else []
         wanted = [{"agentId": "main",
                    "match": {"channel": "whatsapp",
-                             "peer": {"kind": "direct", "id": p}}} for p in peers]
+                             "peer": {"kind": "direct", "id": p}}} for p in wa_peers]
+        wanted += [{"agentId": "main",
+                    "match": {"channel": "telegram",
+                              "peer": {"kind": "direct", "id": i}}} for i in tg_ids]
         def _is_owner_binding(b):
-            # Todo binding main←whatsapp:direct es nuestro (lo sembró este
-            # daemon): así una siembra previa con número mal formado se
-            # reemplaza en vez de quedarse huérfana.
+            # Todo binding main←{whatsapp,telegram}:direct es nuestro (lo
+            # sembró este daemon): así una siembra previa con número mal
+            # formado se reemplaza en vez de quedarse huérfana.
             m = (b or {}).get("match") or {}
             peer = m.get("peer") if isinstance(m.get("peer"), dict) else {}
             return ((b or {}).get("agentId") == "main"
-                    and m.get("channel") == "whatsapp"
+                    and m.get("channel") in ("whatsapp", "telegram")
                     and peer.get("kind") == "direct")
         rest = [b for b in bindings if not _is_owner_binding(b)]
         new_bindings = wanted + rest
