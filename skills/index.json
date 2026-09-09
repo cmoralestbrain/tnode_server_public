@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "builtAt": "cache-3a66d5d1d750",
+  "builtAt": "cache-1f914cf7663d",
   "skills": {
     "tnode-agenda": {
       "version": "1.0.1",
@@ -80,19 +80,19 @@
       }
     },
     "tnode-bet": {
-      "version": "1.16.0",
-      "file": "tnode-bet-1.16.0.tgz",
-      "sha256": "00880be3c8cb2e4fa8c405e4dd9a6d6660b508c00a3c4b51211679309fa2ff02",
+      "version": "1.17.0",
+      "file": "tnode-bet-1.17.0.tgz",
+      "sha256": "fba6dd5848a400c18f34a72f3afeb48c645280c3fb2fe4f1e705dcce0c75346e",
       "audience": "dueño",
       "files": {
-        "SKILL.md": "aaac5e22ec87e8e9b1e8e711edfe139718b1a08a2692acaf4978f4ac3dc6cdd7",
-        "bin/apisports.py": "86ce078f4668a70641040d5af2587ed5891f097244ecb7ff89e9bec3cbe5f56b",
+        "SKILL.md": "e7cb1ff182a64f79f1b58d2e36da870dcb5f7dd44eb4970aee2e94f6cc875db3",
+        "bin/apisports.py": "d8d033d70f209b4eed438a7d19bc9da4f216e587e0c3837260f05fdfbdc77261",
         "bin/backfill.py": "0d713ccc050801eb66e2ce69f9a1bb0142de3cb99d0a2c7c8000caf9b2b1cc3b",
-        "bin/bet.py": "417b03e8cfbf7d38ee7aabe12ba9ea942ea34255126be38b96de6bf51e52186f",
+        "bin/bet.py": "8ffb84e4d3cd608cdcf8054a6224d08a34319419d7ad1ebedc3f185332de060a",
         "bin/db.py": "47a6873844c042c2c3a0d3c251cbfd218fdc0730810245314261a05a10d23f81",
         "bin/models.py": "ef3dd66fa627809dda12cf0202f3d0aaf495112101a52b9ea6bd8f15a081d0fc",
         "bin/value.py": "cbe259a20fea022afe365ddcc9b7b92e0c020887ed5d3847ad350967951386b4",
-        "manifest.json": "c3d5f1d7f371d8143c250a8cd42ae6f87bdd7d98879e917adb423ca6b7755ff9",
+        "manifest.json": "e3097cf3dc93f8f045880fa6bdfd3daf9687f8d9f54bfd3730482debf766e9d3",
         "migrations/002_null_line_unique.sql": "1b6c1bae41a173f28ddfca61c1a767c8d45d9a3c4fd702bedff4f718da29ddad",
         "migrations/003_status_snapshot.sql": "62b0b7b84db8fe8a35dc457bd628d6659b60cc1a65a430bc0ba8f07b5a6792e2",
         "migrations/004_verified_provider_ids.sql": "d3e2142bd58ce00d56fa5054cbd9d487249b9ef6e289e258cf9309a3aedfbeab",
