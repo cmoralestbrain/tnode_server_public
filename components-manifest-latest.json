@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-09-09T04:04:20.671253+00:00",
-  "tag": "tnode-setup-v1.144.0",
+  "generatedAt": "2026-09-11T02:16:47.071838+00:00",
+  "tag": "tnode-setup-v1.145.0",
   "components": [
     {
       "id": "tnode-chat-sync",
@@ -12,7 +12,7 @@
     {
       "id": "tnode-config-sync",
       "kind": "daemon-embedded",
-      "version": "2.5.0",
+      "version": "2.7.0",
       "source": "scripts/tnode_config_sync.py"
     },
     {
@@ -74,7 +74,7 @@
     {
       "id": "@tbrain/openclaw-tnode-channel",
       "kind": "plugin-extension",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "source": "extensions/tnode/"
     },
     {
