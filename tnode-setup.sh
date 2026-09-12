@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.146.1"
+TNODE_SETUP_VERSION="1.146.2"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -1537,6 +1537,14 @@ enable_plugin() {
             return 0
         fi
         warn "enable_plugin: $pid intento $attempt sin enabled=true en config — $(printf '%s' "$out" | tail -1)"
+        if printf '%s' "$out" | grep -qiE 'config is invalid|doctor --fix|agents\.ownership'; then
+            # Config inválido = casi siempre roster multi-agente sin
+            # agents.ownership (config-sync materializó guest/recepcion antes
+            # de v2-defaults). Reparar en sitio y reintentar; sin esto la
+            # provisión moría en el paso 6 (2026-09-02 → 2026-09-12).
+            info "enable_plugin: config inválido — aplicando v2-defaults (ownership/main) antes de reintentar"
+            configure_openclaw_v2_defaults >/dev/null 2>&1 || true
+        fi
         sleep $((attempt * 2))
     done
     return 1
@@ -16036,6 +16044,12 @@ from __future__ import annotations
 #          unidades, probabilidad, ventaja, CLV y el acumulado. Reemplaza la
 #          automation que el agente armaba solo ("picks cerrados"). Los
 #          crons de aviso comparten `_sync_bet_announce_job`; reconcile 2.7.0.
+# 2.8.0   — _roster_store (2.0): SIEMPRE escribe agents.ownership="explicit"
+#          al persistir el roster. Causa raíz de la provisión rota (paso 6)
+#          desde 1.133.0: el daemon materializaba guest/recepcion antes de
+#          v2-defaults del installer → config inválido → `plugins enable`
+#          rehusado → installer muere antes de pairing_ready. Cazado con
+#          lab-provision.py el 2026-09-12 (3 provisiones reales fallidas).
 # 2.6.0   — tnode-bet: que el modelo no se pierda avisando. (a) Los 4 crons
 #          de INGESTA (fixtures/odds/results/settle) ya no llevan `delivery`:
 #          eran comandos que no le reportan a nadie, pero el announce con
@@ -16211,7 +16225,7 @@ from __future__ import annotations
 #          quedó listo. Apagar conserva la BD (el historial es del usuario);
 #          sólo `purge:true` la borra. Mismo patrón que agenda/drive/poll:
 #          los archivos viajan en el daemon y se auto-materializan al boot.
-__VERSION__ = "2.7.0"
+__VERSION__ = "2.8.0"
 
 import hashlib
 import hmac
@@ -18221,6 +18235,16 @@ def _roster_store(agents_section: dict, agents_list: list) -> None:
             if isinstance(a, dict) and a.get("id")
         }
         agents_section.pop("list", None)
+        # 2.8.0: un roster multi-agente SIN agents.ownership="explicit" es
+        # config INVÁLIDO en 2.0 ("multi-agent rosters require
+        # agents.ownership=explicit or one legacy default=true marker") y el
+        # CLI rehúsa `plugins enable` hasta correr doctor --fix. En un nodo
+        # recién nacido este daemon materializa guest/recepcion/workflow-*
+        # ANTES de que el installer escriba v2-defaults → provisión rota en
+        # el paso 6 (2026-09-02 → 2026-09-12). Quien escribe el roster pone
+        # la ownership. Idempotente.
+        if len(agents_section["entries"]) > 1 or agents_section.get("ownership") is None:
+            agents_section["ownership"] = "explicit"
     else:
         agents_section["list"] = agents_list
 
