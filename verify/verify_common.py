@@ -197,20 +197,31 @@ def check_script_version(script_path: Path, expected_version: str) -> CheckResul
 
 
 def check_http_probe(url: str, timeout: int = 3,
-                     expect_status: tuple[int, ...] = (200,)) -> CheckResult:
-    """GET el URL, valida status. WebSocket URLs (ws://) se chequean como TCP connect."""
+                     expect_status: tuple[int, ...] = (200,),
+                     retries: int = 1, delay: float = 2.0) -> CheckResult:
+    """GET el URL, valida status. WebSocket URLs (ws://) se chequean como TCP connect.
+    `retries`/`delay`: el gateway 2.x tarda 10-25 s en escuchar tras un restart
+    (el smoke corría 1 s después de recover_failed_openclaw_gateway y daba
+    ECONNREFUSED falso — visto 2026-09-12 en el upgrade a 2026.9.4)."""
+    import time as _time
     if url.startswith("ws://") or url.startswith("wss://"):
         import socket
         host_port = url.split("://", 1)[1].split("/", 1)[0]
         host, _, port_s = host_port.partition(":")
         port = int(port_s) if port_s else (443 if url.startswith("wss") else 80)
-        try:
-            with socket.create_connection((host, port), timeout=timeout):
-                return {"name": "http-probe", "status": "ok",
-                        "details": f"tcp connect to {host}:{port} OK"}
-        except Exception as e:
-            return {"name": "http-probe", "status": "fail",
-                    "details": f"tcp connect to {host}:{port} failed: {e}"}
+        last = ""
+        for attempt in range(1, max(1, retries) + 1):
+            try:
+                with socket.create_connection((host, port), timeout=timeout):
+                    return {"name": "http-probe", "status": "ok",
+                            "details": f"tcp connect to {host}:{port} OK"
+                                       + (f" (intento {attempt})" if attempt > 1 else "")}
+            except Exception as e:
+                last = str(e)
+                if attempt < retries:
+                    _time.sleep(delay)
+        return {"name": "http-probe", "status": "fail",
+                "details": f"tcp connect to {host}:{port} failed tras {retries} intento(s): {last}"}
     try:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:

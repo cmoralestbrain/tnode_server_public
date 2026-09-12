@@ -89,14 +89,14 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.146.2"
+TNODE_SETUP_VERSION="1.147.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
 # even with a valid Ed25519 signature + master token, blocking cloud
 # provisioning E2E. Override with `OPENCLAW_PIN_VERSION=` (empty) to take
 # whatever is current.
-OPENCLAW_PIN_VERSION="${OPENCLAW_PIN_VERSION-2026.8.1}"
+OPENCLAW_PIN_VERSION="${OPENCLAW_PIN_VERSION-2026.9.4}"
 # Canal WhatsApp Personal (Baileys). El pin SIGUE al del core AUTOMATICAMENTE:
 # mismo release train, quitando el sufijo de republish npm del core (p.ej.
 # core "2026.7.1-2" → WA "2026.7.1"), que @openclaw/whatsapp no publica. Cada
@@ -34895,6 +34895,31 @@ update_openclaw_gateway_only() {
             ;;
     esac
     success "openclaw-gateway refreshed"
+    reinstall_whatsapp_if_stale
+}
+
+# El pin del plugin WhatsApp SIGUE al del core, pero en un nodo vivo
+# `install_whatsapp_plugin` es idempotente (si el proyecto existe no re-pinea)
+# y `plugins install` sin --force responde "plugin already exists". Tras el
+# bump del kernel comparamos la version instalada con el pin y reinstalamos
+# con --force (camino validado en el lab 7ed81d3d, 2026-09-12: 8.1 -> 9.4).
+reinstall_whatsapp_if_stale() {
+    [[ -z "${OPENCLAW_WA_PLUGIN_VERSION:-}" ]] && return 0
+    local pkg installed=""
+    for pkg in "$OPENCLAW_HOME"/npm/projects/openclaw-whatsapp-*/node_modules/@openclaw/whatsapp/package.json; do
+        [[ -f "$pkg" ]] || continue
+        installed="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('version',''))" "$pkg" 2>/dev/null || true)"
+        break
+    done
+    [[ -z "$installed" ]] && return 0   # WA no instalado en este nodo: nada que hacer
+    [[ "$installed" == "$OPENCLAW_WA_PLUGIN_VERSION" ]] && { info "WhatsApp plugin ya en $installed"; return 0; }
+    info "WhatsApp plugin $installed != pin $OPENCLAW_WA_PLUGIN_VERSION — reinstalando (--force)"
+    if run_as_tnode bash -c "cd \"$OPENCLAW_HOME/..\" && openclaw plugins install @openclaw/whatsapp@$OPENCLAW_WA_PLUGIN_VERSION --pin --force $(_oc_accept_caps_flag)" </dev/null; then
+        enable_plugin whatsapp || warn "WhatsApp: enable tras reinstalar fallo"
+        success "WhatsApp plugin @$OPENCLAW_WA_PLUGIN_VERSION reinstalado (el gateway lo toma en su proximo arranque)"
+    else
+        warn "WhatsApp: reinstall @$OPENCLAW_WA_PLUGIN_VERSION fallo — revisar a mano (openclaw plugins install ... --force)"
+    fi
 }
 
 # Detect a stale openclaw-gateway daemon — binary updated on disk (via

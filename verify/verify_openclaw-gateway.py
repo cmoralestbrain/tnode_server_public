@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """verify_openclaw-gateway — health check del gateway WebSocket de OpenClaw."""
 from __future__ import annotations
-__VERSION__ = "1.1.0"
+__VERSION__ = "1.1.1"
 
 import sys
 from pathlib import Path
@@ -38,7 +38,7 @@ def main() -> int:
         # existe como unit. Quien manda sobre si está vivo es el probe al WS.
         check_service_active(SERVICE_NAME, darwin_label=DARWIN_LABEL, soft=True),
         check_npm_version(NPM_PACKAGE),
-        check_http_probe(GATEWAY_WS_URL, timeout=3),
+        check_http_probe(GATEWAY_WS_URL, timeout=3, retries=15, delay=2.0),
         check_json_valid(OPENCLAW_JSON),
     ]
     actual = next((c["details"].split("@")[1]
