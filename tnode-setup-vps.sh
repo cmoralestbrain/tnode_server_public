@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.145.0"
+TNODE_SETUP_VERSION="1.146.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -110,6 +110,14 @@ OPENCLAW_WA_PLUGIN_VERSION="${OPENCLAW_WA_PLUGIN_VERSION-${OPENCLAW_PIN_VERSION%
 # que update_plugins_if_stale pueda compararlo: el installer se ejecuta via
 # `curl | bash`, asi que $0 es "bash" y no se puede releer el propio fichero.
 OPENCLAW_WS_PLUGIN_VERSION="${OPENCLAW_WS_PLUGIN_VERSION-0.2.2}"
+# Runtime Node minimo que exige el kernel. OpenClaw 2026.9.3+ declara
+# engines.node ">=24.16.0 <25 || >=26.1.0" (Node 22 fuera de soporte).
+# Decision tobal 2026-09-12: toda la flota en Node 26 (brew `node` = 26.x,
+# NodeSource setup_26.x). ensure_nodejs() sube el major si el instalado es
+# menor y deja NODE_MAJOR_UPGRADED=1 para que --scope full regenere lo que
+# lleva la ruta/ABI de Node (kernel via npm install -g; LaunchAgent en Mac).
+NODE_MAJOR_MIN="${NODE_MAJOR_MIN-26}"
+NODE_MAJOR_UPGRADED=0
 # web-search (@ollama/openclaw-web-search) busca y lee páginas a través de un
 # servidor Ollama LOCAL (127.0.0.1:11434). En un VPS/nodo sin ollama el plugin
 # es peso muerto (1.141.0: en HEB β estaba enabled y ni cargaba). Solo aplica
@@ -1126,11 +1134,19 @@ phase_ollama() {
 
 # Ensure Node.js is available (required by OpenClaw)
 ensure_nodejs() {
+    local needs_upgrade=0
     if command_exists node && command_exists npm; then
-        local node_ver
+        local node_ver node_major
         node_ver="$(node --version 2>&1)"
-        success "Node.js $node_ver (npm $(npm --version 2>&1))"
-        return 0
+        node_major="${node_ver#v}"; node_major="${node_major%%.*}"
+        if [[ "$node_major" =~ ^[0-9]+$ ]] && (( node_major >= NODE_MAJOR_MIN )); then
+            success "Node.js $node_ver (npm $(npm --version 2>&1))"
+            return 0
+        fi
+        # Node presente pero viejo (flota 2026.8.1 nacio con NodeSource 22):
+        # el kernel 2026.9.3+ no arranca con el. Subir el major en sitio.
+        info "Node.js $node_ver por debajo del minimo v$NODE_MAJOR_MIN que exige el kernel — subiendo major"
+        needs_upgrade=1
     fi
 
     # Node exists without npm (e.g. Ubuntu 24 ships Node 18 without npm).
@@ -1139,7 +1155,7 @@ ensure_nodejs() {
     # with Node 18 and no npm after the installer "succeeds".
     local needs_purge=0
     if command_exists node && ! command_exists npm; then
-        info "Node.js $(node --version) detectado sin npm — reinstalando Node.js 22..."
+        info "Node.js $(node --version) detectado sin npm — reinstalando Node.js $NODE_MAJOR_MIN..."
         needs_purge=1
     fi
 
@@ -1148,7 +1164,20 @@ ensure_nodejs() {
         Darwin)
             ensure_brew_on_path
             if command_exists brew; then
-                run_with_progress "Instalando Node.js + git via Homebrew" --estimate 30 brew install node git
+                run_with_progress "Instalando Node.js $NODE_MAJOR_MIN + git via Homebrew" --estimate 30 brew install node git
+                if [[ "$needs_upgrade" == "1" ]]; then
+                    # La formula `node` ya es 26.x; si lo que manda en
+                    # /opt/homebrew/bin es un keg versionado (node@22 en la
+                    # Mini) hay que deslinkearlo y linkear `node`. Si `node`
+                    # ya estaba instalada pero vieja, upgrade.
+                    brew upgrade node >/dev/null 2>&1 || true
+                    local old_keg
+                    for old_keg in $(brew list --formula 2>/dev/null | grep -E '^node@[0-9]+$'); do
+                        info "Deslinkeando $old_keg"
+                        brew unlink "$old_keg" >/dev/null 2>&1 || true
+                    done
+                    brew link --overwrite node >/dev/null 2>&1 || true
+                fi
             else
                 die "Homebrew necesario para instalar Node.js en macOS"
             fi
@@ -1163,16 +1192,16 @@ ensure_nodejs() {
                 # Run NodeSource setup foreground (no spinner) — its output is load-bearing
                 # for debugging when the repo fails to register.
                 info "Configurando repositorio NodeSource..."
-                curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null 2>&1 || die "NodeSource setup falló"
-                run_with_progress "Instalando Node.js 22 + git + python3-websockets + python3-psutil" --estimate 30 apt-get install -y nodejs git python3-websockets python3-psutil
+                curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR_MIN}.x | bash - >/dev/null 2>&1 || die "NodeSource setup falló"
+                run_with_progress "Instalando Node.js $NODE_MAJOR_MIN + git + python3-websockets + python3-psutil" --estimate 30 apt-get install -y nodejs git python3-websockets python3-psutil
             elif command_exists dnf; then
                 info "Configurando repositorio NodeSource..."
-                curl -fsSL https://rpm.nodesource.com/setup_22.x | bash - >/dev/null 2>&1 || die "NodeSource setup falló"
-                run_with_progress "Instalando Node.js 22 + git + python3-websockets + python3-psutil" --estimate 30 dnf install -y nodejs git python3-websockets python3-psutil
+                curl -fsSL https://rpm.nodesource.com/setup_${NODE_MAJOR_MIN}.x | bash - >/dev/null 2>&1 || die "NodeSource setup falló"
+                run_with_progress "Instalando Node.js $NODE_MAJOR_MIN + git + python3-websockets + python3-psutil" --estimate 30 dnf install -y nodejs git python3-websockets python3-psutil
             elif command_exists yum; then
                 info "Configurando repositorio NodeSource..."
-                curl -fsSL https://rpm.nodesource.com/setup_22.x | bash - >/dev/null 2>&1 || die "NodeSource setup falló"
-                run_with_progress "Instalando Node.js 22 + git + python3-websockets + python3-psutil" --estimate 30 yum install -y nodejs git python3-websockets python3-psutil
+                curl -fsSL https://rpm.nodesource.com/setup_${NODE_MAJOR_MIN}.x | bash - >/dev/null 2>&1 || die "NodeSource setup falló"
+                run_with_progress "Instalando Node.js $NODE_MAJOR_MIN + git + python3-websockets + python3-psutil" --estimate 30 yum install -y nodejs git python3-websockets python3-psutil
             else
                 die "No se encontró package manager (apt/dnf/yum) para instalar Node.js"
             fi
@@ -1189,7 +1218,13 @@ ensure_nodejs() {
     hash -r 2>/dev/null || true
 
     if command_exists node && command_exists npm; then
+        local got_major
+        got_major="$(node --version 2>&1)"; got_major="${got_major#v}"; got_major="${got_major%%.*}"
+        if ! [[ "$got_major" =~ ^[0-9]+$ ]] || (( got_major < NODE_MAJOR_MIN )); then
+            die "Node.js $(node --version) instalado pero el kernel exige >= v$NODE_MAJOR_MIN — revisa el log"
+        fi
         success "Node.js $(node --version) (npm $(npm --version)) instalado"
+        [[ "$needs_upgrade" == "1" ]] && NODE_MAJOR_UPGRADED=1
     else
         die "Node.js/npm no se encontró en PATH después de instalar — revisa el log"
     fi
@@ -35646,7 +35681,21 @@ main() {
             # —que corre luego— vea el paquete npm nuevo y reinicie una sola
             # vez, en vez de reiniciar por plugins y otra por el binario.
             info "--scope full: actualizando también el kernel openclaw"
+            # El runtime primero: si el kernel nuevo exige un Node mayor
+            # (2026.9.3+ = Node 26) el `npm install -g` de abajo fallaria o
+            # dejaria un binario que no arranca. No-op si ya cumple
+            # NODE_MAJOR_MIN. El propio npm install -g reinstala los
+            # prebuilds nativos (fs-safe, tree-sitter) contra el Node nuevo.
+            ensure_nodejs
             update_openclaw_gateway_only
+            if [[ "$NODE_MAJOR_UPGRADED" == "1" && "$OS" == "Darwin" ]]; then
+                # El LaunchAgent managed lleva la ruta del binario de Node
+                # hardcodeada (/opt/homebrew/opt/node@22/bin/node en la Mini):
+                # regenerarlo o el gateway arranca con el Node viejo.
+                info "Node cambio de major — regenerando LaunchAgent del gateway"
+                run_as_tnode openclaw gateway install --force </dev/null \
+                    || warn "openclaw gateway install --force fallo — regenerar a mano"
+            fi
         fi
     fi
     phase_helpers
