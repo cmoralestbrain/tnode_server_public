@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.146.0"
+TNODE_SETUP_VERSION="1.146.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -34197,8 +34197,15 @@ Stdlib only (Python 3.9+).
         sólo el segundo intento del usuario pasaba. Ahora: detectar el
         requestId dependiente en el stderr, aprobarlo, esperar y reintentar
         el original (una vez). Ver feedback_scope_upgrade_first_spawn.
+1.1.1 — fix macOS: el LaunchAgent corre /usr/bin/python3 (Apple, 3.9.6) y
+        `-> str | None` sin `from __future__ import annotations` truena al
+        importar (TypeError: unsupported operand | ... NoneType). Los otros
+        daemons ya traían el import; pair-watch 1.1.0 no. Detectado en la
+        Mini 2026-09-12 (upgrade Node 26); Linux (3.12) no lo sufría.
 """
-__VERSION__ = "1.1.0"
+from __future__ import annotations
+
+__VERSION__ = "1.1.1"
 
 import fcntl
 import ipaddress
