@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.147.1"
+TNODE_SETUP_VERSION="1.147.2"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -201,6 +201,25 @@ SUPPORTED_COMPONENTS=(
 # to. Defaults to prod, so existing installs are untouched. Beta nodes get
 # it from the shell env (e.g. `TNODE_PROJECT_ID=tbrain-platform-beta bash
 # tnode-setup.sh`). TNODE_TUNNEL_API points at the per-env tunnel Worker.
+# Preservar el entorno de un nodo EXISTENTE: un `--update-only` sin
+# TNODE_PROJECT_ID explicito reescribia /etc/tnode/env con el default PROD en
+# nodos beta (HEB 2026-09-12: 7 h de telemetry `404 not_registered` y
+# config-sync/chat-sync `403` contra el proyecto equivocado; el chat seguia
+# vivo por WS y nadie lo vio hasta la pantalla de Consumo). Prioridad:
+# env explicito > /etc/tnode/env previo > auto-pair.env > ~/.config/tnode/env
+# > default prod. Aplica a TNODE_PROJECT_ID y TNODE_TUNNEL_API.
+for _envf in /etc/tnode/env /etc/tnode/auto-pair.env "${HOME}/.config/tnode/env"; do
+    [[ -f "$_envf" ]] || continue
+    if [[ -z "${TNODE_PROJECT_ID:-}" ]]; then
+        _v="$(grep -m1 '^TNODE_PROJECT_ID=' "$_envf" 2>/dev/null | cut -d= -f2- | tr -d "\"'" )"
+        [[ -n "$_v" ]] && TNODE_PROJECT_ID="$_v" && TNODE_PROJECT_ID_FROM="$_envf"
+    fi
+    if [[ -z "${TNODE_TUNNEL_API:-}" ]]; then
+        _v="$(grep -m1 '^TNODE_TUNNEL_API=' "$_envf" 2>/dev/null | cut -d= -f2- | tr -d "\"'" )"
+        [[ -n "$_v" ]] && TNODE_TUNNEL_API="$_v"
+    fi
+done
+unset _envf _v
 TNODE_PROJECT_ID="${TNODE_PROJECT_ID:-tbrain-platform-7fc1f}"
 TNODE_FUNCTIONS_BASE="https://us-central1-${TNODE_PROJECT_ID}.cloudfunctions.net"
 
