@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.148.0"
+TNODE_SETUP_VERSION="1.148.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -10563,7 +10563,9 @@ update_plugins_if_stale() {
     chown -R "$TNODE_USER":"$TNODE_USER" "$stage_dir" 2>/dev/null || true
 
     local pid emb inst updated=0 checked=0
-    for pid in tbrain-context-engine tnode tnode-transport tnode-wake; do
+    # 1.148.1: tnode-a2a faltaba en esta lista (desde que se embebió en Path B):
+    # en --update-only el plugin A2A nunca se refrescaba en nodos vivos.
+    for pid in tbrain-context-engine tnode tnode-transport tnode-wake tnode-a2a; do
         emb="$(_plugin_pkg_version "$stage_dir/$pid")"
         [[ -n "$emb" ]] || continue
         checked=$((checked+1))
