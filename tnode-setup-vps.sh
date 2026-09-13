@@ -89,7 +89,7 @@ for _p in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/s
 done
 unset _p
 
-TNODE_SETUP_VERSION="1.147.0"
+TNODE_SETUP_VERSION="1.147.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -34964,15 +34964,51 @@ update_openclaw_gateway_only() {
     [[ -n "$OPENCLAW_PIN_VERSION" ]] && npm_target="openclaw@$OPENCLAW_PIN_VERSION"
     run_with_progress "Actualizando openclaw kernel ($npm_target)" --estimate 30 npm install -g "$npm_target"
 
+    restart_openclaw_gateway_and_wait
+    success "openclaw-gateway refreshed"
+    # WA DESPUES del restart real: el CLI del kernel nuevo rehusa tocar el
+    # state ("another Gateway owns that state directory") mientras el gateway
+    # viejo siga vivo. Si reinstalo, un 2o restart para que lo cargue.
+    WA_REINSTALLED=0
+    reinstall_whatsapp_if_stale
+    if [[ "$WA_REINSTALLED" == "1" ]]; then
+        info "Reiniciando el gateway para cargar el plugin WhatsApp nuevo"
+        restart_openclaw_gateway_and_wait
+    fi
+}
+
+# Reinicio REAL del gateway + espera a que escuche en :18789. Antes en Mac se
+# hacia `pkill -f openclaw-gatewa`, que NO matchea el proceso real
+# (`node .../openclaw/dist/index.js gateway`): el gateway viejo seguia vivo en
+# memoria tras el bump del kernel (Mini, 2026-09-12). Un arranque con
+# migracion 9.x tarda ~80 s y el primer intento puede salir 78/CONFIG
+# (indice del agent DB); systemd/launchd lo reintentan solos.
+restart_openclaw_gateway_and_wait() {
     local tnode_uid
     tnode_uid="$(id -u "$TNODE_USER" 2>/dev/null || echo "")"
-    if [[ "$(id -u)" == "0" ]] && [[ -n "$tnode_uid" ]]; then
-        su - "$TNODE_USER" -c "export XDG_RUNTIME_DIR=/run/user/$tnode_uid; systemctl --user restart openclaw-gateway" 2>/dev/null || true
-    else
-        systemctl --user restart openclaw-gateway 2>/dev/null || true
-    fi
-    success "openclaw-gateway refreshed"
-    reinstall_whatsapp_if_stale
+    case "$OS" in
+        Darwin)
+            launchctl kickstart -k "gui/$(id -u)/ai.openclaw.gateway" 2>/dev/null \
+                || pkill -f "openclaw/dist/index.js gateway" 2>/dev/null || true
+            ;;
+        Linux)
+            if [[ "$(id -u)" == "0" ]] && [[ -n "$tnode_uid" ]]; then
+                su - "$TNODE_USER" -c "export XDG_RUNTIME_DIR=/run/user/$tnode_uid; systemctl --user restart openclaw-gateway" 2>/dev/null || true
+            else
+                systemctl --user restart openclaw-gateway 2>/dev/null || true
+            fi
+            ;;
+    esac
+    local i
+    for i in $(seq 1 60); do
+        if python3 -c "import socket; s=socket.create_connection(('127.0.0.1',18789),timeout=2); s.close()" 2>/dev/null; then
+            info "openclaw-gateway escuchando en :18789 (${i}x3 s)"
+            return 0
+        fi
+        sleep 3
+    done
+    warn "openclaw-gateway no escucha en :18789 tras 180 s — revisar 'openclaw gateway status' / journal"
+    return 0
 }
 
 # El pin del plugin WhatsApp SIGUE al del core, pero en un nodo vivo
@@ -34993,7 +35029,8 @@ reinstall_whatsapp_if_stale() {
     info "WhatsApp plugin $installed != pin $OPENCLAW_WA_PLUGIN_VERSION — reinstalando (--force)"
     if run_as_tnode bash -c "cd \"$OPENCLAW_HOME/..\" && openclaw plugins install @openclaw/whatsapp@$OPENCLAW_WA_PLUGIN_VERSION --pin --force $(_oc_accept_caps_flag)" </dev/null; then
         enable_plugin whatsapp || warn "WhatsApp: enable tras reinstalar fallo"
-        success "WhatsApp plugin @$OPENCLAW_WA_PLUGIN_VERSION reinstalado (el gateway lo toma en su proximo arranque)"
+        WA_REINSTALLED=1
+        success "WhatsApp plugin @$OPENCLAW_WA_PLUGIN_VERSION reinstalado"
     else
         warn "WhatsApp: reinstall @$OPENCLAW_WA_PLUGIN_VERSION fallo — revisar a mano (openclaw plugins install ... --force)"
     fi
