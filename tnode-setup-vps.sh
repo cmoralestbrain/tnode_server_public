@@ -103,7 +103,7 @@ if command -v npm >/dev/null 2>&1; then
 fi
 unset _p
 
-TNODE_SETUP_VERSION="1.148.3"
+TNODE_SETUP_VERSION="1.148.4"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -16620,6 +16620,17 @@ from __future__ import annotations
 #          unidades, probabilidad, ventaja, CLV y el acumulado. Reemplaza la
 #          automation que el agente armaba solo ("picks cerrados"). Los
 #          crons de aviso comparten `_sync_bet_announce_job`; reconcile 2.7.0.
+# 2.10.1  — 🔒 agentes LIGADOS A CANALES EXTERNOS también son clase cliente.
+#          Mini 2026-09-15: `tsporty` y `tnodeonb` atendían grupos de WhatsApp
+#          sin `tools` (ni allow ni deny) porque 2.10.0 sólo clasificaba
+#          recepcion/guest/registro A2A. `_channel_bound_client_ids`: todo
+#          agente ≠ main con un binding a un canal ≠ tnode cuyo peer es grupo,
+#          directo que NO es del dueño (ownerPeers) o sin peer (canal entero)
+#          → misma política que un A2A dedicado (channelSkillTools +
+#          prospect_update, deny de recepcion). Fail-closed, sin excepciones.
+#          `_enforce_client_agents_tools_if_changed` corre en cada tick sólo
+#          cuando cambia el mtime de openclaw.json (un binding nuevo desde el
+#          app no espera a un reinicio del daemon).
 # 2.10.0  — 🔒 agentes de CLASE CLIENTE (recepcion, A2A dedicados, guest) pasan
 #          a ALLOWLIST (`tools.allow` + deny). Probe A2A 2026-09-14 en HEB β
 #          (OpenClaw 9.4): un tercero ejecutó `secrets` (valor en claro),
@@ -16844,7 +16855,7 @@ from __future__ import annotations
 #          quedó listo. Apagar conserva la BD (el historial es del usuario);
 #          sólo `purge:true` la borra. Mismo patrón que agenda/drive/poll:
 #          los archivos viajan en el daemon y se auto-materializan al boot.
-__VERSION__ = "2.10.0"
+__VERSION__ = "2.10.1"
 
 import hashlib
 import hmac
@@ -20291,9 +20302,45 @@ def _client_tools_policy(cfg: dict, agent_id: str) -> dict:
     return {"allow": allow, "deny": list(deny)}
 
 
+_OWNER_ONLY_CHANNELS = ("tnode",)
+
+
+def _peer_digits(value) -> str:
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def _channel_bound_client_ids(cfg: dict) -> list:
+    """2.10.1: agentes ≠ main que atienden a terceros por un binding de canal.
+    Cuenta como externo: peer de grupo, peer directo que no está en
+    `ownerPeers` del context-engine, o binding al canal entero (sin peer).
+    Los bindings al canal del app (`tnode`) son del dueño."""
+    if not isinstance(cfg, dict):
+        return []
+    entry = ((cfg.get("plugins") or {}).get("entries") or {}).get("tbrain-context-engine") or {}
+    owner = {_peer_digits(p) for p in ((entry.get("config") or {}).get("ownerPeers") or [])}
+    owner.discard("")
+    out: list = []
+    for b in cfg.get("bindings") or []:
+        if not isinstance(b, dict):
+            continue
+        agent = b.get("agentId")
+        m = b.get("match") if isinstance(b.get("match"), dict) else {}
+        channel = m.get("channel")
+        if not isinstance(agent, str) or not agent or agent == "main":
+            continue
+        if not channel or channel in _OWNER_ONLY_CHANNELS:
+            continue
+        peer = m.get("peer") if isinstance(m.get("peer"), dict) else None
+        if peer and peer.get("kind") == "direct" and _peer_digits(peer.get("id")) in owner:
+            continue
+        if agent not in out:
+            out.append(agent)
+    return out
+
+
 def _enforce_client_agents_tools() -> bool:
     """Reaplica `_client_tools_policy` a los agentes cliente presentes en el
-    roster (tras un cambio de channelSkillTools). True si escribió."""
+    roster (tras un cambio de channelSkillTools o de bindings). True si escribió."""
     cfg = read_openclaw_json()
     if not isinstance(cfg, dict):
         return False
@@ -20301,7 +20348,8 @@ def _enforce_client_agents_tools() -> bool:
     if not isinstance(agents_section, dict):
         return False
     agents_list = _roster_load(agents_section)
-    targets = set(_a2a_client_agent_ids()) | {"guest"}
+    bound = set(_channel_bound_client_ids(cfg))
+    targets = set(_a2a_client_agent_ids()) | {"guest"} | bound
     changed = False
     for a in agents_list:
         if isinstance(a, dict) and a.get("id") in targets:
@@ -20309,11 +20357,32 @@ def _enforce_client_agents_tools() -> bool:
             if a.get("tools") != want:
                 a["tools"] = want
                 changed = True
+                if a["id"] in bound:
+                    _log("client-tools: %s atiende un canal externo → clase cliente" % a["id"])
     if changed:
         _roster_store(agents_section, agents_list)
         _write_openclaw_json(cfg)
         _log("client-tools: allowlist de agentes cliente reaplicada")
     return changed
+
+
+_CLIENT_TOOLS_CFG_MTIME = None
+
+
+def _enforce_client_agents_tools_if_changed() -> None:
+    """Tick barato: reaplica la allowlist sólo si openclaw.json cambió."""
+    global _CLIENT_TOOLS_CFG_MTIME
+    try:
+        mtime = (OPENCLAW_DIR / "openclaw.json").stat().st_mtime
+    except OSError:
+        return
+    if mtime == _CLIENT_TOOLS_CFG_MTIME:
+        return
+    _enforce_client_agents_tools()
+    try:
+        _CLIENT_TOOLS_CFG_MTIME = (OPENCLAW_DIR / "openclaw.json").stat().st_mtime
+    except OSError:
+        _CLIENT_TOOLS_CFG_MTIME = mtime
 
 # El autor NO ejecuta: sin tools de ejecución/estado del motor — su única
 # superficie es wf_author (gate por sesión wf-author-* en el plugin).
@@ -26734,6 +26803,13 @@ def main() -> int:
                     _sync_a2a(token)
             except Exception as e:  # noqa: BLE001
                 _log(f"a2a pending absorb: {e}")
+
+            # 2.10.1: un agente recién ligado a un canal externo (grupo o
+            # contacto de terceros) recibe la allowlist sin esperar reinicio.
+            try:
+                _enforce_client_agents_tools_if_changed()
+            except Exception as e:  # noqa: BLE001
+                _log(f"client-tools tick: {e}")
 
             # Inventario de flota: al arrancar y luego cada FLEET_REPORT_EVERY_S
             # (24h por defecto). Al arrancar porque un nodo que vuelve de estar
