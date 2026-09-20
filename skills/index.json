@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "builtAt": "cache-367faf2eb77e",
+  "builtAt": "cache-91384752468f",
   "skills": {
     "tnode-agenda": {
       "version": "1.0.1",
@@ -58,14 +58,14 @@
       }
     },
     "tnode-awmf": {
-      "version": "1.0.0",
-      "file": "tnode-awmf-1.0.0.tgz",
-      "sha256": "e48e9f585bac35b844f067242cd3c3945b069cf3f130a77fc2662d6a50f392ce",
+      "version": "1.0.1",
+      "file": "tnode-awmf-1.0.1.tgz",
+      "sha256": "ce651034599bf402bf6aac30287119cd543f5c8d9c4e1b94b5b0676d126cf882",
       "audience": "dueño",
       "files": {
-        "SKILL.md": "43680d1cf73e4db0a83bad58a60bdf5971f317b6e86eb4a0832d4ea120dd4b95",
-        "bin/awmf.py": "b73a764581136ed9a59a57722194062fc05a40c51a1d1abc71735d82b23d2fbc",
-        "manifest.json": "623e323ad7558493d173eaacdc78a5946d40ffa929873bf1098e5899237ad051"
+        "SKILL.md": "1001693cd3e956e837cdc027fbcdc2ac1919975ed17e04e00ea9132e7d7586c7",
+        "bin/awmf.py": "995ef1b943e5a11d26174b3847efb3b52972b4cdb64f20fe848986250a47e569",
+        "manifest.json": "919e5121efa3d804b5077a1376e750ac5cbc3fb803bb173c2ea1b7263dad09a6"
       }
     },
     "tnode-a2a": {
