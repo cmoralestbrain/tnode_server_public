@@ -103,7 +103,7 @@ if command -v npm >/dev/null 2>&1; then
 fi
 unset _p
 
-TNODE_SETUP_VERSION="1.148.4"
+TNODE_SETUP_VERSION="1.148.5"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -16739,7 +16739,7 @@ from __future__ import annotations
 #           (sha256 verificado) + `sync`. Punteros los escribe
 #           publish_skills.py (beta primero, prod al promover).
 # 2.0.1   — owner-channel: el perfil de PROD guarda el teléfono nacional sin
-#           lada ("8182595889") y se sembraba "+8182595889". Un número de 10
+#           lada ("5512345678") y se sembraba "+5512345678". Un número de 10
 #           dígitos sin '+' se trata como mexicano (+52 y +521). Los bindings
 #           main←whatsapp:direct se consideran todos nuestros y se
 #           reconstruyen, para que una siembra mala no quede huérfana.
@@ -16855,7 +16855,7 @@ from __future__ import annotations
 #          quedó listo. Apagar conserva la BD (el historial es del usuario);
 #          sólo `purge:true` la borra. Mismo patrón que agenda/drive/poll:
 #          los archivos viajan en el daemon y se auto-materializan al boot.
-__VERSION__ = "2.10.1"
+__VERSION__ = "2.10.2"
 
 import hashlib
 import hmac
@@ -19177,15 +19177,15 @@ Argumentos comunes:
 
 ## Ejemplo de turno completo
 
-Pregunta del usuario: *"mándame un correo de bienvenida a ctobal@gmail.com"*
+Pregunta del usuario: *"mándame un correo de bienvenida a destinatario@ejemplo.com"*
 
 Tu acción (UNA invocación, no múltiples intentos):
 
 ```bash
 ~/.openclaw/workspace/skills/tnode-email-send/bin/send.py \\
-  --to ctobal@gmail.com \\
+  --to destinatario@ejemplo.com \\
   --subject "Bienvenido a TNode Pro" \\
-  --body "Hola Tobal,
+  --body "Hola,
 
 Bienvenido a tu nodo TNode Pro. Estoy listo para ayudarte con lo que necesites — desde redactar correos hasta automatizar tareas en tus canales conectados.
 
@@ -19212,7 +19212,7 @@ TNode Agent"
 
 ## Lectura del inbox (informativo, NO usa este skill)
 
-Para LEER correos del inbox del usuario (`tbrainplatform@gmail.com`) sí
+Para LEER correos del inbox del usuario (la cuenta que el dueño conectó en Canales → Correo) sí
 puedes usar `himalaya` directamente — IMAP port 993 está abierto:
 
 ```bash
@@ -24589,7 +24589,7 @@ def _owner_channel_peers(profile) -> list:
     if len(digits) < 8:
         return []
     # 2.0.1: en prod el perfil guarda el número NACIONAL sin lada
-    # ("8182595889"); sembrar "+8182595889" no identifica a nadie. Un número
+    # ("5512345678"); sembrar "+5512345678" no identifica a nadie. Un número
     # de 10 dígitos sin '+' es mexicano salvo que el país diga otra cosa.
     country = (profile.get("country") or "").strip().lower()
     if len(digits) == 10 and not raw.startswith("+"):
