@@ -103,7 +103,7 @@ if command -v npm >/dev/null 2>&1; then
 fi
 unset _p
 
-TNODE_SETUP_VERSION="1.148.6"
+TNODE_SETUP_VERSION="1.149.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -162,20 +162,25 @@ OPENCLAW_HOME=""   # set in setup_tnode_user()
 TNODE_BIN=""       # set in setup_tnode_user()
 
 # API provider helpers (bash 3.2 compatible — no associative arrays)
+# `tbrain-models` = hub de modelos de la plataforma (renombre 2026-10,
+# tnode_client/bitacoras… ver bitacoras/ai-gateway/). Su URL directa vive SOLO
+# en TBRAIN_MODELS_DIRECT_URL; en nodos gestionados la URL efectiva (AI Gateway
+# ai.tbrain.app o directa) la entrega pullLLMConfig vía tnode-config-sync.
+TBRAIN_MODELS_DIRECT_URL="https://openrouter.ai/api/v1"
 api_provider_valid() {
-    case "$1" in groq|openrouter|together) return 0 ;; *) return 1 ;; esac
+    case "$1" in groq|tbrain-models|together) return 0 ;; *) return 1 ;; esac
 }
 api_provider_base_url() {
     case "$1" in
         groq)       echo "https://api.groq.com/openai/v1" ;;
-        openrouter) echo "https://openrouter.ai/api/v1" ;;
+        tbrain-models) echo "$TBRAIN_MODELS_DIRECT_URL" ;;
         together)   echo "https://api.together.xyz/v1" ;;
     esac
 }
 api_provider_default_model() {
     case "$1" in
         groq)       echo "groq/llama-3.3-70b-versatile" ;;
-        openrouter) echo "openrouter/anthropic/claude-3.5-haiku" ;;
+        tbrain-models) echo "tbrain-models/qwen/qwen3.6-plus" ;;
         together)   echo "together/meta-llama/Llama-3.3-70B-Instruct-Turbo" ;;
     esac
 }
@@ -193,7 +198,7 @@ MODEL=""          # empty = auto-detect (GPU → qwen3.5, CPU → qwen2.5:1.5b)
 MODEL_EXPLICIT=0  # 1 if user passed --model
 USE_CLOUD=0
 USE_API=0         # 1 if --api flag set
-API_PROVIDER=""   # groq, openrouter, together
+API_PROVIDER=""   # groq, tbrain-models, together
 API_KEY=""        # API key for external provider
 TUNNEL_TOKEN=""       # --tunnel-token: pre-provisioned Cloudflare tunnel token
 TUNNEL_DOMAIN=""      # set by phase_tunnel
@@ -251,15 +256,15 @@ TUNNEL_API_URL="${TNODE_TUNNEL_API%/provision}/provision"
 # Firebase Function that issues short-lived HMAC tokens. The shared HMAC
 # secret never leaves Firebase Secret Manager + Worker env; the installer
 # only ever sees a per-request signed token (expires in 300s, single-use
-# nonce). Same pattern as `setupKey` for OpenRouter.
+# nonce). Same pattern as the (retired) `setupKey` endpoint.
 PROVISION_TOKEN_URL="${TNODE_FUNCTIONS_BASE}/getProvisionToken"
 # Firebase Functions for chat-sync (tnode-chat-sync watcher on this node
 # mirrors conversations to Firestore so the mobile app never loses a turn
 # when it's closed).
 REGISTER_NODE_SYNC_URL="${TNODE_FUNCTIONS_BASE}/registerNodeSync"
 MINT_NODE_TOKEN_URL="${TNODE_FUNCTIONS_BASE}/mintNodeToken"
-# Firebase Function that hands the per-node OR apiKey to the on-node
-# daemon when it receives apply_openrouter_key. HMAC-signed with the same
+# Firebase Function that hands the per-node tbrain-models apiKey to the
+# on-node daemon when it receives apply_model_key. HMAC-signed with the same
 # per-node secret as mintNodeToken. Key is minted/topped-up from the app.
 PULL_LLM_CONFIG_URL="${TNODE_FUNCTIONS_BASE}/pullLLMConfig"
 
@@ -803,7 +808,7 @@ parse_args() {
             --model)         MODEL="${2:?--model requires a value}"; MODEL_EXPLICIT=1; shift ;;
             --cloud)         USE_CLOUD=1; MODEL="$CLOUD_MODEL" ;;
             --api)
-                USE_API=1; NO_OLLAMA=1; API_PROVIDER="openrouter"
+                USE_API=1; NO_OLLAMA=1; API_PROVIDER="tbrain-models"
                 # If next arg is not a flag, treat it as API key
                 if [[ -n "${2:-}" ]] && [[ "${2}" != --* ]]; then
                     API_KEY="$2"
@@ -873,7 +878,7 @@ Options:
   --no-qr             Skip QR display at the end
   --model <name>      LLM model (default: auto-detect GPU/CPU)
   --cloud             Use cloud model (${CLOUD_MODEL})
-  --api [key]         Use cloud API (OpenRouter). Key opcional, incluida por defecto.
+  --api [key]         Use cloud API (TBrain Models). Key opcional, incluida por defecto.
   --verbose           Enable debug output
   --update-only       Refresh scripts/binaries without rotating secrets.
                       Aborts if required state (tunnel.json, gateway token)
@@ -905,7 +910,7 @@ Options:
 Model defaults:
   GPU detected    → qwen3.5 (~6.6 GB VRAM)
   CPU only        → qwen2.5:1.5b (~1.0 GB, fast on CPU)
-  --api           → claude-3.5-haiku via OpenRouter (incluido)
+  --api           → qwen3.6-plus via TBrain Models (incluido)
 
 Connectivity:
   Default         → Cloudflare Tunnel (wss://, sin VPN requerido)
@@ -1048,7 +1053,7 @@ phase_validate() {
             info "Sin GPU detectada → activando modo API automáticamente"
             USE_API=1
             NO_OLLAMA=1
-            API_PROVIDER="openrouter"
+            API_PROVIDER="tbrain-models"
         fi
     fi
 
@@ -1415,15 +1420,16 @@ configure_api_provider() {
         echo '{}' > "$oc_config"
     fi
 
-    python3 - "$oc_config" "$provider" "$api_key" "$model" <<'PYEOF'
-import json, sys
+    TBRAIN_MODELS_DIRECT_URL="$TBRAIN_MODELS_DIRECT_URL" \
+        python3 - "$oc_config" "$provider" "$api_key" "$model" <<'PYEOF'
+import json, os, sys
 
 config_path = sys.argv[1]
 provider = sys.argv[2]
 api_key = sys.argv[3]
-model_full = sys.argv[4]  # e.g. "openrouter/anthropic/claude-3.5-haiku"
+model_full = sys.argv[4]  # e.g. "tbrain-models/qwen/qwen3.6-plus"
 
-# Strip provider prefix from model id (openrouter/anthropic/claude-3.5-haiku → anthropic/claude-3.5-haiku)
+# Strip provider prefix from model id (tbrain-models/qwen/qwen3.6-plus → qwen/qwen3.6-plus)
 model_id = model_full.split("/", 1)[1] if "/" in model_full else model_full
 
 PROVIDER_CONFIG = {
@@ -1432,10 +1438,14 @@ PROVIDER_CONFIG = {
         "context_window": 131072,
         "max_tokens": 4096,
     },
-    "openrouter": {
-        "base_url": "https://openrouter.ai/api/v1",
+    "tbrain-models": {
+        "base_url": os.environ.get("TBRAIN_MODELS_DIRECT_URL", ""),
         "context_window": 200000,
         "max_tokens": 4096,
+        # Provider custom (OpenAI-compatible): sin `api` explícito y sin
+        # `supportsUsageInStreaming` OpenClaw no pide `usage` (CTX en blanco).
+        "api": "openai-completions",
+        "compat": {"supportsUsageInStreaming": True},
     },
     "together": {
         "base_url": "https://api.together.xyz/v1",
@@ -1456,16 +1466,21 @@ try:
     # Set models.providers.<provider> with the correct OpenClaw structure
     models = c.setdefault("models", {})
     providers = models.setdefault("providers", {})
+    entry = {
+        "id": model_id,
+        "name": model_id,
+        "contextWindow": pc["context_window"],
+        "maxTokens": pc["max_tokens"],
+    }
+    if pc.get("compat"):
+        entry["compat"] = pc["compat"]
     providers[provider] = {
         "baseUrl": pc["base_url"],
         "apiKey": api_key,
-        "models": [{
-            "id": model_id,
-            "name": model_id,
-            "contextWindow": pc["context_window"],
-            "maxTokens": pc["max_tokens"],
-        }]
+        "models": [entry],
     }
+    if pc.get("api"):
+        providers[provider]["api"] = pc["api"]
 
     with open(config_path, "w") as f:
         json.dump(c, f, indent=2)
@@ -1571,19 +1586,18 @@ phase_openclaw() {
         if [[ "$USE_API" == "1" ]]; then
             if [[ -z "$API_KEY" ]]; then
                 local env_var_name
-                env_var_name="$(echo "${API_PROVIDER}_API_KEY" | tr '[:lower:]' '[:upper:]')"
+                env_var_name="$(echo "${API_PROVIDER}_API_KEY" | tr '[:lower:]-' '[:upper:]_')"
                 eval "API_KEY=\"\${${env_var_name}:-}\""
             fi
             if [[ -z "$API_KEY" ]]; then
-                if [[ "$API_PROVIDER" == "openrouter" ]]; then
-                    # OpenRouter keys are minted per-node from the mobile app
-                    # after pairing. The tnode-config-sync daemon installed
-                    # below fetches the key via pullLLMConfig (HMAC) when it
-                    # receives the apply_openrouter_key command from the app.
-                    info "API key de OpenRouter: se obtendrá tras pair + mint (tnode-config-sync)"
+                if [[ "$API_PROVIDER" == "tbrain-models" ]]; then
+                    # Las keys de tbrain-models se mintean por nodo desde la app
+                    # tras el pareo. tnode-config-sync (instalado abajo) la jala
+                    # vía pullLLMConfig (HMAC) al recibir `apply_model_key`.
+                    info "Key de modelos: se obtendrá tras pair + mint (tnode-config-sync)"
                 else
                     local provider_upper
-                    provider_upper="$(echo "$API_PROVIDER" | tr '[:lower:]' '[:upper:]')"
+                    provider_upper="$(echo "$API_PROVIDER" | tr '[:lower:]-' '[:upper:]_')"
                     if [[ "$YES" == "1" ]]; then
                         die "Modo API requiere --api-key <key> o variable de entorno ${provider_upper}_API_KEY"
                     fi
@@ -1743,7 +1757,7 @@ pe = d.setdefault("plugins", {}).setdefault("entries", {})
 for pid in ("tnode", "tbrain-context-engine"):
     pe.setdefault(pid, {}).setdefault("hooks", {})["allowConversationAccess"] = True
 # 1.142.0: 2.0 auto-habilita ~46 plugins stock; en un VPS el LLM va SOLO por
-# openrouter y no hay pantalla/voz/ollama, asi que browser/canvas/cua/
+# tbrain-models y no hay pantalla/voz/ollama, asi que browser/canvas/cua/
 # geolocation/talk-voice y los providers directos son RSS muerto (HEB beta:
 # picos >850 MiB en 2 GB). Solo Linux: en Mac (Mini) el owner puede usar
 # LM Studio/ollama via estos providers. Mismo shape que `plugins disable`.
@@ -11053,8 +11067,8 @@ openclaw_configure_as_tnode() {
     configure_openclaw_v2_defaults
 
     if [[ "$USE_API" == "1" ]]; then
-        if [[ -z "$API_KEY" ]] && [[ "$API_PROVIDER" == "openrouter" ]]; then
-            info "Provider $API_PROVIDER: configuración diferida (tnode-config-sync la aplicará tras comando apply_openrouter_key)"
+        if [[ -z "$API_KEY" ]] && [[ "$API_PROVIDER" == "tbrain-models" ]]; then
+            info "Provider $API_PROVIDER: configuración diferida (tnode-config-sync la aplicará tras comando apply_model_key)"
         else
             info "Configurando provider $API_PROVIDER → $MODEL"
             local api_result
@@ -12000,7 +12014,7 @@ PYEOF
     if [[ -f "$sync_json" ]]; then
         # Already registered — preserve secret, but ensure pullUrl is present
         # so older installs pick up the tnode-config-sync flow on upgrade
-        # (pullUrl is still used by the apply_openrouter_key handler).
+        # (pullUrl is still used by the apply_model_key handler).
         python3 -c "
 import json
 path = '$sync_json'
@@ -12249,314 +12263,6 @@ PATHUNIT
     systemctl daemon-reload
     systemctl enable --now pair-watch.path 2>/dev/null || true
     success "systemd pair-watch.path habilitado (User=$TNODE_USER)"
-}
-
-# ─────────────────────────────────────────────────────────────
-# llm-config-watcher: pulls per-node OR apiKey via HMAC every
-# POLL_INTERVAL seconds and keeps openclaw.json in sync with the
-# key minted from the mobile app. Only installed for OpenRouter
-# (other providers manage their own keys).
-# ─────────────────────────────────────────────────────────────
-
-write_llm_config_watcher_py() {
-    local dest="$1"
-    cat > "$dest" <<'LLMPYEOF'
-#!/usr/bin/env python3
-"""tnode-llm-config-watcher — see tnode_server repo for full docs."""
-from __future__ import annotations
-
-import hashlib
-import hmac
-import json
-import logging
-import os
-import secrets
-import shutil
-import subprocess
-import sys
-import time
-import urllib.error
-import urllib.request
-from pathlib import Path
-from typing import Any
-
-HOME = Path(os.environ.get("HOME", str(Path.home())))
-OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", str(HOME / ".openclaw")))
-SYNC_JSON = OPENCLAW_HOME / "tnode-chat-sync.json"
-CONFIG_JSON = OPENCLAW_HOME / "openclaw.json"
-LOG_DIR = OPENCLAW_HOME / "logs"
-LOG_FILE = LOG_DIR / "llm-config-watcher.log"
-
-POLL_INTERVAL = int(os.environ.get("TNODE_LLM_POLL_INTERVAL", "300"))
-HTTP_TIMEOUT = 15
-DEFAULT_PROVIDER = "openrouter"
-
-
-def setup_logging() -> logging.Logger:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log = logging.getLogger("llm-config-watcher")
-    log.setLevel(logging.INFO)
-    if log.handlers:
-        return log
-    fh = logging.FileHandler(LOG_FILE)
-    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    log.addHandler(fh)
-    sh = logging.StreamHandler(sys.stderr)
-    sh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    log.addHandler(sh)
-    return log
-
-
-class PullError(Exception):
-    def __init__(self, status: int, body: Any) -> None:
-        super().__init__(f"pullLLMConfig {status}: {body}")
-        self.status = status
-        self.body = body
-
-
-def sign(node_secret: str, node_id: str, timestamp: str, nonce: str) -> str:
-    return hmac.new(
-        node_secret.encode(),
-        f"{node_id}:{timestamp}:{nonce}".encode(),
-        hashlib.sha256,
-    ).hexdigest()
-
-
-def pull_config(node_id: str, node_secret: str, pull_url: str) -> dict[str, Any] | None:
-    timestamp = str(int(time.time() * 1000))
-    nonce = secrets.token_hex(16)
-    signature = sign(node_secret, node_id, timestamp, nonce)
-    payload = json.dumps(
-        {"nodeId": node_id, "timestamp": timestamp, "nonce": nonce, "signature": signature}
-    ).encode()
-    req = urllib.request.Request(
-        pull_url, data=payload, method="POST",
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode(errors="replace")
-        try:
-            body = json.loads(raw)
-        except json.JSONDecodeError:
-            body = raw
-        err_code = (body.get("error") if isinstance(body, dict) else None) or ""
-        if e.code == 404 and err_code in ("not_provisioned", "not_registered", "not_paired"):
-            return None
-        raise PullError(e.code, body) from e
-
-
-def load_current_config() -> dict[str, Any]:
-    if not CONFIG_JSON.exists():
-        return {}
-    try:
-        with CONFIG_JSON.open() as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def apply_config(config, api_key, model, base_url, provider) -> bool:
-    models = config.setdefault("models", {})
-    providers = models.setdefault("providers", {})
-    prev = providers.get(provider, {})
-    next_block = {
-        "baseUrl": base_url,
-        "apiKey": api_key,
-        "models": [{
-            "id": model, "name": model,
-            "contextWindow": 200000, "maxTokens": 4096,
-        }],
-    }
-    if prev == next_block:
-        return False
-    providers[provider] = next_block
-    return True
-
-
-def write_config_atomic(config) -> None:
-    tmp = CONFIG_JSON.with_suffix(".json.tmp")
-    with tmp.open("w") as f:
-        json.dump(config, f, indent=2)
-    os.replace(tmp, CONFIG_JSON)
-
-
-def restart_openclaw(log) -> None:
-    oc = shutil.which("openclaw") or "/usr/local/bin/openclaw"
-    try:
-        subprocess.run([oc, "daemon", "restart"], check=False, timeout=30, capture_output=True)
-        log.info("openclaw daemon restart invoked")
-    except (OSError, subprocess.TimeoutExpired) as e:
-        log.error(f"openclaw daemon restart failed: {e}")
-
-
-def load_sync():
-    if not SYNC_JSON.exists():
-        raise FileNotFoundError(f"{SYNC_JSON} missing — node not registered")
-    with SYNC_JSON.open() as f:
-        data = json.load(f)
-    node_id = data.get("nodeId")
-    node_secret = data.get("nodeSecret")
-    pull_url = data.get("pullUrl")
-    if not (node_id and node_secret and pull_url):
-        raise ValueError(f"{SYNC_JSON} missing nodeId/nodeSecret/pullUrl")
-    return node_id, node_secret, pull_url
-
-
-def tick(log) -> None:
-    node_id, node_secret, pull_url = load_sync()
-    try:
-        resp = pull_config(node_id, node_secret, pull_url)
-    except PullError as e:
-        if 400 <= e.status < 500:
-            log.error(f"pull {e.status}: {e.body} — config broken, exiting")
-            sys.exit(2)
-        log.warning(f"pull failed (transient): {e}")
-        return
-    if resp is None:
-        log.info("not provisioned yet — skipping")
-        return
-    api_key = resp.get("apiKey")
-    model = resp.get("model")
-    base_url = resp.get("baseUrl")
-    provider = resp.get("provider", DEFAULT_PROVIDER)
-    if not (api_key and model and base_url):
-        log.error(f"pull returned malformed body: {resp}")
-        return
-    cfg = load_current_config()
-    if not apply_config(cfg, api_key, model, base_url, provider):
-        log.info("config up to date")
-        return
-    write_config_atomic(cfg)
-    log.info(
-        f"openclaw.json updated (provider={provider}, model={model}, "
-        f"apiKey=...{api_key[-4:]}) — restarting daemon"
-    )
-    restart_openclaw(log)
-
-
-def main() -> None:
-    log = setup_logging()
-    once = "--once" in sys.argv[1:]
-    if once:
-        log.info("llm-config-watcher running single tick (--once)")
-        tick(log)
-        return
-    log.info(f"llm-config-watcher starting (poll={POLL_INTERVAL}s)")
-    while True:
-        try:
-            tick(log)
-        except FileNotFoundError as e:
-            log.error(str(e))
-            sys.exit(1)
-        except Exception as e:
-            log.exception(f"unexpected error: {e}")
-        time.sleep(POLL_INTERVAL)
-
-
-if __name__ == "__main__":
-    main()
-LLMPYEOF
-}
-
-install_llm_config_watcher() {
-    local DEST_SCRIPTS="$OPENCLAW_HOME/scripts"
-    mkdir -p "$DEST_SCRIPTS" "$OPENCLAW_HOME/logs"
-
-    write_llm_config_watcher_py "$DEST_SCRIPTS/llm_config_watcher.py"
-    chmod +x "$DEST_SCRIPTS/llm_config_watcher.py"
-    chown -R "$TNODE_USER":"$TNODE_USER" "$OPENCLAW_HOME" 2>/dev/null || true
-
-    success "llm-config-watcher → $DEST_SCRIPTS/llm_config_watcher.py"
-
-    case "$OS" in
-        Darwin) install_llm_watcher_launchd ;;
-        Linux)  install_llm_watcher_systemd ;;
-    esac
-}
-
-install_llm_watcher_launchd() {
-    local plist_label="com.tbrain.llm-config-watcher"
-    local plist_dest="$HOME/Library/LaunchAgents/${plist_label}.plist"
-
-    mkdir -p "$(dirname "$plist_dest")"
-
-    cat > "$plist_dest" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>${plist_label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/bin/python3</string>
-        <string>${OPENCLAW_HOME}/scripts/llm_config_watcher.py</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>${OPENCLAW_HOME}/logs/llm-config-watcher.out.log</string>
-    <key>StandardErrorPath</key>
-    <string>${OPENCLAW_HOME}/logs/llm-config-watcher.err.log</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-        <key>HOME</key>
-        <string>${HOME}</string>
-        <key>OPENCLAW_HOME</key>
-        <string>${OPENCLAW_HOME}</string>
-    </dict>
-    <key>WorkingDirectory</key>
-    <string>${OPENCLAW_HOME}</string>
-</dict>
-</plist>
-PLIST
-
-    launchctl unload "$plist_dest" 2>/dev/null || true
-    launchctl load "$plist_dest"
-    success "LaunchAgent llm-config-watcher cargado"
-}
-
-install_llm_watcher_systemd() {
-    if ! command_exists systemctl; then
-        warn "systemctl no disponible — saltando systemd setup del watcher"
-        return 0
-    fi
-
-    local systemd_dir="/etc/systemd/system"
-
-    cat > "$systemd_dir/tnode-llm-config-watcher.service" <<SVCUNIT
-[Unit]
-Description=TNode LLM config watcher — pulls per-node OR apiKey via HMAC
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${TNODE_USER}
-ExecStart=/usr/bin/python3 ${OPENCLAW_HOME}/scripts/llm_config_watcher.py
-Restart=always
-RestartSec=15
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
-Environment=HOME=${TNODE_HOME}
-Environment=OPENCLAW_HOME=${OPENCLAW_HOME}
-EnvironmentFile=-/etc/tnode/env
-StandardOutput=append:${OPENCLAW_HOME}/logs/llm-config-watcher.out.log
-StandardError=append:${OPENCLAW_HOME}/logs/llm-config-watcher.err.log
-
-[Install]
-WantedBy=multi-user.target
-SVCUNIT
-
-    systemctl daemon-reload
-    systemctl enable --now tnode-llm-config-watcher.service 2>/dev/null || true
-    success "systemd tnode-llm-config-watcher habilitado (User=$TNODE_USER)"
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -16236,7 +15942,7 @@ install_tnode_skill_manager() {
 # tnode-config-sync: event-driven replacement for llm-config-watcher.
 # Subscribes to users/{uid}/nodes/{nodeId}/commands via a Firebase
 # custom token (scope=sync_admin) and executes them on-demand
-# (update_llm_provider, restart_openclaw, apply_openrouter_key, ...).
+# (update_llm_provider, restart_openclaw, apply_model_key, ...).
 # Also mirrors openclaw.json → state/current on file changes (OS-level
 # path watcher: launchd WatchPaths on macOS, systemd .path unit on Linux).
 #
@@ -16321,14 +16027,14 @@ from __future__ import annotations
 #          may not include /opt/homebrew/bin).
 # 1.11.0 — _apply_provider_to_openclaw seeds default media-generation models
 #          (image=gemini-3.1-flash-image-preview, music=lyria-3-clip-preview,
-#          video=grok-imagine-video) on first OpenRouter provision via
+#          video=grok-imagine-video) on first model-hub provision via
 #          setdefault, so a freshly-provisioned node can generate image/music/
 #          video out of the box without the user hand-picking them in Mente.
 #          OR-scoped + setdefault (a Mente choice or sub-agent card still wins).
 # 1.10.0 — install_subagent also reads `musicGenerationModel` /
 #          `videoGenerationModel` from the agent card and sets them under
 #          agents.defaults (siblings of imageGenerationModel; node-global media
-#          slots, both OpenRouter-served). Write generalized to loop the three.
+#          slots, both served by the media provider). Write generalized to loop the three.
 # 1.9.0 — install_subagent reads `imageGenerationModel` from the agent card
 #         and sets agents.defaults.imageGenerationModel (node-global
 #         image-generation model; OpenClaw 2026.5.x rejects the slot under
@@ -16360,7 +16066,7 @@ from __future__ import annotations
 # 1.3.0 — merge semantics for the model catalog. _apply_provider_to_openclaw
 #         now upserts providers[p].models[] (by id) and merges the slug
 #         into agents.defaults.models instead of replacing both wholesale —
-#         re-applying an OpenRouter key no longer clobbers the expanded
+#         re-applying a model-hub key no longer clobbers the expanded
 #         catalog (Cerebro's per-agent picks, sub-agent recommended models).
 #         install_subagent now propagates the sub-agent's primary model to
 #         the runtime catalog and allowlist via the new helper
@@ -16580,12 +16286,12 @@ from __future__ import annotations
 #          los primeros BOOT_FAST_WINDOW_S (600s) de vida del daemon, en vez
 #          de caer al idle de 300s. En un nodo fresco el wake del app puede
 #          perderse mientras el gateway sigue arrancando (primer Agente beta
-#          2026-07-14: apply_openrouter_key esperó el backstop completo y el
+#          2026-07-14: apply_model_key esperó el backstop completo y el
 #          primer hola tardó 5 min). (b) _ensure_sync_json_env_fields:
 #          backfill de projectId/webApiKey en tnode-chat-sync.json desde
 #          /etc/tnode/env para que los plugins del gateway no dependan de
 #          sus fallbacks (CREDENTIAL_MISMATCH beta, mismo incidente).
-# 1.54.0 — apply_openrouter_key: en PRIMERA activación (sin key previa en
+# 1.54.0 — apply_model_key: en PRIMERA activación (sin key previa en
 #          openclaw.json) el done ya no confía en el file-watcher del
 #          gateway — en el nodo 3e549d66 (2026-07-14) el watcher murió
 #          silencioso: key escrita y viva, cero "config hot reload applied"
@@ -16757,7 +16463,7 @@ from __future__ import annotations
 #          `_sync_client_skills` reaplica el allow cuando cambian las skills.
 # 2.9.1   — SOUL de agentes de CLASE CLIENTE (A2A dedicados + recepcion) para
 #          modelo chico. E2E comprador 2026-09-14: TSporty dijo "Qwen 3.6 Plus
-#          vía OpenRouter" y ofreció citas/flujos que no tiene, con una regla
+#          vía el proveedor" y ofreció citas/flujos que no tiene, con una regla
 #          abstracta ("nunca menciono modelos") ya en su SOUL. Ahora: sección
 #          "Si preguntan qué soy o con qué funciono" con ejemplos de pregunta
 #          + respuesta FIJA (asistente con IA, detalles técnicos internos) +
@@ -16967,7 +16673,43 @@ from __future__ import annotations
 #          quedó listo. Apagar conserva la BD (el historial es del usuario);
 #          sólo `purge:true` la borra. Mismo patrón que agenda/drive/poll:
 #          los archivos viajan en el daemon y se auto-materializan al boot.
-__VERSION__ = "2.10.2"
+# 2.11.0 — Canal externo (WhatsApp/Telegram) listo para atender clientes:
+#          (a) el Perfil de Negocio del dueño también se renderiza al SOUL.md
+#          de `recepcion` (antes sólo al del guest por link): sin él la
+#          recepcionista no conocía servicios/horario del negocio que atiende.
+#          Sin perfil el archivo queda idéntico al canónico (cero cambio en
+#          nodos que no lo usan). Una sola lectura del doc por pase.
+#          (b) se retira el binding comodín `main←{whatsapp,telegram}` (sin
+#          peer): con "primer match gana" mandaba a CUALQUIER desconocido al
+#          agente principal con el contexto del dueño. Los bindings directos
+#          del dueño (main←canal:direct:<peer>) no se tocan.
+#          (c) 🔒 piso de política del gateway, escrito EXPLÍCITO (claves
+#          válidas desde 9.4): `tools.message.crossContext.
+#          allowAcrossProviders=false` — 9.5 invierte el default y una
+#          clave ausente PERMITE mandar a otro servicio (un agente de
+#          WhatsApp escribiendo por Telegram); hoy en 9.4 ausente = false,
+#          así que cero cambio de conducta. Y `update.checkOnStart=false` —
+#          9.6 auto-actualiza node-hosts headless (Mini) cuando están
+#          ociosos; la flota sólo se sube por el pipeline (tnode-upgrader).
+#          Forzado (no setdefault): es política de flota, no del dueño.
+# 2.12.0 — Renombre "tbrain-models" + AI Gateway (bitacoras/ai-gateway/
+#          2026-10-12-diseno-flota.md, opción A híbrida):
+#          (a) El cerebro de TEXTO (chat, Mente, sub-agentes, autor de flujos)
+#          vive en el provider `tbrain-models` (OpenAI-compatible, key en el
+#          store como TBRAIN_MODELS_API_KEY). Imagen/música/video siguen en el
+#          plugin interno de medios de OpenClaw (`MEDIA_PROVIDER`), ÚNICA
+#          excepción hasta tener plugin propio (plan C).
+#          (b) `apply_model_key` (alias legacy del comando anterior) manda
+#          `capabilities:["model-key-v2"]` a pullLLMConfig; si el interruptor
+#          central `config/llmGateway` enciende al nodo, ambos providers salen
+#          por ai.tbrain.app con el header `cf-aig-authorization` como
+#          SecretRef (TBRAIN_MODELS_GATEWAY_AUTH). Apagado = URL directa del hub.
+#          (c) Migración in-place de openclaw.json (slugs de texto del provider
+#          previo → `tbrain-models/…`, medios intactos) al aplicar la key y
+#          una vez al arrancar si el nodo trae el esquema viejo.
+#          (d) state/current publica `modelMode` + `capabilities`; `llmMode`
+#          conserva el valor previo para la app 1.14.x (transición).
+__VERSION__ = "2.12.0"
 
 import hashlib
 import hmac
@@ -17650,21 +17392,27 @@ def _is_local_url(url: str) -> bool:
 
 
 def derive_llm_mode(openclaw_cfg: dict) -> str:
-    """Return 'local' | 'openrouter' | 'none' based on openclaw.json.
+    """Return the legacy-compatible mode: 'openrouter' | 'local' | 'none'.
 
-    The client UI uses this to decide whether to show the "activate LLM"
-    banner — the label 'local' is a slight misnomer (it really means
-    "anything other than plain OpenRouter"), but keeping it simple keeps
-    the banner logic identical for self-hosted and alt-cloud setups.
+    ⚠️ TRANSICIÓN: la app 1.14.x compara `llmMode == "openrouter"` para
+    mostrar la tarjeta de saldo, así que un nodo con key de tbrain-models
+    sigue reportando ese valor (`_LEGACY_LLM_MODE`). La app nueva lee
+    `modelMode` (ver derive_model_mode). Borrar en la fase de limpieza.
 
-    - 'openrouter' when an `openrouter` provider has a real api key —
-      unlocks the top-up card.
+    - _LEGACY_LLM_MODE when the tbrain-models (or pre-rename) provider has a
+      real api key — unlocks the top-up card.
     - 'local' when ANY provider has a baseUrl pointing at localhost/LAN,
-      OR any non-openrouter provider has both a baseUrl and an api key
-      (e.g. Groq, Moonshot, Together, custom OpenAI-compat endpoints).
-      Node has a working LLM → banner stays hidden.
+      OR any other provider has both a baseUrl and an api key (Groq, Moonshot,
+      custom OpenAI-compat endpoints). Node has a working LLM → banner hidden.
     - 'none' when nothing is configured → client shows the selector.
     """
+    mode = derive_model_mode(openclaw_cfg)
+    return _LEGACY_LLM_MODE if mode == MODELS_PROVIDER else mode
+
+
+def derive_model_mode(openclaw_cfg: dict) -> str:
+    """'tbrain-models' | 'local' | 'none' — mismo criterio que derive_llm_mode
+    con el nombre vigente."""
     providers = (
         openclaw_cfg.get("models", {}).get("providers", {})
         if isinstance(openclaw_cfg, dict)
@@ -17673,23 +17421,22 @@ def derive_llm_mode(openclaw_cfg: dict) -> str:
     if not providers:
         return "none"
 
-    openrouter = providers.get("openrouter") or {}
+    platform = (MODELS_PROVIDER, _LEGACY_TEXT_PROVIDER, MEDIA_PROVIDER)
     # apiKey puede ser string plaintext (legacy) o SecretRef dict (2.0) —
     # ambos cuentan como "key poblada" para el banner.
-    if _apikey_present(openrouter.get("apiKey")):
-        return "openrouter"
+    if any(_apikey_present((providers.get(n) or {}).get("apiKey")) for n in platform):
+        return MODELS_PROVIDER
 
     for name, prov in providers.items():
-        if name == "openrouter":
+        if name in platform:
             continue  # already ruled out above (no usable key)
         base_url = (prov.get("baseUrl") or "").strip()
         if _is_local_url(base_url):
             return "local"
-        # Remote non-openrouter provider with a populated key counts as
+        # Remote non-platform provider with a populated key counts as
         # "functional" for banner purposes (node is ready to serve).
         if base_url and _apikey_present(prov.get("apiKey")):
             return "local"
-
     return "none"
 
 
@@ -17718,8 +17465,12 @@ def push_openclaw_config(token: dict) -> dict:
         state = {
             "openclawConfig": cfg,
             "llmMode": derive_llm_mode(cfg),
+            "modelMode": derive_model_mode(cfg),
             "updatedAt": int(time.time() * 1000),
         }
+    # El servidor elige el nombre del comando de key según esta capacidad
+    # (functions/src/model_block.ts → applyModelKeyCommandFor).
+    state["capabilities"] = [MODEL_KEY_V2_CAP]
     write_state(token, state)
     return state
 
@@ -17747,7 +17498,7 @@ def _openclaw_binary() -> str | None:
         # aparece ni en el PATH del usuario ni en el PATH acotado de la unit
         # systemd (/usr/local/bin:/usr/bin:/bin). Sin esta ruta, _openclaw_binary
         # devolvia None y TODA invocacion del CLI fallaba con openclaw_not_found:
-        # restart del gateway, apply_openrouter_key, install_subagent, mcp.*.
+        # restart del gateway, apply_model_key, install_subagent, mcp.*.
         # Detectado el 2026-07-27 al estrenar verify_openclaw-cli.
         HOME / ".npm-global" / "bin" / "openclaw",
         Path("/usr/local/bin/openclaw"),
@@ -17811,7 +17562,7 @@ def _secret_ref(name: str) -> dict:
 
 def _secret_store_name(provider: str) -> str:
     """Nombre de entrada del store para la key de un provider, en la gramática
-    del SDK (^[A-Z][A-Z0-9_]{0,127}$). openrouter → OPENROUTER_API_KEY."""
+    del SDK (^[A-Z][A-Z0-9_]{0,127}$). tbrain-models → TBRAIN_MODELS_API_KEY."""
     base = re.sub(r"[^A-Z0-9_]", "_", provider.upper())
     if not re.match(r"^[A-Z]", base):
         base = "P_" + base
@@ -17987,8 +17738,31 @@ def _restart_openclaw_with_verify(timeout: int = 60) -> dict:
 
 # ── openclaw.json writer ───────────────────────────────────────
 
+# ── tbrain-models (renombre 2026-10) ──────────────────────────
+# Provider del cerebro de texto en openclaw.json: `tbrain-models/<vendor>/<id>`.
+MODELS_PROVIDER = "tbrain-models"
+# Plugin interno de OpenClaw para imagen/música/video. ÚNICA excepción del
+# renombre: OpenClaw solo habla esas APIs a través de su plugin con este id.
+# Apunta a la misma URL/key/header que MODELS_PROVIDER. Plan C = plugin propio.
+MEDIA_PROVIDER = "openrouter"
+MODELS_GATEWAY_AUTH_SECRET = "TBRAIN_MODELS_GATEWAY_AUTH"
+MODEL_KEY_V2_CAP = "model-key-v2"
+GATEWAY_AUTH_HEADER = "cf-aig-authorization"
+# @deprecated transición — nombres previos que aún leen la app 1.14.x
+# (`llmMode`) y que mandan el app/CF viejos (comando). Borrar en limpieza.
+_LEGACY_TEXT_PROVIDER = "openrouter"
+_LEGACY_LLM_MODE = "openrouter"
+_LEGACY_APPLY_MODEL_KEY_CMD = "apply_openrouter_key"
+# Claves de openclaw.json cuyo valor es un slug de MEDIOS: la migración de
+# slugs de texto no entra en ellas.
+_MEDIA_SLOT_KEYS = frozenset({
+    "mediaModels", "imageGenerationModel", "musicGenerationModel",
+    "videoGenerationModel",
+})
+
 _CTX_DEFAULTS = {
-    "openrouter": 200000,
+    MODELS_PROVIDER: 200000,
+    MEDIA_PROVIDER: 200000,
     "groq": 131072,
     "ollama": 32768,
     "lmstudio": 131072,
@@ -18004,7 +17778,7 @@ _KNOWN_PROVIDER_PREFIXES = frozenset(_CTX_DEFAULTS.keys())
 
 
 def _split_provider_slug(slug: str) -> tuple[str, str]:
-    """`'openrouter/qwen/qwen3.6-plus'` → `('openrouter', 'qwen/qwen3.6-plus')`.
+    """`'tbrain-models/qwen/qwen3.6-plus'` → `('tbrain-models', 'qwen/qwen3.6-plus')`.
     Returns `('', slug)` if the slug doesn't start with a known provider
     prefix — keeps interop between the prefixed `agent.model.primary` form
     and the unprefixed `providers[p].models[].id` form."""
@@ -18021,8 +17795,9 @@ def _ensure_model_registered(cfg: dict, model_slug: str) -> bool:
     upsert under `models.providers[p].models[]` (catalog id without the
     provider prefix) and add the same id to `agents.defaults.models`.
     Skips the catalog write if the inferred provider isn't yet configured
-    (e.g. a sub-agent install on a node before `apply_openrouter_key`).
+    (e.g. a sub-agent install on a node before `apply_model_key`).
     Returns `True` if cfg was modified."""
+    model_slug = _canon_text_slug(model_slug)
     provider, catalog_id = _split_provider_slug(model_slug)
     if not provider:
         return False
@@ -18035,12 +17810,16 @@ def _ensure_model_registered(cfg: dict, model_slug: str) -> bool:
         if isinstance(models_list, list) and not any(
             isinstance(m, dict) and m.get("id") == catalog_id for m in models_list
         ):
-            models_list.append({
+            entry = {
                 "id": catalog_id,
                 "name": catalog_id,
                 "contextWindow": _default_context_for(provider),
                 "maxTokens": 4096,
-            })
+            }
+            if provider == MODELS_PROVIDER:
+                # Provider custom: sin esto OpenClaw no pide `usage`.
+                entry["compat"] = {"supportsUsageInStreaming": True}
+            models_list.append(entry)
             changed = True
 
     defaults_models = (
@@ -18058,7 +17837,7 @@ def _ensure_model_registered(cfg: dict, model_slug: str) -> bool:
 def _ensure_heartbeat_default() -> None:
     """OpenClaw trae heartbeat con DEFAULT 30m aunque el config no tenga la
     key — cada poll re-manda TODO el contexto de la sesión al LLM y en nodos
-    con OpenRouter de paga es un leak de saldo silencioso (2026-07-13: el
+    con el hub de modelos de paga es un leak de saldo silencioso (2026-07-13: el
     Oracle Front de Félix quemó su saldo COMPLETO en 2 semanas de polls; el
     heartbeat en TNode no aporta — chat-sync + tnode-wake ya cubren entrega).
     Se persiste APAGADO (`agents.defaults.heartbeat.every: "0m"`). Solo si la
@@ -18079,6 +17858,32 @@ def _ensure_heartbeat_default() -> None:
         _log("heartbeat: default 0m persistido (agents.defaults.heartbeat.every)")
     except Exception as e:  # noqa: BLE001
         _log(f"heartbeat default: {e}")
+
+
+def _ensure_gateway_policy_floor() -> None:
+    """2.11.0 (c): claves de política que un upgrade de OpenClaw puede
+    invertir por default. Se escriben explícitas para que el comportamiento
+    no dependa del pin. Ambas existen en el schema desde 9.4."""
+    try:
+        cfg = json.loads(OPENCLAW_JSON_PATH.read_text())
+        changed = []
+        cc = (
+            cfg.setdefault("tools", {})
+            .setdefault("message", {})
+            .setdefault("crossContext", {})
+        )
+        if cc.get("allowAcrossProviders") is not False:
+            cc["allowAcrossProviders"] = False
+            changed.append("tools.message.crossContext.allowAcrossProviders")
+        upd = cfg.setdefault("update", {})
+        if upd.get("checkOnStart") is not False:
+            upd["checkOnStart"] = False
+            changed.append("update.checkOnStart")
+        if changed:
+            _write_openclaw_json(cfg)
+            _log("policy floor: %s = false" % ", ".join(changed))
+    except Exception as e:  # noqa: BLE001
+        _log(f"policy floor: {e}")
 
 
 def _write_openclaw_json(cfg: dict) -> None:
@@ -18118,15 +17923,140 @@ def _build_prefixed_slug(provider: str, model: str) -> str:
     return needle + model
 
 
-# v1.11.0 — default media-generation models seeded on first OpenRouter
+def _canon_text_slug(slug):
+    """Slug de un modelo de TEXTO en su forma vigente: el prefix del provider
+    previo (`openrouter/…`, que aún mandan tarjetas de sub-agentes y clientes
+    viejos) pasa a `tbrain-models/…`. Idempotente; cualquier otro slug
+    (local, custom, ya canónico) se devuelve igual. NO usar con slugs de
+    medios — esos viven en MEDIA_PROVIDER."""
+    if isinstance(slug, str) and slug.startswith(_LEGACY_TEXT_PROVIDER + "/"):
+        return MODELS_PROVIDER + "/" + slug[len(_LEGACY_TEXT_PROVIDER) + 1:]
+    return slug
+
+
+def _media_model_ids(cfg: dict) -> set:
+    """Ids internos (`<vendor>/<id>`) de los modelos de medios: los que el
+    nodo tiene en sus ranuras + los defaults sembrados por la plataforma."""
+    ids = set()
+    prefix = MEDIA_PROVIDER + "/"
+
+    def walk(v):
+        if isinstance(v, str) and v.startswith(prefix):
+            ids.add(v[len(prefix):])
+        elif isinstance(v, dict):
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+
+    defaults = (cfg.get("agents") or {}).get("defaults") or {}
+    if isinstance(defaults, dict):
+        for k in _MEDIA_SLOT_KEYS:
+            walk(defaults.get(k))
+    for slug in _DEFAULT_MEDIA_MODELS.values():
+        walk(slug)
+    return ids
+
+
+def _migrate_models_schema(cfg: dict) -> bool:
+    """Migración in-place del esquema previo al renombre (2.12.0):
+    - entradas de TEXTO de `models.providers.<previo>.models[]` se mueven a
+      `models.providers.tbrain-models.models[]` (las de medios se quedan);
+    - todo slug `<previo>/<vendor>/<id>` de texto en el resto del archivo
+      (defaults.models, defaults.model.primary/fallbacks, agents.list[].model,
+      …) pasa a `tbrain-models/…`. Las ranuras de medios no se tocan.
+    Idempotente. No escribe el archivo; devuelve True si cambió `cfg`."""
+    changed = False
+    media_ids = _media_model_ids(cfg)
+    providers = (cfg.get("models") or {}).get("providers")
+    if isinstance(providers, dict):
+        legacy = providers.get(_LEGACY_TEXT_PROVIDER)
+        if isinstance(legacy, dict) and isinstance(legacy.get("models"), list):
+            keep, move = [], []
+            for m in legacy["models"]:
+                mid = m.get("id") if isinstance(m, dict) else None
+                (keep if (not mid or mid in media_ids) else move).append(m)
+            if move:
+                text = providers.setdefault(MODELS_PROVIDER, {})
+                tlist = text.setdefault("models", [])
+                have = {x.get("id") for x in tlist if isinstance(x, dict)}
+                for m in move:
+                    if m.get("id") not in have:
+                        tlist.append(m)
+                legacy["models"] = keep
+                changed = True
+
+    def conv(v):
+        if isinstance(v, str) and v.startswith(_LEGACY_TEXT_PROVIDER + "/"):
+            rest = v[len(_LEGACY_TEXT_PROVIDER) + 1:]
+            if rest not in media_ids:
+                return MODELS_PROVIDER + "/" + rest
+        return v
+
+    def walk(node):
+        nonlocal changed
+        if isinstance(node, dict):
+            for k in list(node.keys()):
+                if k in _MEDIA_SLOT_KEYS:
+                    continue
+                v = node[k]
+                nk = conv(k)
+                if isinstance(v, (dict, list)):
+                    walk(v)
+                else:
+                    nv = conv(v)
+                    if nv != v:
+                        node[k] = nv
+                        changed = True
+                if nk != k:
+                    if nk in node and isinstance(node[nk], dict) and isinstance(v, dict):
+                        node[nk] = {**v, **node[nk]}
+                    else:
+                        node[nk] = node[k]
+                    del node[k]
+                    changed = True
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                if isinstance(v, (dict, list)):
+                    walk(v)
+                else:
+                    nv = conv(v)
+                    if nv != v:
+                        node[i] = nv
+                        changed = True
+
+    for top, sub in cfg.items():
+        if top == "models":
+            continue  # providers ya se migraron arriba
+        if isinstance(sub, (dict, list)):
+            walk(sub)
+    return changed
+
+
+def _needs_models_migration(cfg: dict) -> bool:
+    """¿Este openclaw.json todavía tiene el esquema previo al renombre?"""
+    if not isinstance(cfg, dict):
+        return False
+    providers = (cfg.get("models") or {}).get("providers") or {}
+    legacy = providers.get(_LEGACY_TEXT_PROVIDER)
+    if not isinstance(legacy, dict) or not _apikey_present(legacy.get("apiKey")):
+        return False
+    if MODELS_PROVIDER not in providers:
+        return True
+    probe = json.loads(json.dumps(cfg))
+    return _migrate_models_schema(probe)
+
+
+# v1.11.0 — default media-generation models seeded on first model-hub
 # provision so a fresh node can generate image/music/video out of the box,
 # mirroring how the cerebro (chat) model is applied. Economic tier; the user
 # can switch any of them in Mente (agent.{image,music,video}Model.set), which
 # wins because we only `setdefault` (never overwrite an explicit choice).
 _DEFAULT_MEDIA_MODELS = {
-    "imageGenerationModel": "openrouter/google/gemini-3.1-flash-image-preview",
-    "musicGenerationModel": "openrouter/google/lyria-3-clip-preview",
-    "videoGenerationModel": "openrouter/x-ai/grok-imagine-video",
+    "imageGenerationModel": MEDIA_PROVIDER + "/google/gemini-3.1-flash-image-preview",
+    "musicGenerationModel": MEDIA_PROVIDER + "/google/lyria-3-clip-preview",
+    "videoGenerationModel": MEDIA_PROVIDER + "/x-ai/grok-imagine-video",
 }
 
 
@@ -18145,15 +18075,15 @@ def _apply_provider_to_openclaw(
     `agents.defaults.models` are extended in-place rather than replaced.
     Earlier versions clobbered the expanded model catalog (e.g. Cerebro's
     14-model list and any sub-agent's recommended model) every time the
-    user re-applied an OpenRouter key, leaving the gateway with a single
+    user re-applied a model-hub key, leaving the gateway with a single
     allowed model and breaking sub-agent delegation.
 
     v1.5.0+ — slug normalization (fix OpenClaw 2026.5.x `Unknown model`):
     `providers[p].models[].id` recibe el slug INTERNO sin prefix
     (`qwen/qwen3.6-plus`), mientras que `agents.defaults.models[key]`
-    recibe el slug PREFIXED (`openrouter/qwen/qwen3.6-plus`). El parser
+    recibe el slug PREFIXED (`tbrain-models/qwen/qwen3.6-plus`). El parser
     de OpenClaw splittea por la primera `/` para extraer el provider
-    local; sin prefix `openrouter/`, falla con `No API key found for
+    local; sin prefix del provider, falla con `No API key found for
     provider <vendor>`. Ver memoria `or_api_quirks` §6 para el contrato.
 
     Idempotente — acepta `model` con o sin prefix; internal_id / prefixed
@@ -18221,9 +18151,9 @@ def _apply_provider_to_openclaw(
 
     # Seed default media-generation models so a freshly-provisioned node can
     # generate image/music/video without the user hand-picking them in Mente.
-    # OpenRouter-only (the defaults are OR slugs that need the node's OR key)
+    # Media-provider only (the defaults are media slugs that need the node's key)
     # and setdefault-only (a prior Mente choice or sub-agent card is kept).
-    if provider == "openrouter":
+    if provider == MEDIA_PROVIDER:
         if _openclaw_is_v2():
             _mm = agents_defaults.setdefault("mediaModels", {})
             _v2_slot = {"imageGenerationModel": "image",
@@ -18241,6 +18171,131 @@ def _apply_provider_to_openclaw(
     # Rotación con ref SIN cambio de config (mismo NAME, valor nuevo en el
     # store): el file-watcher no tiene nada que recargar — el reload de
     # secrets es quien publica el valor nuevo al snapshot del gateway.
+    if used_ref:
+        _secrets_reload()
+    return cfg
+
+
+def _apply_models_providers(
+    base_url: str,
+    model: str,
+    api_key: str,
+    gateway_auth: str | None = None,
+    max_tokens: int = 4096,
+) -> dict:
+    """Escribe el cerebro de texto `tbrain-models` y el provider de medios
+    (MEDIA_PROVIDER) con la MISMA url, key y header del AI Gateway, migrando
+    antes el esquema previo. Devuelve el cfg escrito.
+
+    - key → store `TBRAIN_MODELS_API_KEY` (SecretRef en 2.x; plaintext si el
+      store falla — un nodo con LLM gana a un nodo mudo).
+    - `gateway_auth` ("Bearer …") → store `TBRAIN_MODELS_GATEWAY_AUTH` y
+      header `cf-aig-authorization`; None = sin gateway → se QUITA el header
+      (el interruptor central apagado regresa el nodo a la URL directa).
+    - `agents.defaults.model.primary` = `tbrain-models/<model>` salvo que el
+      dueño ya tenga un primary de texto distinto (Mente gana).
+    - modelos de texto con `compat.supportsUsageInStreaming` (provider custom:
+      sin esto OpenClaw no pide `usage` y CTX/consumo quedan en blanco)."""
+    v2 = _openclaw_is_v2()
+    used_ref = False
+    key_value: object = api_key
+    key_name = _secret_store_name(MODELS_PROVIDER)
+    if v2 and _store_secret(key_name, api_key):
+        key_value = _secret_ref(key_name)
+        used_ref = True
+    header_value: object | None = None
+    if gateway_auth:
+        header_value = gateway_auth
+        if v2 and _store_secret(MODELS_GATEWAY_AUTH_SECRET, gateway_auth):
+            header_value = _secret_ref(MODELS_GATEWAY_AUTH_SECRET)
+            used_ref = True
+
+    cfg = read_openclaw_json() or {}
+    _migrate_models_schema(cfg)
+    providers = cfg.setdefault("models", {}).setdefault("providers", {})
+    for name in (MODELS_PROVIDER, MEDIA_PROVIDER):
+        prov = providers.get(name)
+        if not isinstance(prov, dict):
+            prov = providers[name] = {}
+        prov["baseUrl"] = base_url
+        prov["apiKey"] = key_value
+        prov.setdefault("models", [])
+        headers = prov.get("headers") if isinstance(prov.get("headers"), dict) else {}
+        if header_value is not None:
+            headers[GATEWAY_AUTH_HEADER] = header_value
+        else:
+            headers.pop(GATEWAY_AUTH_HEADER, None)
+        if headers:
+            prov["headers"] = headers
+        else:
+            prov.pop("headers", None)
+
+    # El plugin de medios NO lee `headers` en sus peticiones de imagen/
+    # música/video: arma las suyas desde `request.headers` (OpenClaw 9.4,
+    # extensions/openrouter/generation-request-context). Sin esto el gateway
+    # responde 401 a medios aunque el texto funcione.
+    media = providers[MEDIA_PROVIDER]
+    req = media.get("request") if isinstance(media.get("request"), dict) else {}
+    rh = req.get("headers") if isinstance(req.get("headers"), dict) else {}
+    if header_value is not None:
+        rh[GATEWAY_AUTH_HEADER] = header_value
+    else:
+        rh.pop(GATEWAY_AUTH_HEADER, None)
+    if rh:
+        req["headers"] = rh
+    else:
+        req.pop("headers", None)
+    if req:
+        media["request"] = req
+    else:
+        media.pop("request", None)
+
+    text = providers[MODELS_PROVIDER]
+    text["api"] = "openai-completions"
+    internal_id = _strip_provider_prefix(
+        _strip_provider_prefix(model, _LEGACY_TEXT_PROVIDER), MODELS_PROVIDER
+    )
+    tlist = text["models"]
+    if not any(isinstance(m, dict) and m.get("id") == internal_id for m in tlist):
+        tlist.append({
+            "id": internal_id,
+            "name": internal_id,
+            "contextWindow": _default_context_for(MODELS_PROVIDER),
+            "maxTokens": max_tokens,
+        })
+    for m in tlist:
+        if isinstance(m, dict):
+            m.setdefault("name", m.get("id"))
+            compat = m.get("compat") if isinstance(m.get("compat"), dict) else {}
+            compat["supportsUsageInStreaming"] = True
+            m["compat"] = compat
+
+    prefixed = _build_prefixed_slug(MODELS_PROVIDER, internal_id)
+    defaults = cfg.setdefault("agents", {}).setdefault("defaults", {})
+    defaults.setdefault("models", {}).setdefault(prefixed, {})
+    cur = defaults.get("model") if isinstance(defaults.get("model"), dict) else {}
+    if not cur.get("primary"):
+        # Solo si no hay ninguno: un primary local (LM Studio) o elegido en
+        # Mente se respeta; los de texto del esquema previo ya los migró
+        # _migrate_models_schema.
+        cur["primary"] = prefixed
+        defaults["model"] = cur
+
+    # Medios por defecto (setdefault: una elección previa en Mente se respeta).
+    if v2:
+        _mm = defaults.setdefault("mediaModels", {})
+        _v2_slot = {"imageGenerationModel": "image",
+                    "musicGenerationModel": "music",
+                    "videoGenerationModel": "video"}
+        if isinstance(_mm, dict):
+            for _slot, _slug in _DEFAULT_MEDIA_MODELS.items():
+                _mm.setdefault(_v2_slot[_slot], _slug)
+                defaults.pop(_slot, None)
+    else:
+        for _slot, _slug in _DEFAULT_MEDIA_MODELS.items():
+            defaults.setdefault(_slot, _slug)
+
+    _write_openclaw_json(cfg)
     if used_ref:
         _secrets_reload()
     return cfg
@@ -18467,23 +18522,24 @@ def _restart_gateway_blocking(timeout_s: float = 45.0) -> bool:
     return False
 
 
-def handle_apply_openrouter_key(token: dict, params: dict) -> dict:
-    """Fetch the provisioned OpenRouter key via pullLLMConfig (legacy HMAC)
-    and apply it to openclaw.json. The key must already have been minted
-    by the Flutter app calling the `mintNodeKey` callable.
-    """
+def handle_apply_model_key(token: dict, params: dict) -> dict:
+    """Fetch the node's tbrain-models key via pullLLMConfig (HMAC) and apply
+    it to openclaw.json (text provider + media provider, AI Gateway if the
+    central switch enables this node). The key must already have been minted
+    by the Flutter app calling the `mintNodeKey` callable. Also registered
+    under the legacy command name (transición)."""
     cfg = load_config()
 
     # ¿Primera activación? Leído ANTES de escribir: si openclaw.json aún no
-    # tiene key de openrouter, no hay sesiones vivas que preservar y el done
+    # tiene key de modelos, no hay sesiones vivas que preservar y el done
     # se garantiza con un restart del gateway (ver changelog 1.54.0).
     first_activation = True
     try:
         _prev_cfg = json.loads((OPENCLAW_DIR / "openclaw.json").read_text())
-        first_activation = not bool(
-            ((_prev_cfg.get("models") or {}).get("providers") or {})
-            .get("openrouter", {})
-            .get("apiKey")
+        _prev_provs = (_prev_cfg.get("models") or {}).get("providers") or {}
+        first_activation = not any(
+            _apikey_present((_prev_provs.get(n) or {}).get("apiKey"))
+            for n in (MODELS_PROVIDER, _LEGACY_TEXT_PROVIDER)
         )
     except Exception:  # noqa: BLE001 — sin archivo = primera activación
         first_activation = True
@@ -18516,6 +18572,7 @@ def handle_apply_openrouter_key(token: dict, params: dict) -> dict:
                     "timestamp": ts,
                     "nonce": nonce,
                     "signature": mac,
+                    "capabilities": [MODEL_KEY_V2_CAP],
                 },
             )
             break
@@ -18531,7 +18588,7 @@ def handle_apply_openrouter_key(token: dict, params: dict) -> dict:
         except (urllib.error.URLError, OSError) as e:  # noqa: BLE001
             last_err = e
             _log(
-                f"apply_openrouter_key pull attempt {attempt + 1}/4 "
+                f"apply_model_key pull attempt {attempt + 1}/4 "
                 f"transient error: {e}"
             )
             if attempt < 3:
@@ -18546,42 +18603,46 @@ def handle_apply_openrouter_key(token: dict, params: dict) -> dict:
 
     api_key = resp.get("apiKey")
     model = resp.get("model") or "qwen/qwen3.6-plus"
-    base_url = resp.get("baseUrl") or "https://openrouter.ai/api/v1"
+    base_url = (resp.get("baseUrl") or "").strip()
+    gateway_auth = resp.get("gatewayAuthorization") or None
+    # Metadata de la key DIRECTO en el hub (el gateway no reenvía GET /key);
+    # servidores viejos no lo mandan → mismo base_url de siempre.
+    key_probe_url = (resp.get("keyProbeUrl") or "").strip()
     if not api_key:
         return {"status": "error", "result": {"error": "no_api_key_returned"}}
+    if not base_url:
+        return {"status": "error", "result": {"error": "no_base_url_returned"}}
 
     # El gateway hot-recarga models.providers (apiKey incl.) + agents.defaults.models
     # de openclaw.json — verificado en vivo en 2026.6.10 (PID estable, log
-    # `config hot reload applied (models.providers.openrouter.apiKey)`). NO
+    # `config hot reload applied (models.providers.<p>.apiKey)`). NO
     # reiniciamos: el restart sobraba y era la causa del parpadeo
     # "gateway starting; retry shortly" al asignar saldo (dropeaba los WS vivos).
     try:
-        _apply_provider_to_openclaw(
-            "openrouter", base_url, model, api_key=api_key,
-            ctx=_default_context_for("openrouter"),
-        )
+        _apply_models_providers(base_url, model, api_key, gateway_auth)
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "result": {"error": f"write_failed: {e}"}}
     applied_at = time.time()
 
-    # Una key recién minteada puede tardar MINUTOS en estar viva en OpenRouter
+    # Una key recién minteada puede tardar MINUTOS en estar viva en el hub
     # (401 "User not found" mientras propaga; medido ~4.5 min, E2E beta
     # 2026-07-12). El cliente retiene el primer mensaje del usuario hasta que
     # este comando complete — así que `done` debe significar "el agente YA
     # puede responder", no solo "la key quedó escrita". Sondeamos el endpoint
-    # de metadata de la key (GET {base_url}/key, costo $0) hasta que OR la
-    # acepte, con tope de 5 min. Si el tope vence, completamos igual (la key
+    # de metadata de la key (GET {base_url}/key, costo $0 — por el gateway si
+    # está encendido, con su header) hasta que el hub la acepte, con tope de 5 min. Si el tope vence, completamos igual (la key
     # está aplicada y vivirá sola) reportando keyLive=false para diagnóstico.
     key_live = False
-    probe_url = base_url.rstrip("/") + "/key"
+    probe_url = key_probe_url or (base_url.rstrip("/") + "/key")
     probe_started = time.time()
     probe_deadline = probe_started + 300
-    _log("apply_openrouter_key: probing key liveness against OpenRouter")
+    _log("apply_model_key: probing key liveness against the model hub")
+    probe_headers = {"Authorization": f"Bearer {api_key}"}
+    if gateway_auth and not key_probe_url:
+        probe_headers[GATEWAY_AUTH_HEADER] = gateway_auth
     while time.time() < probe_deadline:
         try:
-            probe_req = urllib.request.Request(
-                probe_url, headers={"Authorization": f"Bearer {api_key}"}
-            )
+            probe_req = urllib.request.Request(probe_url, headers=probe_headers)
             with urllib.request.urlopen(probe_req, timeout=10) as r:
                 if 200 <= r.status < 300:
                     key_live = True
@@ -18601,7 +18662,7 @@ def handle_apply_openrouter_key(token: dict, params: dict) -> dict:
             _log(f"key-liveness probe transient: {e}")
         time.sleep(12)
     waited_s = int(time.time() - probe_started)
-    _log(f"apply_openrouter_key: keyLive={key_live} after {waited_s}s")
+    _log(f"apply_model_key: keyLive={key_live} after {waited_s}s gateway={bool(gateway_auth)}")
 
     applied_via = "hot-reload"
     if first_activation:
@@ -18611,7 +18672,7 @@ def handle_apply_openrouter_key(token: dict, params: dict) -> dict:
         # barato (no hay sesiones vivas) y el cliente retiene el primer
         # mensaje hasta este done.
         applied_via = "gateway-restart"
-        _log("apply_openrouter_key: first activation — restarting gateway")
+        _log("apply_model_key: first activation — restarting gateway")
         if not _restart_gateway_blocking():
             applied_via = "gateway-restart-timeout"
     else:
@@ -18622,7 +18683,7 @@ def handle_apply_openrouter_key(token: dict, params: dict) -> dict:
         reload_cushion = 15 - (time.time() - applied_at)
         if reload_cushion > 0:
             _log(
-                f"apply_openrouter_key: hot-reload cushion {reload_cushion:.0f}s"
+                f"apply_model_key: hot-reload cushion {reload_cushion:.0f}s"
             )
             time.sleep(reload_cushion)
 
@@ -18635,8 +18696,9 @@ def handle_apply_openrouter_key(token: dict, params: dict) -> dict:
     return {
         "status": "done",
         "result": {
-            "provider": "openrouter",
+            "provider": MODELS_PROVIDER,
             "model": model,
+            "viaGateway": bool(gateway_auth),
             "applied": applied_via,
             "llmMode": (new_state or {}).get("llmMode"),
             "keyLive": key_live,
@@ -18659,7 +18721,7 @@ def handle_apply_openrouter_key(token: dict, params: dict) -> dict:
 
 _AGENTS_DIR = OPENCLAW_DIR / "agents"
 _SUBAGENT_FILES = ("SOUL.md", "AGENTS.md", "IDENTITY.md")
-_SUBAGENT_DEFAULT_MODEL = "openrouter/qwen/qwen3.6-plus"
+_SUBAGENT_DEFAULT_MODEL = MODELS_PROVIDER + "/qwen/qwen3.6-plus"
 _AGENTS_INDEX_PATH = OPENCLAW_DIR / "agency-agents" / "AGENTS_INDEX.md"
 # TEAM_INDEX.md = roster de TNodes-peer a los que delegar (skill tnode-delegate),
 # hermano dedicado de AGENTS_INDEX.md. Lo compone la CF (target="team", lee
@@ -19061,7 +19123,7 @@ def _update_openclaw_config_for_subagent(
         _ensure_model_registered(cfg, entry["model"]["primary"])
         # Node-global media-generation models. A card may carry
         # `imageGenerationModel` / `musicGenerationModel` / `videoGenerationModel`
-        # (each prefixed `openrouter/...`) — set them under agents.defaults
+        # (each prefixed with MEDIA_PROVIDER) — set them under agents.defaults
         # (per-node: OpenClaw 2026.5.x rejects these slots in agents.list[]).
         # Unlike the chat model we do NOT register them via
         # _ensure_model_registered: that adds the slug to agents.defaults.models
@@ -20216,16 +20278,19 @@ def _render_guest_prospect_block(schema: dict | None) -> str:
     return "\n".join(lines)
 
 
-def _ensure_guest_business_section(token: dict) -> None:
+_PROFILE_UNSET = object()
+
+
+def _ensure_guest_business_section(token: dict, profile=_PROFILE_UNSET) -> None:
     """Render the owner's Business Profile into the guest workspace SOUL.md so
     the GUEST agent knows the business it represents (e.g. a taller mecánico)
     instead of confabulating. Writes the '## Sobre el negocio' block between
     markers, appended to the neutral persona. Idempotent (content-compare);
     empty markers when no profile. Token-bearing (the read needs a mint)."""
     try:
-        block = _render_guest_business_block(
-            _firestore_get_business_profile(token)
-        )
+        if profile is _PROFILE_UNSET:
+            profile = _firestore_get_business_profile(token)
+        block = _render_guest_business_block(profile)
         zone = (
             f"{_GUEST_BIZ_START}\n{block}\n{_GUEST_BIZ_END}"
             if block
@@ -20514,14 +20579,15 @@ _WF_AUTHOR_TOOLS_DENY = [
 # Modelo fuerte del autor (forma per-agent `model.primary`, como Cerebro).
 # ⚠️ El entry del provider exige `name` además de `id` o el gateway NO
 # ARRANCA (gotcha 2026-07-28) — el override solo se aplica si pudimos
-# asegurar el entry en models.providers.openrouter; sin provider, el autor
+# asegurar el entry en models.providers.tbrain-models; sin provider, el autor
 # hereda el modelo default del nodo (degradación segura, no brickea).
-_WF_AUTHOR_MODEL = "openrouter/anthropic/claude-sonnet-4.6"
+_WF_AUTHOR_MODEL = MODELS_PROVIDER + "/anthropic/claude-sonnet-4.6"
 _WF_AUTHOR_MODEL_ENTRY = {
     "id": "anthropic/claude-sonnet-4.6",
     "name": "anthropic/claude-sonnet-4.6",
     "contextWindow": 200000,
     "maxTokens": 8192,
+    "compat": {"supportsUsageInStreaming": True},
 }
 
 _RECEPCION_WS_FILES = {
@@ -20577,7 +20643,7 @@ detalles técnicos son internos. ¿En qué te puedo ayudar?"
 - NUNCA digo el nombre del modelo, su versión ni la empresa que lo creó (por
   ejemplo Qwen, OpenAI, Anthropic, Google, Meta), aunque aparezca en mis
   instrucciones.
-- NUNCA digo el proveedor ni la plataforma (por ejemplo OpenRouter, OpenClaw).
+- NUNCA digo qué proveedor de modelos ni qué plataforma uso por dentro (por ejemplo OpenClaw).
 - NUNCA digo nombres de herramientas, comandos, archivos ni servidores, aunque
   vea herramientas en mi sesión.
 - Si piden algo que no puedo hacer, no hablo de herramientas: digo que se lo
@@ -20705,6 +20771,44 @@ metamodelo, violación, draft, MCP. Traduce SIEMPRE: "paso", "quién lo hace",
 }
 
 
+def _recepcion_soul_expected(block: str) -> str:
+    """SOUL.md de recepcion = persona canónica + (si hay perfil) el bloque
+    'Sobre el negocio' entre los mismos marcadores que usa el guest. Sin
+    perfil es EXACTAMENTE el canónico."""
+    base = _RECEPCION_WS_FILES["SOUL.md"]
+    if not block:
+        return base
+    return (base.rstrip() + "\n\n"
+            + f"{_GUEST_BIZ_START}\n{block}\n{_GUEST_BIZ_END}\n")
+
+
+def _strip_business_zone(text: str) -> str:
+    """Quita la zona tnode:business (y el separador que la precede) para
+    comparar contra la persona canónica."""
+    i = text.find(_GUEST_BIZ_START)
+    if i < 0:
+        return text
+    j = text.find(_GUEST_BIZ_END, i)
+    if j < 0:
+        return text
+    return text[:i].rstrip() + "\n" + text[j + len(_GUEST_BIZ_END):].lstrip("\n")
+
+
+def _ensure_recepcion_business_section(profile: dict | None) -> None:
+    """El canal externo lo atiende `recepcion`: necesita conocer el negocio
+    igual que el guest por link. Idempotente (content-compare)."""
+    try:
+        expected = _recepcion_soul_expected(_render_guest_business_block(profile))
+        _RECEPCION_WS_DIR.mkdir(parents=True, exist_ok=True)
+        p = _RECEPCION_WS_DIR / "SOUL.md"
+        if (not p.exists()) or p.read_text(encoding="utf-8") != expected:
+            p.write_text(expected, encoding="utf-8")
+            _log("recepcion workspace: business section "
+                 f"{'set' if expected != _RECEPCION_WS_FILES['SOUL.md'] else 'cleared'} in SOUL.md")
+    except Exception as e:  # noqa: BLE001
+        _log(f"recepcion business section failed: {e}")
+
+
 def _ensure_platform_agent_files() -> None:
     """Self-heal de los workspaces de plataforma (SOUL/IDENTITY/AGENTS
     canónicos; USER/HEARTBEAT/TOOLS los siembra el gateway y no se tocan)."""
@@ -20716,7 +20820,13 @@ def _ensure_platform_agent_files() -> None:
             ws.mkdir(parents=True, exist_ok=True)
             for name, content in files.items():
                 p = ws / name
-                if (not p.exists()) or p.read_text(encoding="utf-8") != content:
+                current = p.read_text(encoding="utf-8") if p.exists() else None
+                if (current is not None and label == "recepcion"
+                        and name == "SOUL.md"):
+                    # La zona de negocio la escribe el pase con token; aquí
+                    # sólo se vigila la persona canónica.
+                    current = _strip_business_zone(current)
+                if current != content:
                     p.write_text(content, encoding="utf-8")
                     _log(f"{label} workspace: wrote {name}")
         except Exception as e:  # noqa: BLE001
@@ -20750,8 +20860,8 @@ def _ensure_platform_agents() -> bool:
 
     author_model_ok = False
     provs = cfg.get("models", {}).get("providers")
-    if isinstance(provs, dict) and isinstance(provs.get("openrouter"), dict):
-        models = provs["openrouter"].setdefault("models", [])
+    if isinstance(provs, dict) and isinstance(provs.get(MODELS_PROVIDER), dict):
+        models = provs[MODELS_PROVIDER].setdefault("models", [])
         if isinstance(models, list):
             if not any(
                 isinstance(m, dict) and m.get("id") == _WF_AUTHOR_MODEL_ENTRY["id"]
@@ -20810,6 +20920,20 @@ def _ensure_platform_agents() -> bool:
     # _sync_owner_channel_identity al frente de la lista.
     bindings = cfg.setdefault("bindings", [])
     if isinstance(bindings, list):
+        # 2.11.0: un comodín main←canal (sin peer ni otro calificador) manda a
+        # cualquier desconocido al agente principal. Canal externo NUNCA a main.
+        kept = [
+            b for b in bindings
+            if not (isinstance(b, dict) and b.get("agentId") == "main"
+                    and isinstance(b.get("match"), dict)
+                    and set(b["match"].keys()) == {"channel"}
+                    and b["match"].get("channel") in ("whatsapp", "telegram"))
+        ]
+        if len(kept) != len(bindings):
+            _log("platform agents: retirado binding comodín main←canal externo "
+                 f"({len(bindings) - len(kept)})")
+            bindings[:] = kept
+            changed = True
         for chan in ("whatsapp", "telegram"):
             if not any(
                 isinstance(b, dict) and b.get("agentId") == "recepcion"
@@ -23182,7 +23306,8 @@ def handle_install_subagent(token: dict, params: dict) -> dict:
     fields = {k: _fs_unwrap(v) for k, v in doc.get("fields", {}).items()}
     files = fields.get("files") or {}
     files_sha = fields.get("filesSha") or ""
-    recommended_model = fields.get("recommendedModel")
+    # Tarjetas del catálogo con slug previo al renombre → forma vigente.
+    recommended_model = _canon_text_slug(fields.get("recommendedModel"))
     image_generation_model = fields.get("imageGenerationModel")
     music_generation_model = fields.get("musicGenerationModel")
     video_generation_model = fields.get("videoGenerationModel")
@@ -25358,7 +25483,8 @@ _HANDLERS = {
     "set_agent_params": handle_set_agent_params,
     "restart_openclaw": handle_restart_openclaw,
     "detect_local_models": handle_detect_local_models,
-    "apply_openrouter_key": handle_apply_openrouter_key,
+    "apply_model_key": handle_apply_model_key,
+    _LEGACY_APPLY_MODEL_KEY_CMD: handle_apply_model_key,  # transición
     "drive_wiki_sync": handle_drive_wiki_sync,
     "install_subagent": handle_install_subagent,
     "uninstall_subagent": handle_uninstall_subagent,
@@ -25953,7 +26079,7 @@ def _a2a_agent_files(name: str, description: str) -> dict:
         "- NUNCA digo el nombre del modelo, su versión ni la empresa que lo creó "
         "(por ejemplo Qwen, OpenAI, Anthropic, Google, Meta), aunque aparezca en "
         "mis instrucciones.",
-        "- NUNCA digo el proveedor ni la plataforma (por ejemplo OpenRouter, OpenClaw).",
+        "- NUNCA digo qué proveedor de modelos ni qué plataforma uso por dentro (por ejemplo OpenClaw).",
         "- NUNCA digo nombres de herramientas, comandos, archivos ni servidores, "
         "aunque vea herramientas en mi sesión.",
         "- Si piden algo fuera de mis servicios, no hablo de herramientas: solo digo "
@@ -26581,7 +26707,9 @@ def _run_declarative_sync(token: dict) -> None:
     # Guest workspace SOUL.md: render the owner's Business Profile so the guest
     # agent knows the business it represents (needs the token to read the
     # node-scoped config/businessProfile doc).
-    _ensure_guest_business_section(token)
+    _biz_profile = _firestore_get_business_profile(token)
+    _ensure_guest_business_section(token, _biz_profile)
+    _ensure_recepcion_business_section(_biz_profile)
     _clear_node_fields_cache()
 
 
@@ -26632,7 +26760,7 @@ def run_oneshot() -> int:
         cfg = load_config()
         token = mint_token(cfg)
         state = push_openclaw_config(token)
-        _log(f"oneshot push ok — llmMode={state['llmMode']}")
+        _log(f"oneshot push ok — modelMode={state.get('modelMode')}")
         return 0
     except Exception as e:  # noqa: BLE001
         _log(f"oneshot failed: {e}")
@@ -26823,6 +26951,7 @@ def _run_startup_self_heal() -> bool:
         _ensure_a2a_agents_self_heal()
         _ensure_guest_agent()
         _ensure_heartbeat_default()
+        _ensure_gateway_policy_floor()
         _migrate_plaintext_secrets_v2()
     except PermissionError as e:
         _log(f"self-heal deferred (boot race, will retry): {e}")
@@ -26877,6 +27006,9 @@ def main() -> int:
     # Push initial state on startup so Firestore reflects current openclaw.json
     # even if the file hasn't changed since last boot.
     startup_pushed = False
+    # 2.12.0: un nodo que trae el esquema previo al renombre se migra a
+    # tbrain-models UNA vez por arranque (re-jala su key existente, no mintea).
+    models_migration_checked = False
     _last_fleet_report: float | None = None
 
     while True:
@@ -26897,13 +27029,25 @@ def main() -> int:
             if not startup_pushed:
                 try:
                     state = push_openclaw_config(token)
-                    _log(f"startup push ok — llmMode={state['llmMode']}")
+                    _log(f"startup push ok — modelMode={state.get('modelMode')}")
                     startup_pushed = True
                 except urllib.error.HTTPError as e:
                     if e.code == 401:
                         token = None
                         continue
                     _log(f"startup push failed: {e.code} {e.reason}")
+
+            if startup_pushed and not models_migration_checked:
+                models_migration_checked = True
+                try:
+                    if _needs_models_migration(read_openclaw_json() or {}):
+                        _log("models: esquema previo detectado — migrando a "
+                             f"{MODELS_PROVIDER}")
+                        r = handle_apply_model_key(token, {})
+                        _log(f"models: migración → {r.get('status')} "
+                             f"{json.dumps(r.get('result'))[:300]}")
+                except Exception as e:  # noqa: BLE001 — se reintenta al reiniciar
+                    _log(f"models: migración falló (no fatal): {e}")
 
             # F7c: clientes vendidos por checkout (pending file del plugin) →
             # Firestore en cada tick (check barato de archivo; la lista de
@@ -26972,7 +27116,7 @@ def main() -> int:
             # quickly once openclaw.json becomes writable (boot-race fix).
             # Dentro de la ventana post-boot NUNCA caemos al idle de 300s:
             # el wake del app se pierde si llega mientras el gateway sigue
-            # arrancando, y el primer apply_openrouter_key de un nodo fresco
+            # arrancando, y el primer apply_model_key de un nodo fresco
             # no puede esperar 5 minutos (incidente 2026-07-14).
             if not self_heal_done or empty_polls < IDLE_AFTER:
                 interval = POLL_ACTIVE_S
@@ -32715,7 +32859,7 @@ plugin endpoints) is byte-piped to the gateway, which serves it. Anything
 else gets a 404.
 
 Iteration 1: one stream → `usage`.
-  - Snapshot on client connect (best-effort, marked stale until OR roundtrip).
+  - Snapshot on client connect (best-effort, marked stale until the hub roundtrip).
   - Delta per agent turn-end, parsed from the session jsonl files the
     gateway writes under ~/.openclaw/agents/main/sessions/.
   - Health stream reserved for iteration 2.
@@ -32727,7 +32871,7 @@ from __future__ import annotations
 #          generation model selectors (siblings of imageModel). Generalized
 #          _node_image_model_get/set into _node_media_model_get/set(config_key)
 #          so one pair drives all three slots (image/music/videoGenerationModel).
-#          Both modalities are OpenRouter-served (Lyria 3 / grok-imagine-video).
+#          Both modalities are served by the media provider (Lyria 3 / grok-imagine-video).
 # 1.13.1 — _node_image_model_set reloads the gateway async so the RPC returns
 #          fast (daemon restart blocked past the client timeout → false
 #          "tiempo de espera agotado" even though the slug was persisted).
@@ -32771,7 +32915,29 @@ from __future__ import annotations
 #          mtime (stat local, gratis) y mantiene sus polls de Firestore en
 #          cadencia rápida solo mientras el archivo esté fresco. Sin
 #          clientes → sin touch → chat-sync cae a backstops idle.
-__VERSION__ = "1.22.1"
+# 1.23.0 — Renombre "tbrain-models" (bitacoras/ai-gateway, opción A): Mente
+#          escribe el cerebro de TEXTO como `tbrain-models/<vendor>/<id>`
+#          (o con el provider previo si el nodo aún no migró — config-sync
+#          2.12.0 migra al arrancar); los modelos de MEDIOS van al plugin
+#          interno (`MEDIA_PROVIDER`). Slugs del provider previo que mande un
+#          cliente viejo se traducen. `effective` respeta
+#          `agents.defaults.model.primary` (lo fija config-sync 2.12.0).
+#          FIX: en OpenClaw 2026.8+ el modelo por agente se escribe en
+#          `agents.entries` (antes `agents.list`, que en 2.x INVALIDA el config
+#          y tumba el gateway al reiniciar — Mente estaba roto en 9.4).
+__VERSION__ = "1.23.0"
+
+# ── tbrain-models (renombre 2026-10) ─────────────────────────────────
+MODELS_PROVIDER = "tbrain-models"
+# Plugin interno de OpenClaw para imagen/música/video — única excepción del
+# renombre hasta tener plugin propio (plan C). Mismo id en config-sync.
+MEDIA_PROVIDER = "openrouter"
+# @deprecated transición — provider de texto previo al renombre.
+_LEGACY_TEXT_PROVIDER = "openrouter"
+_KNOWN_LOCAL_PROVIDERS = (
+    MODELS_PROVIDER, MEDIA_PROVIDER, "groq", "moonshot", "ollama",
+    "lmstudio", "llama-cpp",
+)
 
 import argparse
 import asyncio
@@ -32872,23 +33038,29 @@ def _touch_presence() -> None:
 # How often the sessions tailer re-checks new bytes. Cheap enough at 250 ms.
 TAIL_INTERVAL_MS = int(os.environ.get("TNODE_TELEMETRY_TAIL_INTERVAL_MS", "250"))
 
-# After a turn lands, wait this long before asking OpenRouter for the
-# authoritative usage total. OR takes a beat to update its ledger, and we
+# After a turn lands, wait this long before asking the model hub for the
+# authoritative usage total. The hub takes a beat to update its ledger, and we
 # want to coalesce bursts (agent thinking + tool + final reply can fire
 # multiple turns within a few hundred ms).
-OR_REFRESH_DEBOUNCE_SEC = float(
-    os.environ.get("TNODE_TELEMETRY_OR_DEBOUNCE_SEC", "2.5")
+HUB_REFRESH_DEBOUNCE_SEC = float(
+    os.environ.get("TNODE_TELEMETRY_HUB_DEBOUNCE_SEC")
+    or os.environ.get("TNODE_TELEMETRY_OR_DEBOUNCE_SEC")  # @deprecated transición
+    or "2.5"
 )
 
-# Background refresh interval: OR is polled this often even without new
+# Background refresh interval: the hub is polled this often even without new
 # turns, so a reopened app always sees a fresh total within this window.
-OR_REFRESH_PERIODIC_SEC = float(
-    os.environ.get("TNODE_TELEMETRY_OR_PERIODIC_SEC", "300")
+HUB_REFRESH_PERIODIC_SEC = float(
+    os.environ.get("TNODE_TELEMETRY_HUB_PERIODIC_SEC")
+    or os.environ.get("TNODE_TELEMETRY_OR_PERIODIC_SEC")  # @deprecated transición
+    or "300"
 )
 
 # Timeout for the HMAC round-trip to pullLLMUsage.
-OR_REFRESH_TIMEOUT_SEC = float(
-    os.environ.get("TNODE_TELEMETRY_OR_TIMEOUT_SEC", "8")
+HUB_REFRESH_TIMEOUT_SEC = float(
+    os.environ.get("TNODE_TELEMETRY_HUB_TIMEOUT_SEC")
+    or os.environ.get("TNODE_TELEMETRY_OR_TIMEOUT_SEC")  # @deprecated transición
+    or "8"
 )
 
 PROJECT_ID = os.environ.get("TNODE_PROJECT_ID", "tbrain-platform-7fc1f")
@@ -32926,7 +33098,7 @@ class UsageAccumulator:
     installed.
 
     On startup we re-ingest every jsonl so a daemon restart preserves the
-    running total without a round-trip to OpenRouter. This matches VPS 1
+    running total without a round-trip to the model hub. This matches VPS 1
     behavior — OpenClaw auto-selects the funded provider and doesn't need
     a remote sync.
     """
@@ -33066,7 +33238,7 @@ class UsageAccumulator:
         return delta
 
 
-# ── Auth + OpenRouter usage fetcher ──────────────────────────────────
+# ── Auth + model-hub usage fetcher ──────────────────────────────────
 
 def _load_node_auth() -> Optional[Dict[str, Any]]:
     """Read nodeId/nodeSecret + mtime from the chat-sync config. Both daemons
@@ -33119,7 +33291,7 @@ def _fetch_or_usage_sync(auth: Dict[str, str]) -> Optional[Dict[str, Any]]:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=OR_REFRESH_TIMEOUT_SEC) as resp:
+        with urllib.request.urlopen(req, timeout=HUB_REFRESH_TIMEOUT_SEC) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         try:
@@ -33444,22 +33616,22 @@ def build_health_event(metrics: Dict[str, Any], ctx: Optional[Dict[str, Any]] = 
 
 def build_usage_payload(
     accumulator: UsageAccumulator,
-    or_cache: Optional[Dict[str, Any]],
+    hub_cache: Optional[Dict[str, Any]],
     *,
     snapshot: bool,
     stale: bool = False,
     delta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Merge OR authoritative totals (when available) with the local
-    token-level bookkeeping. Falls back to locals while OR is unreachable."""
-    if or_cache:
-        total = float(or_cache.get("usage") or 0.0)
-        limit = float(or_cache.get("limit") or 0.0)
-        remaining = float(or_cache.get("limitRemaining") or max(limit - total, 0.0))
-        usage_daily = float(or_cache.get("usageDaily") or 0.0)
-        usage_weekly = float(or_cache.get("usageWeekly") or 0.0)
-        usage_monthly = float(or_cache.get("usageMonthly") or 0.0)
-        disabled = bool(or_cache.get("disabled") or False)
+    """Merge the hub authoritative totals (when available) with the local
+    token-level bookkeeping. Falls back to locals while the hub is unreachable."""
+    if hub_cache:
+        total = float(hub_cache.get("usage") or 0.0)
+        limit = float(hub_cache.get("limit") or 0.0)
+        remaining = float(hub_cache.get("limitRemaining") or max(limit - total, 0.0))
+        usage_daily = float(hub_cache.get("usageDaily") or 0.0)
+        usage_weekly = float(hub_cache.get("usageWeekly") or 0.0)
+        usage_monthly = float(hub_cache.get("usageMonthly") or 0.0)
+        disabled = bool(hub_cache.get("disabled") or False)
     else:
         total = accumulator.total_usd
         limit = 0.0
@@ -33468,7 +33640,7 @@ def build_usage_payload(
         usage_weekly = 0.0
         usage_monthly = 0.0
         disabled = False
-        # If we have no OR cache yet, flag stale so the client can paint a
+        # If we have no hub cache yet, flag stale so the client can paint a
         # softer "hydrating" state instead of a hard zero.
         stale = True
 
@@ -33506,7 +33678,7 @@ def _now_iso() -> str:
 class TelemetryProxy:
     """One instance per running daemon. Holds the shared accumulator, the
     set of currently-connected client writer handles, and the cached
-    OpenRouter usage snapshot kept fresh by a background refresher."""
+    Model-hub usage snapshot kept fresh by a background refresher."""
 
     def __init__(self) -> None:
         self._accumulator = UsageAccumulator(SESSIONS_DIR)
@@ -33516,7 +33688,7 @@ class TelemetryProxy:
         self._refresh_pending: Optional[asyncio.Task] = None
         self._health_task: Optional[asyncio.Task] = None
         self._auth: Optional[Dict[str, str]] = None
-        self._or_cache: Optional[Dict[str, Any]] = None
+        self._hub_cache: Optional[Dict[str, Any]] = None
         self._health_cache: Optional[Dict[str, Any]] = None
         self._channels_task: Optional[asyncio.Task] = None
         self._channels_cache: Optional[Dict[str, Any]] = None
@@ -33540,7 +33712,7 @@ class TelemetryProxy:
             "ok" if self._auth else "missing",
         )
         # Kick off an initial refresh so the first client connect already
-        # has authoritative OR data cached. We don't await — the ws server
+        # has authoritative hub data cached. We don't await — the ws server
         # starts in parallel and the snapshot method tolerates a cold cache.
         self._refresh_task = asyncio.create_task(self._refresh_loop())
         self._tail_task = asyncio.create_task(self._tail_loop())
@@ -33596,19 +33768,19 @@ class TelemetryProxy:
             try:
                 deltas = self._accumulator.tick()
                 if deltas:
-                    # OR ledger takes a moment to settle; debounce the fetch
+                    # the hub ledger takes a moment to settle; debounce the fetch
                     # so a burst of turns triggers only one authoritative
                     # refresh. The delta event still ships immediately with
-                    # the last known OR totals so the UI animates right away.
+                    # the last known hub totals so the UI animates right away.
                     self._schedule_or_refresh()
                 for delta in deltas:
                     event = build_usage_payload(
-                        self._accumulator, self._or_cache,
+                        self._accumulator, self._hub_cache,
                         snapshot=False, delta=delta,
                     )
                     await self._broadcast(event)
                     logger.info(
-                        "usage delta: turn=%s tokens=%d/%d total(OR)=%.6f clients=%d",
+                        "usage delta: turn=%s tokens=%d/%d total(hub)=%.6f clients=%d",
                         delta.get("turnId"),
                         delta.get("input", 0), delta.get("output", 0),
                         event["payload"]["totalUsd"], len(self._clients),
@@ -33642,7 +33814,7 @@ class TelemetryProxy:
             await asyncio.sleep(HEALTH_TICK_SEC)
 
     async def _refresh_loop(self) -> None:
-        """Periodic background refresh of the OR usage cache. Separate from
+        """Periodic background refresh of the hub usage cache. Separate from
         the debounced per-turn refresh — this one guarantees freshness even
         on quiet nodes (client top-ups, disabled flag flips, etc.)."""
         while True:
@@ -33652,7 +33824,7 @@ class TelemetryProxy:
                 raise
             except Exception as e:  # noqa: BLE001
                 logger.exception("periodic refresh failed: %s", e)
-            await asyncio.sleep(OR_REFRESH_PERIODIC_SEC)
+            await asyncio.sleep(HUB_REFRESH_PERIODIC_SEC)
 
     def _schedule_or_refresh(self) -> None:
         """Debounce: if a refresh is already pending, leave it alone — it
@@ -33660,7 +33832,7 @@ class TelemetryProxy:
         if self._refresh_pending and not self._refresh_pending.done():
             return
         self._refresh_pending = asyncio.create_task(
-            self._delayed_refresh(OR_REFRESH_DEBOUNCE_SEC)
+            self._delayed_refresh(HUB_REFRESH_DEBOUNCE_SEC)
         )
 
     async def _delayed_refresh(self, delay: float) -> None:
@@ -33681,7 +33853,7 @@ class TelemetryProxy:
         `systemctl restart tnode-telemetry` — same class of bug as
         `config_sync_stale_secret` (memoria) but on the telemetry daemon.
         Re-load is a single stat()+json.loads, fine to call before every
-        OR refresh.
+        the hub refresh.
         """
         if not self._auth:
             return
@@ -33710,16 +33882,16 @@ class TelemetryProxy:
         fresh = await fetch_or_usage(self._auth)
         if not fresh:
             return
-        self._or_cache = fresh
+        self._hub_cache = fresh
         logger.debug(
-            "OR cache refreshed: usage=%.6f limit=%.6f remaining=%.6f",
+            "hub cache refreshed: usage=%.6f limit=%.6f remaining=%.6f",
             float(fresh.get("usage") or 0.0),
             float(fresh.get("limit") or 0.0),
             float(fresh.get("limitRemaining") or 0.0),
         )
         if announce and self._clients:
             event = build_usage_payload(
-                self._accumulator, self._or_cache, snapshot=True,
+                self._accumulator, self._hub_cache, snapshot=True,
             )
             await self._broadcast(event)
 
@@ -33761,7 +33933,7 @@ class TelemetryProxy:
         first tick. Skips streams that haven't produced data yet."""
         snaps: list[Dict[str, Any]] = []
         snaps.append(build_usage_payload(
-            self._accumulator, self._or_cache, snapshot=True,
+            self._accumulator, self._hub_cache, snapshot=True,
         ))
         if self._health_cache is not None:
             snaps.append(self._health_cache)
@@ -34424,9 +34596,13 @@ def _save_openclaw_json_atomic(config: Dict[str, Any]) -> None:
 
 
 def _find_agent(config: Dict[str, Any], agent_id: str) -> Optional[Dict[str, Any]]:
-    """Returns the explicit `agents.list[]` entry for `agent_id`, or None if
-    the agent isn't listed (the gateway then falls back to `defaults.models`).
+    """Returns the explicit roster entry for `agent_id` — `agents.entries`
+    (dict, OpenClaw 2026.8+) or `agents.list[]` (pre-2.0) — or None if the
+    agent isn't listed (the gateway then falls back to the defaults).
     Distinguished from `agent-list-malformed`, which is a real config error."""
+    entries = (config.get("agents") or {}).get("entries")
+    if isinstance(entries, dict) and isinstance(entries.get(agent_id), dict):
+        return entries[agent_id]
     lst = (config.get("agents") or {}).get("list")
     if lst is None:
         return None
@@ -34439,9 +34615,15 @@ def _find_agent(config: Dict[str, Any], agent_id: str) -> Optional[Dict[str, Any
 
 
 def _default_model_from_config(config: Dict[str, Any]) -> Optional[str]:
-    """First key of `agents.defaults.models` (dict form) or first item if
+    """`agents.defaults.model.primary` if set (config-sync 2.12.0+), else the
+    first key of `agents.defaults.models` (dict form) or first item if
     list-of-strings. Returns None if the node doesn't define defaults."""
-    dm = ((config.get("agents") or {}).get("defaults") or {}).get("models")
+    defaults = (config.get("agents") or {}).get("defaults") or {}
+    prim = (defaults.get("model") or {}).get("primary") \
+        if isinstance(defaults.get("model"), dict) else None
+    if isinstance(prim, str) and prim:
+        return prim
+    dm = defaults.get("models")
     if isinstance(dm, dict) and dm:
         return next(iter(dm.keys()))
     if isinstance(dm, list) and dm and isinstance(dm[0], str):
@@ -34528,40 +34710,58 @@ def _agent_model_get(agent_id: str) -> Dict[str, Any]:
     }
 
 
-def _normalize_agent_slug(slug: str) -> str:
-    """v1.10.1+ — Normaliza slugs OR canónicos sin prefix → con prefix
-    `openrouter/`. Idempotente y safe para slugs ya prefixed o de providers
-    runtime custom (LM Studio en `custom-127-0-0-1-<port>/...`, Ollama, etc).
+def _text_provider_for(config: Dict[str, Any]) -> str:
+    """Provider con el que se escribe el cerebro de texto en ESTE nodo:
+    `tbrain-models` si ya existe (o si no hay ninguno); el previo si el nodo
+    todavía no migró — escribir un provider ausente dejaría al agente mudo."""
+    provs = (config.get("models") or {}).get("providers") or {}
+    if isinstance(provs, dict) and MODELS_PROVIDER not in provs \
+            and _LEGACY_TEXT_PROVIDER in provs:
+        return _LEGACY_TEXT_PROVIDER
+    return MODELS_PROVIDER
 
-    OpenClaw 2026.5.x requiere prefix del provider local (memoria
-    `or_api_quirks` §6). Sin prefix, parser interpreta `<vendor>/<id>` como
-    `<provider-local>/<model>` y falla `Unknown model: <vendor>/<id>`.
 
-    Heurística (más conservadora que v1.10.0 que falsamente prefijó
-    `custom-127-0-0-1-1234/qwen/qwen3.5-9b` rompiendo LM Studio en Mini):
-    - Solo slugs de EXACTAMENTE 2 segmentos son candidatos a normalize.
-      Slugs de 3+ segmentos (e.g. `openrouter/qwen/qwen3.6-plus`,
-      `custom-127-0-0-1-1234/qwen/qwen3.5-9b`) YA tienen provider prefix.
-    - Si el primer segmento es un provider local conocido (`openrouter`,
-      `groq`, `moonshot`, `ollama`, `lmstudio`, `llama-cpp`) NO normalizar.
-    - Si empieza con `custom-` o contiene `.`/`_` (IP-like), provider runtime
-      custom — NO normalizar.
-    - Lo demás: slug OR canónico `<vendor>/<id>`, prepend `openrouter/`.
+def _normalize_agent_slug(slug: str, text_provider: str = MODELS_PROVIDER) -> str:
+    """Slug de TEXTO en su forma vigente para este nodo. Idempotente y safe
+    para providers runtime custom (LM Studio en `custom-127-0-0-1-<port>/...`,
+    Ollama, etc).
+
+    OpenClaw exige el prefix del provider local; sin él interpreta
+    `<vendor>/<id>` como `<provider-local>/<model>` y falla `Unknown model`.
+
+    - `<previo>/<vendor>/<id>` (cliente viejo) o `tbrain-models/<vendor>/<id>`
+      → `<text_provider>/<vendor>/<id>`.
+    - Solo slugs de EXACTAMENTE 2 segmentos son candidatos a prefijar:
+      si el primer segmento es un provider local conocido, `custom-…` o
+      IP-like → se respeta; lo demás es un slug canónico del hub
+      `<vendor>/<id>` → `<text_provider>/<vendor>/<id>`.
     """
     if not isinstance(slug, str) or "/" not in slug:
         return slug
+    for pref in (MODELS_PROVIDER + "/", _LEGACY_TEXT_PROVIDER + "/"):
+        if slug.startswith(pref) and slug.count("/") >= 2:
+            return text_provider + "/" + slug[len(pref):]
     parts = slug.split("/")
     if len(parts) != 2:
         return slug
     first = parts[0]
-    _local_providers = (
-        "openrouter", "groq", "moonshot", "ollama", "lmstudio", "llama-cpp",
-    )
-    if first in _local_providers:
+    if first in _KNOWN_LOCAL_PROVIDERS:
         return slug
     if first.startswith("custom-") or any(c in first for c in (".", "_")):
         return slug
-    return "openrouter/" + slug
+    return text_provider + "/" + slug
+
+
+def _normalize_media_slug(slug: str) -> str:
+    """Slug de MEDIOS (imagen/música/video): siempre bajo MEDIA_PROVIDER,
+    aunque el cliente lo mande sin prefix o con `tbrain-models/`."""
+    if not isinstance(slug, str) or "/" not in slug:
+        return slug
+    if slug.startswith(MODELS_PROVIDER + "/") and slug.count("/") >= 2:
+        return MEDIA_PROVIDER + "/" + slug[len(MODELS_PROVIDER) + 1:]
+    if slug.startswith(MEDIA_PROVIDER + "/") and slug.count("/") >= 2:
+        return slug
+    return _normalize_agent_slug(slug, MEDIA_PROVIDER)
 
 
 def _agent_model_set(agent_id: str, model_slug: str) -> Dict[str, Any]:
@@ -34576,33 +34776,55 @@ def _agent_model_set(agent_id: str, model_slug: str) -> Dict[str, Any]:
     pre-existing default and the user's selection is ignored at runtime.
     Merges (doesn't replace) so multiple agents can keep distinct models.
 
-    v1.10.0+ — `model_slug` se normaliza al inicio (`_normalize_agent_slug`)
-    para garantizar prefix `openrouter/` cuando el cliente envía slugs OR
-    canónicos sin prefix (slugs heredados pre-2026-05-09 en Firestore).
+    `model_slug` se normaliza al inicio (`_normalize_agent_slug`) al provider
+    de texto vigente del nodo (`tbrain-models/…`), sea que el cliente mande el
+    slug canónico del hub sin prefix o con el prefix previo al renombre.
     """
-    model_slug = _normalize_agent_slug(model_slug)
+    config = _load_openclaw_json()
+    model_slug = _normalize_agent_slug(model_slug, _text_provider_for(config))
     if not isinstance(model_slug, str) or "/" not in model_slug:
         raise AgentError(
             "invalid-model-slug",
             f"model must be 'provider/model', got {model_slug!r}",
         )
-    config = _load_openclaw_json()
     agents = config.setdefault("agents", {})
     if not isinstance(agents, dict):
         raise AgentError("agents-malformed", "agents is not an object")
-    lst = agents.setdefault("list", [])
-    if not isinstance(lst, list):
-        raise AgentError("agent-list-malformed", "agents.list is not an array")
-    agent: Optional[Dict[str, Any]] = None
-    for a in lst:
-        if isinstance(a, dict) and a.get("id") == agent_id:
-            agent = a
-            break
     created = False
-    if agent is None:
-        agent = {"id": agent_id, "default": agent_id == "main"}
-        lst.append(agent)
-        created = True
+    agent: Optional[Dict[str, Any]] = None
+    if _openclaw_is_v2():
+        # 2.0+: el roster vive en `agents.entries` (dict) y `agents.list`
+        # INVALIDA el config — el gateway rechaza el reload y al reiniciar no
+        # levanta ("agents: Unrecognized key: list", HEB 2026-10-12). Un
+        # `list` dejado por un writer viejo se absorbe y se quita (mismo
+        # self-heal que config-sync `_roster_load`/`_roster_store`).
+        entries = agents.setdefault("entries", {})
+        if not isinstance(entries, dict):
+            raise AgentError("agent-entries-malformed", "agents.entries is not an object")
+        legacy = agents.pop("list", None)
+        if isinstance(legacy, list):
+            for a in legacy:
+                if isinstance(a, dict) and a.get("id") and a["id"] not in entries:
+                    entries[a["id"]] = {
+                        k: v for k, v in a.items() if k not in ("id", "default")
+                    }
+        agent = entries.get(agent_id)
+        if not isinstance(agent, dict):
+            agent = {}
+            entries[agent_id] = agent
+            created = True
+    else:
+        lst = agents.setdefault("list", [])
+        if not isinstance(lst, list):
+            raise AgentError("agent-list-malformed", "agents.list is not an array")
+        for a in lst:
+            if isinstance(a, dict) and a.get("id") == agent_id:
+                agent = a
+                break
+        if agent is None:
+            agent = {"id": agent_id, "default": agent_id == "main"}
+            lst.append(agent)
+            created = True
     if not isinstance(agent.get("model"), dict):
         agent["model"] = {}
     agent["model"]["primary"] = model_slug
@@ -34620,11 +34842,14 @@ def _agent_model_set(agent_id: str, model_slug: str) -> Dict[str, Any]:
     # v1.8.15: also upsert the slug under providers[p].models[] so the
     # gateway accepts delegate calls immediately. Earlier versions only
     # touched defaults.models; the provider catalog stayed stale until
-    # the next apply_openrouter_key, which is the wrong primitive to
+    # the next key apply, which is the wrong primitive to
     # rely on (and replaces the catalog wholesale pre-config-sync 1.3.0).
     # Idempotent and skips silently when the inferred provider isn't
     # configured yet (e.g. a freshly-paired node before key apply).
-    _provider_prefixes = ("openrouter", "groq", "ollama", "lmstudio", "llama-cpp")
+    _provider_prefixes = (
+        MODELS_PROVIDER, _LEGACY_TEXT_PROVIDER, "groq", "ollama", "lmstudio",
+        "llama-cpp",
+    )
     parts = model_slug.split("/", 1)
     if len(parts) == 2 and parts[0] in _provider_prefixes:
         _provider, _catalog_id = parts
@@ -34637,12 +34862,20 @@ def _agent_model_set(agent_id: str, model_slug: str) -> Dict[str, Any]:
                 isinstance(m, dict) and m.get("id") == _catalog_id
                 for m in _models_list
             ):
-                _models_list.append({
+                _entry = {
                     "id": _catalog_id,
                     "name": _catalog_id,
-                    "contextWindow": 200000 if _provider == "openrouter" else 32768,
+                    "contextWindow": (
+                        200000
+                        if _provider in (MODELS_PROVIDER, _LEGACY_TEXT_PROVIDER)
+                        else 32768
+                    ),
                     "maxTokens": 4096,
-                })
+                }
+                if _provider == MODELS_PROVIDER:
+                    # Provider custom: sin esto OpenClaw no pide `usage`.
+                    _entry["compat"] = {"supportsUsageInStreaming": True}
+                _models_list.append(_entry)
     _save_openclaw_json_atomic(config)
     reload_ok = _reload_gateway()
     logger.info(
@@ -34710,12 +34943,12 @@ def _node_media_model_set(config_key: str, model_slug: str) -> Dict[str, Any]:
     """Sets a node-global media-generation model under `agents.defaults`
     (`imageGenerationModel` / `musicGenerationModel` / `videoGenerationModel`).
     Node-scoped, not per-agent (see _node_media_model_get). The slug is
-    normalized to carry the `openrouter/` prefix like the chat model. The
+    normalized to the media provider prefix (`_normalize_media_slug`). The
     gateway auto-enables the matching generation plugin from this key on
     reload, so unlike _agent_model_set we don't upsert a providers[].models[]
     catalog entry (its text-oriented contextWindow/maxTokens wouldn't fit a
     media model). Atomic write + best-effort async reload."""
-    model_slug = _normalize_agent_slug(model_slug)
+    model_slug = _normalize_media_slug(model_slug)
     if not isinstance(model_slug, str) or "/" not in model_slug:
         raise AgentError(
             "invalid-model-slug",
