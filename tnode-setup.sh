@@ -103,7 +103,7 @@ if command -v npm >/dev/null 2>&1; then
 fi
 unset _p
 
-TNODE_SETUP_VERSION="1.149.0"
+TNODE_SETUP_VERSION="1.149.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -16575,7 +16575,13 @@ from __future__ import annotations
 #          una vez al arrancar si el nodo trae el esquema viejo.
 #          (d) state/current publica `modelMode` + `capabilities`; `llmMode`
 #          conserva el valor previo para la app 1.14.x (transición).
-__VERSION__ = "2.12.0"
+# 2.12.1 — `mediaBaseUrl` opcional de pullLLMConfig: el provider de medios
+#          (MEDIA_PROVIDER) usa esa base en vez de la del texto. Detrás del
+#          AI Gateway el video fallaba con 401: el hub devuelve `polling_url`
+#          absoluto a su dominio y OpenClaw no manda la auth a otro origen;
+#          el proxy de medios (tnode_server/media-proxy-worker) reescribe ese
+#          URL. Sin el campo, todo igual que 2.12.0.
+__VERSION__ = "2.12.1"
 
 import hashlib
 import hmac
@@ -18048,6 +18054,7 @@ def _apply_models_providers(
     api_key: str,
     gateway_auth: str | None = None,
     max_tokens: int = 4096,
+    media_base_url: str | None = None,
 ) -> dict:
     """Escribe el cerebro de texto `tbrain-models` y el provider de medios
     (MEDIA_PROVIDER) con la MISMA url, key y header del AI Gateway, migrando
@@ -18083,7 +18090,9 @@ def _apply_models_providers(
         prov = providers.get(name)
         if not isinstance(prov, dict):
             prov = providers[name] = {}
-        prov["baseUrl"] = base_url
+        prov["baseUrl"] = (
+            media_base_url if name == MEDIA_PROVIDER and media_base_url else base_url
+        )
         prov["apiKey"] = key_value
         prov.setdefault("models", [])
         headers = prov.get("headers") if isinstance(prov.get("headers"), dict) else {}
@@ -18471,6 +18480,8 @@ def handle_apply_model_key(token: dict, params: dict) -> dict:
     model = resp.get("model") or "qwen/qwen3.6-plus"
     base_url = (resp.get("baseUrl") or "").strip()
     gateway_auth = resp.get("gatewayAuthorization") or None
+    # 2.12.1: base propia de medios (proxy que reescribe polling_url).
+    media_base_url = (resp.get("mediaBaseUrl") or "").strip() or None
     # Metadata de la key DIRECTO en el hub (el gateway no reenvía GET /key);
     # servidores viejos no lo mandan → mismo base_url de siempre.
     key_probe_url = (resp.get("keyProbeUrl") or "").strip()
@@ -18485,7 +18496,9 @@ def handle_apply_model_key(token: dict, params: dict) -> dict:
     # reiniciamos: el restart sobraba y era la causa del parpadeo
     # "gateway starting; retry shortly" al asignar saldo (dropeaba los WS vivos).
     try:
-        _apply_models_providers(base_url, model, api_key, gateway_auth)
+        _apply_models_providers(
+            base_url, model, api_key, gateway_auth, media_base_url=media_base_url
+        )
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "result": {"error": f"write_failed: {e}"}}
     applied_at = time.time()
