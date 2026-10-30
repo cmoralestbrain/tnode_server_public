@@ -124,7 +124,7 @@ if command -v npm >/dev/null 2>&1; then
 fi
 unset _p
 
-TNODE_SETUP_VERSION="1.152.0"
+TNODE_SETUP_VERSION="1.154.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -16769,6 +16769,182 @@ install_tnode_skill_manager() {
 # the tnode-config-sync-v* tags in that repo.
 # ─────────────────────────────────────────────────────────────
 
+# ─── tnode_agent_model.py — shared by tnode-telemetry and tnode-config-sync ──
+# The main agent's model in openclaw.json (`agent.model.set`): telemetry
+# answers the app's RPC with it and config-sync the server's auto-mode
+# command (cmoralestbrain/tnode_server#24). One copy, so both write the
+# roster, defaults.models and the provider catalog the same way. Pure: each
+# daemon reads/writes the file and reloads the gateway itself.
+write_tnode_agent_model_py() {
+    local dest="$1"
+    cat > "$dest" <<'AGENTMODELPYEOF'
+#!/usr/bin/env python3
+"""tnode_agent_model — the agent's primary model in openclaw.json.
+
+Imported by tnode_telemetry.py (`agent.model.set` RPC from the app) and
+tnode_config_sync.py (`agent.model.set` command queued by the server's
+auto mode). Pure functions on the config dict; callers do I/O + reload."""
+from __future__ import annotations
+
+from typing import Any, Dict, Iterable
+
+
+class AgentModelError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def text_provider_for(config: Dict[str, Any], models_provider: str, legacy_provider: str) -> str:
+    """Provider con el que se escribe el cerebro de texto en ESTE nodo:
+    `models_provider` si ya existe (o si no hay ninguno); el previo si el nodo
+    todavía no migró — escribir un provider ausente dejaría al agente mudo."""
+    provs = (config.get("models") or {}).get("providers") or {}
+    if isinstance(provs, dict) and models_provider not in provs \
+            and legacy_provider in provs:
+        return legacy_provider
+    return models_provider
+
+
+def normalize_agent_slug(slug: str, text_provider: str, models_provider: str,
+                         legacy_provider: str, known_local: Iterable[str]) -> str:
+    """Slug de TEXTO en su forma vigente para este nodo. Idempotente y safe
+    para providers runtime custom (LM Studio en `custom-127-0-0-1-<port>/...`,
+    Ollama, etc).
+
+    OpenClaw exige el prefix del provider local; sin él interpreta
+    `<vendor>/<id>` como `<provider-local>/<model>` y falla `Unknown model`.
+
+    - `<previo>/<vendor>/<id>` (cliente viejo) o `tbrain-models/<vendor>/<id>`
+      → `<text_provider>/<vendor>/<id>`.
+    - Solo slugs de EXACTAMENTE 2 segmentos son candidatos a prefijar:
+      si el primer segmento es un provider local conocido, `custom-…` o
+      IP-like → se respeta; lo demás es un slug canónico del hub
+      `<vendor>/<id>` → `<text_provider>/<vendor>/<id>`.
+    """
+    if not isinstance(slug, str) or "/" not in slug:
+        return slug
+    for pref in (models_provider + "/", legacy_provider + "/"):
+        if slug.startswith(pref) and slug.count("/") >= 2:
+            return text_provider + "/" + slug[len(pref):]
+    parts = slug.split("/")
+    if len(parts) != 2:
+        return slug
+    first = parts[0]
+    if first in tuple(known_local):
+        return slug
+    if first.startswith("custom-") or any(c in first for c in (".", "_")):
+        return slug
+    return text_provider + "/" + slug
+
+
+def set_agent_model(config: Dict[str, Any], agent_id: str, model_slug: str, *,
+                    is_v2: bool, models_provider: str, legacy_provider: str) -> Dict[str, Any]:
+    """Sets the per-agent primary model on `config` (in place). If the node has
+    no roster entry for `agent_id`, one is created, so this works on
+    freshly-provisioned nodes that only have `defaults.models`. Returns
+    `{"agent": <entry>, "created": bool}`.
+
+    Critically also adds `model_slug` to `agents.defaults.models` (the plural
+    dict). OpenClaw v2026.4.x builds the agent's allowlist from that key —
+    if the slug isn't there, the resolver silently falls back to the
+    pre-existing default and the user's selection is ignored at runtime.
+    Merges (doesn't replace) so multiple agents can keep distinct models.
+    """
+    if not isinstance(model_slug, str) or "/" not in model_slug:
+        raise AgentModelError(
+            "invalid-model-slug",
+            f"model must be 'provider/model', got {model_slug!r}",
+        )
+    agents = config.setdefault("agents", {})
+    if not isinstance(agents, dict):
+        raise AgentModelError("agents-malformed", "agents is not an object")
+    created = False
+    agent: Any = None
+    if is_v2:
+        # 2.0+: el roster vive en `agents.entries` (dict) y `agents.list`
+        # INVALIDA el config — el gateway rechaza el reload y al reiniciar no
+        # levanta ("agents: Unrecognized key: list", HEB 2026-10-12). Un
+        # `list` dejado por un writer viejo se absorbe y se quita (mismo
+        # self-heal que config-sync `_roster_load`/`_roster_store`).
+        entries = agents.setdefault("entries", {})
+        if not isinstance(entries, dict):
+            raise AgentModelError("agent-entries-malformed", "agents.entries is not an object")
+        legacy = agents.pop("list", None)
+        if isinstance(legacy, list):
+            for a in legacy:
+                if isinstance(a, dict) and a.get("id") and a["id"] not in entries:
+                    entries[a["id"]] = {
+                        k: v for k, v in a.items() if k not in ("id", "default")
+                    }
+        agent = entries.get(agent_id)
+        if not isinstance(agent, dict):
+            agent = {}
+            entries[agent_id] = agent
+            created = True
+    else:
+        lst = agents.setdefault("list", [])
+        if not isinstance(lst, list):
+            raise AgentModelError("agent-list-malformed", "agents.list is not an array")
+        for a in lst:
+            if isinstance(a, dict) and a.get("id") == agent_id:
+                agent = a
+                break
+        if agent is None:
+            agent = {"id": agent_id, "default": agent_id == "main"}
+            lst.append(agent)
+            created = True
+    if not isinstance(agent.get("model"), dict):
+        agent["model"] = {}
+    agent["model"]["primary"] = model_slug
+    defaults = agents.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        raise AgentModelError("defaults-malformed", "agents.defaults is not an object")
+    defaults_models = defaults.setdefault("models", {})
+    if not isinstance(defaults_models, dict):
+        raise AgentModelError(
+            "defaults-models-malformed",
+            "agents.defaults.models is not an object",
+        )
+    if model_slug not in defaults_models:
+        defaults_models[model_slug] = {}
+    # Also upsert the slug under providers[p].models[] so the gateway accepts
+    # delegate calls immediately (telemetry 1.8.15). Idempotent and skips
+    # silently when the inferred provider isn't configured yet (e.g. a
+    # freshly-paired node before key apply).
+    provider_prefixes = (
+        models_provider, legacy_provider, "groq", "ollama", "lmstudio",
+        "llama-cpp",
+    )
+    parts = model_slug.split("/", 1)
+    if len(parts) == 2 and parts[0] in provider_prefixes:
+        provider, catalog_id = parts
+        p_block = (config.get("models") or {}).get("providers", {}).get(provider)
+        if isinstance(p_block, dict):
+            models_list = p_block.setdefault("models", [])
+            if isinstance(models_list, list) and not any(
+                isinstance(m, dict) and m.get("id") == catalog_id
+                for m in models_list
+            ):
+                entry: Dict[str, Any] = {
+                    "id": catalog_id,
+                    "name": catalog_id,
+                    "contextWindow": (
+                        200000
+                        if provider in (models_provider, legacy_provider)
+                        else 32768
+                    ),
+                    "maxTokens": 4096,
+                }
+                if provider == models_provider:
+                    # Provider custom: sin esto OpenClaw no pide `usage`.
+                    entry["compat"] = {"supportsUsageInStreaming": True}
+                models_list.append(entry)
+    return {"agent": agent, "created": created}
+AGENTMODELPYEOF
+}
+
 write_tnode_config_sync_py() {
     local dest="$1"
     cat > "$dest" <<'CFGSYNCPYEOF'
@@ -17532,7 +17708,14 @@ from __future__ import annotations
 #          absoluto a su dominio y OpenClaw no manda la auth a otro origen;
 #          el proxy de medios (tnode_server/media-proxy-worker) reescribe ese
 #          URL. Sin el campo, todo igual que 2.12.0.
-__VERSION__ = "2.12.1"
+# 2.13.0 — state/current anuncia `cron-tz`: chat-sync ya pasa la zona del
+#          dueño a `openclaw cron add/edit --tz` y la app habilita "A una
+#          hora" en OpenClaw (tnode_server#6).
+# 2.14.0 — comando `agent.model.set` (modo automático de Mente: el servidor
+#          encola el ganador del modo del dueño) con la misma escritura que la
+#          RPC de telemetry, vía tnode_agent_model.py; state/current anuncia
+#          `model-set-cmd` (tnode_server#24).
+__VERSION__ = "2.14.0"
 
 import hashlib
 import hmac
@@ -18293,7 +18476,7 @@ def push_openclaw_config(token: dict) -> dict:
         }
     # El servidor elige el nombre del comando de key según esta capacidad
     # (functions/src/model_block.ts → applyModelKeyCommandFor).
-    state["capabilities"] = [MODEL_KEY_V2_CAP]
+    state["capabilities"] = [MODEL_KEY_V2_CAP, CRON_TZ_CAP, MODEL_SET_CAP]
     write_state(token, state)
     return state
 
@@ -18570,6 +18753,9 @@ MODELS_PROVIDER = "tbrain-models"
 MEDIA_PROVIDER = "openrouter"
 MODELS_GATEWAY_AUTH_SECRET = "TBRAIN_MODELS_GATEWAY_AUTH"
 MODEL_KEY_V2_CAP = "model-key-v2"
+# chat-sync passes the owner's zone to `openclaw cron add/edit --tz`; the
+# app offers "A una hora" on OpenClaw only when this is announced.
+CRON_TZ_CAP = "cron-tz"
 GATEWAY_AUTH_HEADER = "cf-aig-authorization"
 # @deprecated transición — nombres previos que aún leen la app 1.14.x
 # (`llmMode`) y que mandan el app/CF viejos (comando). Borrar en limpieza.
@@ -19255,6 +19441,44 @@ def handle_set_agent_params(token: dict, params: dict) -> dict:
         _log(f"post set_agent_params push failed: {e}")
 
     return {"status": "done", "result": {"agentId": agent_id, "params": p}}
+
+
+# Auto mode (tnode_server#24): the server queues `agent.model.set` with the
+# daily winner of the owner's mode; same write as the app's RPC (telemetry),
+# via the shared tnode_agent_model.py. Announced as MODEL_SET_CAP.
+MODEL_SET_CAP = "model-set-cmd"
+
+
+def handle_agent_model_set(token: dict, params: dict) -> dict:
+    try:
+        import tnode_agent_model as lib
+    except ImportError as e:
+        return {"status": "error", "result": {"error": f"agent_model_lib_missing: {e}"}}
+    agent_id = str(params.get("agentId") or "main").strip()
+    cfg = read_openclaw_json()
+    if not cfg:
+        return {"status": "error", "result": {"error": "openclaw_json_missing"}}
+    text_provider = lib.text_provider_for(cfg, MODELS_PROVIDER, _LEGACY_TEXT_PROVIDER)
+    # Same local providers telemetry respects (its _KNOWN_LOCAL_PROVIDERS).
+    known_local = (MODELS_PROVIDER, MEDIA_PROVIDER, "groq", "moonshot", "ollama",
+                   "lmstudio", "llama-cpp")
+    model = lib.normalize_agent_slug(str(params.get("model") or ""), text_provider,
+                                     MODELS_PROVIDER, _LEGACY_TEXT_PROVIDER, known_local)
+    try:
+        res = lib.set_agent_model(cfg, agent_id, model, is_v2=_openclaw_is_v2(),
+                                  models_provider=MODELS_PROVIDER,
+                                  legacy_provider=_LEGACY_TEXT_PROVIDER)
+    except lib.AgentModelError as e:
+        return {"status": "error", "result": {"error": e.code, "message": e.message}}
+    _write_openclaw_json(cfg)
+    restart = _restart_openclaw_with_verify()
+    _log(f"agent.model.set {agent_id} → {model} ({params.get('reason') or 'server'}, "
+         f"created={res['created']} restart={restart.get('ok')})")
+    return {
+        "status": "done",
+        "result": {"agentId": agent_id, "primary": model, "created": res["created"],
+                   "gatewayReloaded": bool(restart.get("ok"))},
+    }
 
 
 def handle_restart_openclaw(token: dict, params: dict) -> dict:
@@ -26311,6 +26535,7 @@ _HANDLERS = {
     },
     "update_llm_provider": handle_update_llm_provider,
     "set_agent_params": handle_set_agent_params,
+    "agent.model.set": handle_agent_model_set,
     "restart_openclaw": handle_restart_openclaw,
     "detect_local_models": handle_detect_local_models,
     "apply_model_key": handle_apply_model_key,
@@ -27992,6 +28217,7 @@ install_tnode_config_sync() {
     mkdir -p "$DEST_SCRIPTS" "$OPENCLAW_HOME/logs"
 
     write_tnode_config_sync_py "$DEST_SCRIPTS/tnode_config_sync.py"
+    write_tnode_agent_model_py "$DEST_SCRIPTS/tnode_agent_model.py"
     chmod +x "$DEST_SCRIPTS/tnode_config_sync.py"
     chown -R "$TNODE_USER":"$TNODE_USER" "$OPENCLAW_HOME" 2>/dev/null || true
 
@@ -28456,7 +28682,10 @@ from __future__ import annotations
 #          zonas de "Especializa tu agente" no llegaban al agente hasta un
 #          reinicio). `SessionWindowsWatcher` detecta filas nuevas (solo
 #          lectura, cada 5 s, sin cron) y dispara el mismo refresco.
-__VERSION__ = "1.49.0"
+# 1.50.0 — cron.add/cron.edit pasan `params.tz` como `--tz <iana>` junto a
+#          `--cron`/`--at` (no con `--every`, el CLI lo rechaza). Recurrencias
+#          "A una hora" disparan a la hora local del dueño (tnode_server#6).
+__VERSION__ = "1.50.0"
 
 import hashlib
 import hmac
@@ -29678,6 +29907,10 @@ def _build_cron_add_args(params: dict) -> list[str]:
     at = params.get("at")
     if isinstance(at, str) and at.strip():
         args += ["--at", at]
+    # The owner's zone for "A una hora" jobs; the CLI rejects --tz with --every.
+    tz = params.get("tz")
+    if isinstance(tz, str) and tz.strip() and (cron_expr or at):
+        args += ["--tz", tz]
     agent = params.get("agent") or "main"
     args += ["--agent", agent]
     session = params.get("sessionTarget")
@@ -29703,6 +29936,9 @@ def _build_cron_edit_args(cron_id: str, params: dict) -> list[str]:
         args += ["--every", params["every"]]
     if "cron" in params and isinstance(params["cron"], str):
         args += ["--cron", params["cron"]]
+        tz = params.get("tz")
+        if isinstance(tz, str) and tz.strip():
+            args += ["--tz", tz]
     if "agent" in params and isinstance(params["agent"], str):
         args += ["--agent", params["agent"]]
     if "description" in params and isinstance(params["description"], str):
@@ -33694,6 +33930,7 @@ install_tnode_telemetry() {
     mkdir -p "$DEST_SCRIPTS" "$OPENCLAW_HOME/logs"
 
     write_tnode_telemetry_py "$DEST_SCRIPTS/tnode_telemetry.py"
+    write_tnode_agent_model_py "$DEST_SCRIPTS/tnode_agent_model.py"
     chmod +x "$DEST_SCRIPTS/tnode_telemetry.py"
     chown -R "$TNODE_USER":"$TNODE_USER" "$OPENCLAW_HOME" 2>/dev/null || true
 
@@ -33844,7 +34081,9 @@ from __future__ import annotations
 #          Spec v1.2: en esos mismos momentos pide al colector
 #          (`POST /tnode/v1/flush`) que envíe el uso pendiente por clase y
 #          modelo a la plataforma — el colector limita a 1 envío/min.
-__VERSION__ = "1.25.0"
+# 1.26.0 — agent.model.set delega en tnode_agent_model.py (compartido con
+#          config-sync, tnode_server#24); mismo comportamiento.
+__VERSION__ = "1.26.0"
 
 # ── tbrain-models (renombre 2026-10) ─────────────────────────────────
 MODELS_PROVIDER = "tbrain-models"
@@ -35694,46 +35933,24 @@ def _agent_model_get(agent_id: str) -> Dict[str, Any]:
     }
 
 
+def _agent_model_lib():
+    """tnode_agent_model.py, written next to this script by the installer
+    (shared with tnode-config-sync, tnode_server#24)."""
+    try:
+        import tnode_agent_model
+    except ImportError as e:
+        raise AgentError("agent-model-lib-missing", f"tnode_agent_model.py: {e}")
+    return tnode_agent_model
+
+
 def _text_provider_for(config: Dict[str, Any]) -> str:
-    """Provider con el que se escribe el cerebro de texto en ESTE nodo:
-    `tbrain-models` si ya existe (o si no hay ninguno); el previo si el nodo
-    todavía no migró — escribir un provider ausente dejaría al agente mudo."""
-    provs = (config.get("models") or {}).get("providers") or {}
-    if isinstance(provs, dict) and MODELS_PROVIDER not in provs \
-            and _LEGACY_TEXT_PROVIDER in provs:
-        return _LEGACY_TEXT_PROVIDER
-    return MODELS_PROVIDER
+    return _agent_model_lib().text_provider_for(config, MODELS_PROVIDER, _LEGACY_TEXT_PROVIDER)
 
 
 def _normalize_agent_slug(slug: str, text_provider: str = MODELS_PROVIDER) -> str:
-    """Slug de TEXTO en su forma vigente para este nodo. Idempotente y safe
-    para providers runtime custom (LM Studio en `custom-127-0-0-1-<port>/...`,
-    Ollama, etc).
-
-    OpenClaw exige el prefix del provider local; sin él interpreta
-    `<vendor>/<id>` como `<provider-local>/<model>` y falla `Unknown model`.
-
-    - `<previo>/<vendor>/<id>` (cliente viejo) o `tbrain-models/<vendor>/<id>`
-      → `<text_provider>/<vendor>/<id>`.
-    - Solo slugs de EXACTAMENTE 2 segmentos son candidatos a prefijar:
-      si el primer segmento es un provider local conocido, `custom-…` o
-      IP-like → se respeta; lo demás es un slug canónico del hub
-      `<vendor>/<id>` → `<text_provider>/<vendor>/<id>`.
-    """
-    if not isinstance(slug, str) or "/" not in slug:
-        return slug
-    for pref in (MODELS_PROVIDER + "/", _LEGACY_TEXT_PROVIDER + "/"):
-        if slug.startswith(pref) and slug.count("/") >= 2:
-            return text_provider + "/" + slug[len(pref):]
-    parts = slug.split("/")
-    if len(parts) != 2:
-        return slug
-    first = parts[0]
-    if first in _KNOWN_LOCAL_PROVIDERS:
-        return slug
-    if first.startswith("custom-") or any(c in first for c in (".", "_")):
-        return slug
-    return text_provider + "/" + slug
+    return _agent_model_lib().normalize_agent_slug(
+        slug, text_provider, MODELS_PROVIDER, _LEGACY_TEXT_PROVIDER, _KNOWN_LOCAL_PROVIDERS
+    )
 
 
 def _normalize_media_slug(slug: str) -> str:
@@ -35749,117 +35966,25 @@ def _normalize_media_slug(slug: str) -> str:
 
 
 def _agent_model_set(agent_id: str, model_slug: str) -> Dict[str, Any]:
-    """Sets the per-agent primary model. If the node has no `agents.list[]`
-    entry for `agent_id`, one is created (`{id, default, model: {primary}}`),
-    so this works on freshly-provisioned nodes that only have
-    `defaults.models`. Atomic file write + best-effort gateway reload.
-
-    Critically also adds `model_slug` to `agents.defaults.models` (the plural
-    dict). OpenClaw v2026.4.x builds the agent's allowlist from that key —
-    if the slug isn't there, the resolver silently falls back to the
-    pre-existing default and the user's selection is ignored at runtime.
-    Merges (doesn't replace) so multiple agents can keep distinct models.
+    """Sets the per-agent primary model (tnode_agent_model.set_agent_model,
+    shared with config-sync's `agent.model.set` command). Atomic file write +
+    best-effort gateway reload.
 
     `model_slug` se normaliza al inicio (`_normalize_agent_slug`) al provider
     de texto vigente del nodo (`tbrain-models/…`), sea que el cliente mande el
     slug canónico del hub sin prefix o con el prefix previo al renombre.
     """
+    lib = _agent_model_lib()
     config = _load_openclaw_json()
     model_slug = _normalize_agent_slug(model_slug, _text_provider_for(config))
-    if not isinstance(model_slug, str) or "/" not in model_slug:
-        raise AgentError(
-            "invalid-model-slug",
-            f"model must be 'provider/model', got {model_slug!r}",
+    try:
+        res = lib.set_agent_model(
+            config, agent_id, model_slug, is_v2=_openclaw_is_v2(),
+            models_provider=MODELS_PROVIDER, legacy_provider=_LEGACY_TEXT_PROVIDER,
         )
-    agents = config.setdefault("agents", {})
-    if not isinstance(agents, dict):
-        raise AgentError("agents-malformed", "agents is not an object")
-    created = False
-    agent: Optional[Dict[str, Any]] = None
-    if _openclaw_is_v2():
-        # 2.0+: el roster vive en `agents.entries` (dict) y `agents.list`
-        # INVALIDA el config — el gateway rechaza el reload y al reiniciar no
-        # levanta ("agents: Unrecognized key: list", HEB 2026-10-12). Un
-        # `list` dejado por un writer viejo se absorbe y se quita (mismo
-        # self-heal que config-sync `_roster_load`/`_roster_store`).
-        entries = agents.setdefault("entries", {})
-        if not isinstance(entries, dict):
-            raise AgentError("agent-entries-malformed", "agents.entries is not an object")
-        legacy = agents.pop("list", None)
-        if isinstance(legacy, list):
-            for a in legacy:
-                if isinstance(a, dict) and a.get("id") and a["id"] not in entries:
-                    entries[a["id"]] = {
-                        k: v for k, v in a.items() if k not in ("id", "default")
-                    }
-        agent = entries.get(agent_id)
-        if not isinstance(agent, dict):
-            agent = {}
-            entries[agent_id] = agent
-            created = True
-    else:
-        lst = agents.setdefault("list", [])
-        if not isinstance(lst, list):
-            raise AgentError("agent-list-malformed", "agents.list is not an array")
-        for a in lst:
-            if isinstance(a, dict) and a.get("id") == agent_id:
-                agent = a
-                break
-        if agent is None:
-            agent = {"id": agent_id, "default": agent_id == "main"}
-            lst.append(agent)
-            created = True
-    if not isinstance(agent.get("model"), dict):
-        agent["model"] = {}
-    agent["model"]["primary"] = model_slug
-    defaults = agents.setdefault("defaults", {})
-    if not isinstance(defaults, dict):
-        raise AgentError("defaults-malformed", "agents.defaults is not an object")
-    defaults_models = defaults.setdefault("models", {})
-    if not isinstance(defaults_models, dict):
-        raise AgentError(
-            "defaults-models-malformed",
-            "agents.defaults.models is not an object",
-        )
-    if model_slug not in defaults_models:
-        defaults_models[model_slug] = {}
-    # v1.8.15: also upsert the slug under providers[p].models[] so the
-    # gateway accepts delegate calls immediately. Earlier versions only
-    # touched defaults.models; the provider catalog stayed stale until
-    # the next key apply, which is the wrong primitive to
-    # rely on (and replaces the catalog wholesale pre-config-sync 1.3.0).
-    # Idempotent and skips silently when the inferred provider isn't
-    # configured yet (e.g. a freshly-paired node before key apply).
-    _provider_prefixes = (
-        MODELS_PROVIDER, _LEGACY_TEXT_PROVIDER, "groq", "ollama", "lmstudio",
-        "llama-cpp",
-    )
-    parts = model_slug.split("/", 1)
-    if len(parts) == 2 and parts[0] in _provider_prefixes:
-        _provider, _catalog_id = parts
-        _p_block = (
-            (config.get("models") or {}).get("providers", {}).get(_provider)
-        )
-        if isinstance(_p_block, dict):
-            _models_list = _p_block.setdefault("models", [])
-            if isinstance(_models_list, list) and not any(
-                isinstance(m, dict) and m.get("id") == _catalog_id
-                for m in _models_list
-            ):
-                _entry = {
-                    "id": _catalog_id,
-                    "name": _catalog_id,
-                    "contextWindow": (
-                        200000
-                        if _provider in (MODELS_PROVIDER, _LEGACY_TEXT_PROVIDER)
-                        else 32768
-                    ),
-                    "maxTokens": 4096,
-                }
-                if _provider == MODELS_PROVIDER:
-                    # Provider custom: sin esto OpenClaw no pide `usage`.
-                    _entry["compat"] = {"supportsUsageInStreaming": True}
-                _models_list.append(_entry)
+    except lib.AgentModelError as e:
+        raise AgentError(e.code, e.message)
+    agent, created = res["agent"], res["created"]
     _save_openclaw_json_atomic(config)
     reload_ok = _reload_gateway()
     logger.info(
