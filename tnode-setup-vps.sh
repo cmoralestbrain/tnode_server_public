@@ -124,7 +124,7 @@ if command -v npm >/dev/null 2>&1; then
 fi
 unset _p
 
-TNODE_SETUP_VERSION="1.154.1"
+TNODE_SETUP_VERSION="1.154.2"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -34109,7 +34109,10 @@ from __future__ import annotations
 #          modelo a la plataforma — el colector limita a 1 envío/min.
 # 1.26.0 — agent.model.set delega en tnode_agent_model.py (compartido con
 #          config-sync, tnode_server#24); mismo comportamiento.
-__VERSION__ = "1.26.0"
+# 1.27.0 — agent.model.set confía en el hot reload en 2.0; `openclaw daemon
+#          restart` sin OPENCLAW_HOME (2026.9.4 se negaba) y sin doble restart
+#          si tarda; el reload async de medios espera hasta 150 s (#33).
+__VERSION__ = "1.27.0"
 
 # ── tbrain-models (renombre 2026-10) ─────────────────────────────────
 MODELS_PROVIDER = "tbrain-models"
@@ -35892,11 +35895,24 @@ def _cli_env() -> dict:
     return env
 
 
-def _reload_gateway() -> bool:
+def _service_cli_env() -> dict:
+    """Env for `openclaw daemon restart`. OpenClaw 2026.9.4 refuses service
+    management ("non-default state dir or config path") when OPENCLAW_HOME is
+    set, so drop it when the config dir is the canonical one (same fix as
+    config-sync 2.14.1)."""
+    env = _cli_env()
+    if OPENCLAW_HOME == Path.home() / ".openclaw":
+        env.pop("OPENCLAW_HOME", None)
+    return env
+
+
+def _reload_gateway(timeout: int = 15) -> bool:
     """Best-effort restart of openclaw-gateway. Tries `openclaw daemon
     restart` first (portable across home/VPS), falls back to systemctl.
     Returns True on success — RPC still succeeds if reload fails because
-    config is already on disk and applies on next boot."""
+    config is already on disk and applies on next boot. A daemon restart
+    that times out is still in progress (the gateway takes ~66 s to come
+    back), so it does NOT fall through: that would restart it twice."""
     import subprocess
     candidates = [
         ["openclaw", "daemon", "restart"],
@@ -35906,13 +35922,19 @@ def _reload_gateway() -> bool:
     for cmd in candidates:
         try:
             result = subprocess.run(
-                cmd, check=False, capture_output=True, text=True, timeout=15,
-                env=_cli_env() if cmd[0] == "openclaw" else None,
+                cmd, check=False, capture_output=True, text=True,
+                timeout=timeout if cmd[0] == "openclaw" else 15,
+                env=_service_cli_env() if cmd[0] == "openclaw" else None,
             )
             if result.returncode == 0:
                 logger.info("gateway reload OK via %s", cmd[0])
                 return True
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except FileNotFoundError:
+            continue
+        except subprocess.TimeoutExpired:
+            if cmd[0] == "openclaw":
+                logger.warning("gateway restart still running after %ss; not retrying", timeout)
+                return False
             continue
     logger.warning("gateway reload failed — config will apply on next boot")
     return False
@@ -35927,7 +35949,8 @@ def _reload_gateway_async() -> None:
     source of truth, so we run the reload in a daemon thread and return now."""
     import threading
     threading.Thread(
-        target=_reload_gateway, name="gateway-reload", daemon=True
+        target=_reload_gateway, kwargs={"timeout": 150}, name="gateway-reload",
+        daemon=True
     ).start()
 
 
@@ -36012,10 +36035,13 @@ def _agent_model_set(agent_id: str, model_slug: str) -> Dict[str, Any]:
         raise AgentError(e.code, e.message)
     agent, created = res["agent"], res["created"]
     _save_openclaw_json_atomic(config)
-    reload_ok = _reload_gateway()
+    # En 2.0 la gateway hot-recarga model.primary (como config-sync 2.14.1);
+    # reiniciarla la tiraría ~1 min por cambio de modelo.
+    hot = _openclaw_is_v2()
+    reload_ok = True if hot else _reload_gateway()
     logger.info(
-        "agent.model.set %s → %s (created=%s reload=%s)",
-        agent_id, model_slug, created, reload_ok,
+        "agent.model.set %s → %s (created=%s reload=%s ok=%s)",
+        agent_id, model_slug, created, "hot" if hot else "restart", reload_ok,
     )
     return {
         "agentId": agent_id,
@@ -36025,6 +36051,7 @@ def _agent_model_set(agent_id: str, model_slug: str) -> Dict[str, Any]:
         "explicit": True,
         "created": created,
         "gatewayReloaded": reload_ok,
+        "reload": "hot" if hot else "restart",
     }
 
 
