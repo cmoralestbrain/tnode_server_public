@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-10-30T21:58:27.543545+00:00",
-  "tag": "tnode-setup-v1.154.0",
+  "generatedAt": "2026-10-31T01:12:04.087228+00:00",
+  "tag": "tnode-setup-v1.154.1",
   "components": [
     {
       "id": "tnode-chat-sync",
@@ -12,7 +12,7 @@
     {
       "id": "tnode-config-sync",
       "kind": "daemon-embedded",
-      "version": "2.14.0",
+      "version": "2.14.1",
       "source": "scripts/tnode_config_sync.py"
     },
     {

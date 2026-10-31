@@ -124,7 +124,7 @@ if command -v npm >/dev/null 2>&1; then
 fi
 unset _p
 
-TNODE_SETUP_VERSION="1.154.0"
+TNODE_SETUP_VERSION="1.154.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -17715,7 +17715,13 @@ from __future__ import annotations
 #          encola el ganador del modo del dueño) con la misma escritura que la
 #          RPC de telemetry, vía tnode_agent_model.py; state/current anuncia
 #          `model-set-cmd` (tnode_server#24).
-__VERSION__ = "2.14.0"
+# 2.14.1 — `openclaw daemon restart` sin OPENCLAW_HOME (OpenClaw 2026.9.4 se
+#          niega a gestionar el servicio con ese env: todo restart fallaba) y
+#          timeout de 150 s (la gateway tarda ~66 s en levantar).
+#          `agent.model.set` confía en el hot reload en 2.0 en vez de reiniciar;
+#          el drain-oneshot repite hasta vaciar la cola (un .wake durante el
+#          drain no re-dispara la unit) (tnode_server#24).
+__VERSION__ = "2.14.1"
 
 import hashlib
 import hmac
@@ -18544,6 +18550,16 @@ def _cli_env() -> dict:
     return env
 
 
+def _service_cli_env() -> dict:
+    """Env for `openclaw daemon|gateway restart`. OpenClaw 2026.9.4 refuses
+    service management ("non-default state dir or config path") when
+    OPENCLAW_HOME is set, so drop it when the config dir is the canonical one."""
+    env = _cli_env()
+    if OPENCLAW_DIR == Path.home() / ".openclaw":
+        env.pop("OPENCLAW_HOME", None)
+    return env
+
+
 # ── OpenClaw 2.0 Credential Management (SecretRefs + shared store) ──────────
 # En el train 2.0 las API keys de model-providers NO se persisten en plaintext:
 # el valor va al shared secret store (sqlite del gateway, write-only) y el
@@ -18623,7 +18639,7 @@ def _run_openclaw(
             text=True,
             timeout=timeout,
             check=False,
-            env=_cli_env(),
+            env=_service_cli_env() if args[-1:] == ("restart",) else _cli_env(),
             input=input_text,
         )
         result = {
@@ -18699,7 +18715,7 @@ def _gateway_main_pid() -> int | None:
         return None
 
 
-def _restart_openclaw_with_verify(timeout: int = 60) -> dict:
+def _restart_openclaw_with_verify(timeout: int = 150) -> dict:
     """Restart openclaw and verify the MainPID actually rotated.
 
     Some hosts return ok=True from `openclaw daemon restart` while the
@@ -19471,13 +19487,16 @@ def handle_agent_model_set(token: dict, params: dict) -> dict:
     except lib.AgentModelError as e:
         return {"status": "error", "result": {"error": e.code, "message": e.message}}
     _write_openclaw_json(cfg)
-    restart = _restart_openclaw_with_verify()
+    # En 2.0 la gateway hot-recarga model.primary; reiniciarla la tiraría ~1 min
+    # por cada cambio de modelo.
+    hot = _openclaw_is_v2()
+    reloaded = hot or bool(_restart_openclaw_with_verify().get("ok"))
     _log(f"agent.model.set {agent_id} → {model} ({params.get('reason') or 'server'}, "
-         f"created={res['created']} restart={restart.get('ok')})")
+         f"created={res['created']} reload={'hot' if hot else 'restart'} ok={reloaded})")
     return {
         "status": "done",
         "result": {"agentId": agent_id, "primary": model, "created": res["created"],
-                   "gatewayReloaded": bool(restart.get("ok"))},
+                   "gatewayReloaded": reloaded, "reload": "hot" if hot else "restart"},
     }
 
 
@@ -27868,7 +27887,14 @@ def run_command_drain_oneshot() -> int:
     try:
         cfg = load_config()
         token = mint_token(cfg)
-        n = _drain_commands(token)
+        # Un .wake que cae durante el drain no re-dispara la unit: repetir hasta
+        # vaciar la cola (acotado; el backstop de 300 s cubre el resto).
+        n = 0
+        for _ in range(4):
+            got = _drain_commands(token)
+            n += got
+            if got == 0:
+                break
         # F7c (1.81.0): el plugin toca .wake al canjear un claim de checkout —
         # absorbe aquí los clientes vendidos para no esperar el tick idle de
         # 300s del daemon (el claim de tobal 2026-08-30 le perdió por 19s al
