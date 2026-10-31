@@ -124,7 +124,7 @@ if command -v npm >/dev/null 2>&1; then
 fi
 unset _p
 
-TNODE_SETUP_VERSION="1.154.3"
+TNODE_SETUP_VERSION="1.154.4"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -34115,7 +34115,10 @@ from __future__ import annotations
 # 1.28.0 — SEGURIDAD: las RPC locales (mind.*, agent.*, storage.*) solo se
 #          atienden después de que el gateway aceptó el `connect` del cliente;
 #          antes respondían a cualquiera que abriera el WS del túnel.
-__VERSION__ = "1.28.0"
+# 1.29.0 — SEGURIDAD: los eventos de telemetría (usage, health, channels) solo
+#          se envían después del `connect` aceptado; antes el túnel se los
+#          entregaba a cualquiera que abriera el WS.
+__VERSION__ = "1.29.0"
 
 # ── tbrain-models (renombre 2026-10) ─────────────────────────────────
 MODELS_PROVIDER = "tbrain-models"
@@ -35152,6 +35155,8 @@ class TelemetryProxy:
         encoded = json.dumps(event, separators=(",", ":"))
         stale: list["ClientSession"] = []
         for client in list(self._clients):
+            if not client.authed:
+                continue
             try:
                 await client.send_downstream(encoded)
             except ConnectionClosed:
@@ -36186,6 +36191,10 @@ class ClientSession:
         self._connect_id: Any = None
         self._authed = False
 
+    @property
+    def authed(self) -> bool:
+        return self._authed
+
     async def send_downstream(self, message: str) -> None:
         await self._client.send(message)
 
@@ -36206,15 +36215,6 @@ class ClientSession:
                 pass
             return
         try:
-            # Fire-and-forget snapshots — ship them before the first
-            # upstream frame so every widget has data to render.
-            try:
-                for snap in self._proxy.initial_snapshots():
-                    await self._client.send(
-                        json.dumps(snap, separators=(",", ":"))
-                    )
-            except Exception as e:  # noqa: BLE001
-                logger.warning("failed to send snapshot: %s", e)
             down = asyncio.create_task(self._forward(self._client, self._upstream, "c→u"))
             up = asyncio.create_task(self._forward(self._upstream, self._client, "u→c"))
             done, pending = await asyncio.wait(
@@ -36247,13 +36247,25 @@ class ClientSession:
                     if await self._maybe_handle_storage_rpc(message):
                         continue
                     message = _route_chat_session_key(message)
-                else:
-                    self._note_connect_result(message)
+                    await dst.send(message)
+                    continue
+                just_authed = self._note_connect_result(message)
                 await dst.send(message)
+                if just_authed:
+                    await self._send_snapshots()
         except ConnectionClosed:
             pass
 
-    # ── Auth de las RPC locales (1.28.0) ──
+    async def _send_snapshots(self) -> None:
+        """Fire-and-forget: every widget has data to render right after the
+        connect. Telemetry is private, so never before it."""
+        try:
+            for snap in self._proxy.initial_snapshots():
+                await self._client.send(json.dumps(snap, separators=(",", ":")))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("failed to send snapshot: %s", e)
+
+    # ── Auth de las RPC locales (1.28.0) y de los eventos (1.29.0) ──
     # mind.* / agent.* / storage.* se contestan aquí, sin pasar por el gateway.
     # Solo se atienden después de que el gateway aceptó el `connect` de ESTE
     # cliente (res ok al id del connect): la misma credencial que exige el chat.
@@ -36274,12 +36286,15 @@ class ClientSession:
         if frame and frame.get("type") == "req" and frame.get("method") == "connect":
             self._connect_id = frame.get("id")
 
-    def _note_connect_result(self, message: Any) -> None:
+    def _note_connect_result(self, message: Any) -> bool:
+        """True only for the frame that accepts this client's connect."""
         if self._authed or self._connect_id is None:
-            return
+            return False
         frame = self._req(message)
         if frame and frame.get("type") == "res" and frame.get("id") == self._connect_id and frame.get("ok") is True:
             self._authed = True
+            return True
+        return False
 
     async def _reject_unauthed_local_rpc(self, message: Any) -> bool:
         if self._authed:
