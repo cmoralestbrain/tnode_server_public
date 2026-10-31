@@ -124,7 +124,7 @@ if command -v npm >/dev/null 2>&1; then
 fi
 unset _p
 
-TNODE_SETUP_VERSION="1.154.2"
+TNODE_SETUP_VERSION="1.154.3"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -34112,7 +34112,10 @@ from __future__ import annotations
 # 1.27.0 — agent.model.set confía en el hot reload en 2.0; `openclaw daemon
 #          restart` sin OPENCLAW_HOME (2026.9.4 se negaba) y sin doble restart
 #          si tarda; el reload async de medios espera hasta 150 s (#33).
-__VERSION__ = "1.27.0"
+# 1.28.0 — SEGURIDAD: las RPC locales (mind.*, agent.*, storage.*) solo se
+#          atienden después de que el gateway aceptó el `connect` del cliente;
+#          antes respondían a cualquiera que abriera el WS del túnel.
+__VERSION__ = "1.28.0"
 
 # ── tbrain-models (renombre 2026-10) ─────────────────────────────────
 MODELS_PROVIDER = "tbrain-models"
@@ -36180,6 +36183,8 @@ class ClientSession:
         self._upstream = None
         self._upstream_lock = asyncio.Lock()
         self._remote_addr = getattr(ws_client, "remote_address", None)
+        self._connect_id: Any = None
+        self._authed = False
 
     async def send_downstream(self, message: str) -> None:
         await self._client.send(message)
@@ -36232,6 +36237,9 @@ class ClientSession:
         try:
             async for message in src:
                 if direction == "c→u":
+                    self._note_connect(message)
+                    if await self._reject_unauthed_local_rpc(message):
+                        continue
                     if await self._maybe_handle_mind_rpc(message):
                         continue
                     if await self._maybe_handle_agent_rpc(message):
@@ -36239,9 +36247,58 @@ class ClientSession:
                     if await self._maybe_handle_storage_rpc(message):
                         continue
                     message = _route_chat_session_key(message)
+                else:
+                    self._note_connect_result(message)
                 await dst.send(message)
         except ConnectionClosed:
             pass
+
+    # ── Auth de las RPC locales (1.28.0) ──
+    # mind.* / agent.* / storage.* se contestan aquí, sin pasar por el gateway.
+    # Solo se atienden después de que el gateway aceptó el `connect` de ESTE
+    # cliente (res ok al id del connect): la misma credencial que exige el chat.
+    # Antes cualquiera que abriera el WS del túnel podía leerlas y cambiarlas.
+
+    @staticmethod
+    def _req(message: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(message, str):
+            return None
+        try:
+            frame = json.loads(message)
+        except (ValueError, TypeError):
+            return None
+        return frame if isinstance(frame, dict) else None
+
+    def _note_connect(self, message: Any) -> None:
+        frame = self._req(message)
+        if frame and frame.get("type") == "req" and frame.get("method") == "connect":
+            self._connect_id = frame.get("id")
+
+    def _note_connect_result(self, message: Any) -> None:
+        if self._authed or self._connect_id is None:
+            return
+        frame = self._req(message)
+        if frame and frame.get("type") == "res" and frame.get("id") == self._connect_id and frame.get("ok") is True:
+            self._authed = True
+
+    async def _reject_unauthed_local_rpc(self, message: Any) -> bool:
+        if self._authed:
+            return False
+        frame = self._req(message)
+        if not frame or frame.get("type") != "req":
+            return False
+        method = frame.get("method")
+        if not isinstance(method, str) or not method.startswith(_LOCAL_RPC_PREFIXES):
+            return False
+        logger.warning("local rpc %s rejected before connect: remote=%s", method, self._remote_addr)
+        try:
+            await self.send_downstream(json.dumps({
+                "type": "res", "id": frame.get("id", ""), "ok": False,
+                "error": {"code": "unauthorized", "message": "connect first"},
+            }, separators=(",", ":")))
+        except ConnectionClosed:
+            pass
+        return True
 
     async def _maybe_handle_mind_rpc(self, message: Any) -> bool:
         """If `message` is a `mind.*` RPC, answer it locally and return True
@@ -36394,6 +36451,10 @@ class ClientSession:
         except ConnectionClosed:
             pass
         return True
+
+
+# RPCs the proxy answers itself (never reach the gateway's auth).
+_LOCAL_RPC_PREFIXES = ("mind.", "agent.", "storage.")
 
 
 # ── Front TCP dispatcher (v1.20.0) ───────────────────────────────────
