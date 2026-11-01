@@ -124,7 +124,7 @@ if command -v npm >/dev/null 2>&1; then
 fi
 unset _p
 
-TNODE_SETUP_VERSION="1.154.4"
+TNODE_SETUP_VERSION="1.154.5"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -34118,7 +34118,10 @@ from __future__ import annotations
 # 1.29.0 — SEGURIDAD: los eventos de telemetría (usage, health, channels) solo
 #          se envían después del `connect` aceptado; antes el túnel se los
 #          entregaba a cualquiera que abriera el WS.
-__VERSION__ = "1.29.0"
+# 1.30.0 — las RPC locales que llegan antes del `connect` aceptado se retienen
+#          y se atienden tras el hello-ok, en vez de contestar `ok:false`: la
+#          app toma ese error por rechazo de auth y deja de reconectar.
+__VERSION__ = "1.30.0"
 
 # ── tbrain-models (renombre 2026-10) ─────────────────────────────────
 MODELS_PROVIDER = "tbrain-models"
@@ -36190,6 +36193,8 @@ class ClientSession:
         self._remote_addr = getattr(ws_client, "remote_address", None)
         self._connect_id: Any = None
         self._authed = False
+        self._held_rpcs: List[str] = []
+        self._held_bytes = 0
 
     @property
     def authed(self) -> bool:
@@ -36238,23 +36243,29 @@ class ClientSession:
             async for message in src:
                 if direction == "c→u":
                     self._note_connect(message)
-                    if await self._reject_unauthed_local_rpc(message):
+                    if await self._hold_unauthed_local_rpc(message):
                         continue
-                    if await self._maybe_handle_mind_rpc(message):
-                        continue
-                    if await self._maybe_handle_agent_rpc(message):
-                        continue
-                    if await self._maybe_handle_storage_rpc(message):
+                    if await self._answer_local_rpc(message):
                         continue
                     message = _route_chat_session_key(message)
                     await dst.send(message)
                     continue
-                just_authed = self._note_connect_result(message)
+                connect_result = self._note_connect_result(message)
                 await dst.send(message)
-                if just_authed:
+                if connect_result is True:
                     await self._send_snapshots()
+                    await self._answer_held_rpcs()
+                elif connect_result is False:
+                    await self._refuse_held_rpcs()
         except ConnectionClosed:
             pass
+
+    async def _answer_local_rpc(self, message: Any) -> bool:
+        return (
+            await self._maybe_handle_mind_rpc(message)
+            or await self._maybe_handle_agent_rpc(message)
+            or await self._maybe_handle_storage_rpc(message)
+        )
 
     async def _send_snapshots(self) -> None:
         """Fire-and-forget: every widget has data to render right after the
@@ -36270,6 +36281,8 @@ class ClientSession:
     # Solo se atienden después de que el gateway aceptó el `connect` de ESTE
     # cliente (res ok al id del connect): la misma credencial que exige el chat.
     # Antes cualquiera que abriera el WS del túnel podía leerlas y cambiarlas.
+    # Las que llegan antes del connect se retienen (1.30.0): la app no espera
+    # al hello-ok para pedirlas y un `ok:false` en esa fase la desconecta.
 
     @staticmethod
     def _req(message: Any) -> Optional[Dict[str, Any]]:
@@ -36286,17 +36299,18 @@ class ClientSession:
         if frame and frame.get("type") == "req" and frame.get("method") == "connect":
             self._connect_id = frame.get("id")
 
-    def _note_connect_result(self, message: Any) -> bool:
-        """True only for the frame that accepts this client's connect."""
+    def _note_connect_result(self, message: Any) -> Optional[bool]:
+        """True if this frame accepts this client's connect, False if it
+        refuses it, None for any other frame."""
         if self._authed or self._connect_id is None:
-            return False
+            return None
         frame = self._req(message)
-        if frame and frame.get("type") == "res" and frame.get("id") == self._connect_id and frame.get("ok") is True:
-            self._authed = True
-            return True
-        return False
+        if not frame or frame.get("type") != "res" or frame.get("id") != self._connect_id:
+            return None
+        self._authed = frame.get("ok") is True
+        return self._authed
 
-    async def _reject_unauthed_local_rpc(self, message: Any) -> bool:
+    async def _hold_unauthed_local_rpc(self, message: Any) -> bool:
         if self._authed:
             return False
         frame = self._req(message)
@@ -36305,7 +36319,34 @@ class ClientSession:
         method = frame.get("method")
         if not isinstance(method, str) or not method.startswith(_LOCAL_RPC_PREFIXES):
             return False
-        logger.warning("local rpc %s rejected before connect: remote=%s", method, self._remote_addr)
+        size = len(message)
+        if (
+            len(self._held_rpcs) >= _HELD_RPC_MAX
+            or self._held_bytes + size > _HELD_RPC_MAX_BYTES
+        ):
+            logger.warning("local rpc %s rejected before connect: remote=%s", method, self._remote_addr)
+            await self._send_unauthorized(frame)
+            return True
+        self._held_rpcs.append(message)
+        self._held_bytes += size
+        return True
+
+    def _take_held_rpcs(self) -> List[str]:
+        held, self._held_rpcs = self._held_rpcs, []
+        self._held_bytes = 0
+        return held
+
+    async def _answer_held_rpcs(self) -> None:
+        for message in self._take_held_rpcs():
+            await self._answer_local_rpc(message)
+
+    async def _refuse_held_rpcs(self) -> None:
+        for message in self._take_held_rpcs():
+            frame = self._req(message)
+            if frame:
+                await self._send_unauthorized(frame)
+
+    async def _send_unauthorized(self, frame: Dict[str, Any]) -> None:
         try:
             await self.send_downstream(json.dumps({
                 "type": "res", "id": frame.get("id", ""), "ok": False,
@@ -36313,7 +36354,6 @@ class ClientSession:
             }, separators=(",", ":")))
         except ConnectionClosed:
             pass
-        return True
 
     async def _maybe_handle_mind_rpc(self, message: Any) -> bool:
         """If `message` is a `mind.*` RPC, answer it locally and return True
@@ -36470,6 +36510,9 @@ class ClientSession:
 
 # RPCs the proxy answers itself (never reach the gateway's auth).
 _LOCAL_RPC_PREFIXES = ("mind.", "agent.", "storage.")
+# Tope de lo retenido antes del connect: viene de un cliente sin autenticar.
+_HELD_RPC_MAX = 32
+_HELD_RPC_MAX_BYTES = 1024 * 1024
 
 
 # ── Front TCP dispatcher (v1.20.0) ───────────────────────────────────
