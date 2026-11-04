@@ -103,7 +103,7 @@ if command -v npm >/dev/null 2>&1; then
 fi
 unset _p
 
-TNODE_SETUP_VERSION="1.154.5"
+TNODE_SETUP_VERSION="1.154.6"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -16641,6 +16641,20 @@ class AgentModelError(Exception):
         self.message = message
 
 
+def allow_in_model_policy(defaults: Dict[str, Any], model_slug: str) -> bool:
+    """Adds `model_slug` to `agents.defaults.modelPolicy.allow` when that list
+    exists and is non-empty. OpenClaw 2026.9 moved the allowlist there (doctor
+    migration `modelPolicyAllowlist`); a slug missing from it is dropped and the
+    turn falls back to `defaults.model.primary` (tnode_server#51). An empty or
+    absent list permits any model, so it is left alone. Returns True if added."""
+    policy = defaults.get("modelPolicy")
+    allow = policy.get("allow") if isinstance(policy, dict) else None
+    if not isinstance(allow, list) or not allow or model_slug in allow:
+        return False
+    allow.append(model_slug)
+    return True
+
+
 def text_provider_for(config: Dict[str, Any], models_provider: str, legacy_provider: str) -> str:
     """Provider con el que se escribe el cerebro de texto en ESTE nodo:
     `models_provider` si ya existe (o si no hay ninguno); el previo si el nodo
@@ -16754,6 +16768,7 @@ def set_agent_model(config: Dict[str, Any], agent_id: str, model_slug: str, *,
         )
     if model_slug not in defaults_models:
         defaults_models[model_slug] = {}
+    allow_in_model_policy(defaults, model_slug)
     # Also upsert the slug under providers[p].models[] so the gateway accepts
     # delegate calls immediately (telemetry 1.8.15). Idempotent and skips
     # silently when the inferred provider isn't configured yet (e.g. a
@@ -17566,7 +17581,12 @@ from __future__ import annotations
 #          `agent.model.set` confía en el hot reload en 2.0 en vez de reiniciar;
 #          el drain-oneshot repite hasta vaciar la cola (un .wake durante el
 #          drain no re-dispara la unit) (tnode_server#24).
-__VERSION__ = "2.14.1"
+# 2.14.2 — todo modelo que se registra (key, gateway, sub-agente,
+#          `agent.model.set`) entra también a `agents.defaults.modelPolicy.allow`
+#          si esa lista existe y no está vacía. OpenClaw 2026.9 movió ahí la
+#          allowlist; un modelo fuera de ella se ignora y el turno cae al
+#          primary por defecto (Mini en prod, tnode_server#51).
+__VERSION__ = "2.14.2"
 
 import hashlib
 import hmac
@@ -18700,8 +18720,23 @@ def _ensure_model_registered(cfg: dict, model_slug: str) -> bool:
     if isinstance(defaults_models, dict) and catalog_id not in defaults_models:
         defaults_models[catalog_id] = {}
         changed = True
+    if _allow_in_model_policy(cfg["agents"]["defaults"], model_slug):
+        changed = True
 
     return changed
+
+
+def _allow_in_model_policy(defaults: dict, model_slug: str) -> bool:
+    """Same rule as tnode_agent_model.allow_in_model_policy (that module is
+    optional here): OpenClaw 2026.9 keeps the allowlist in
+    `agents.defaults.modelPolicy.allow`; a registered model missing from a
+    non-empty list is ignored at runtime (tnode_server#51)."""
+    policy = defaults.get("modelPolicy")
+    allow = policy.get("allow") if isinstance(policy, dict) else None
+    if not isinstance(allow, list) or not allow or model_slug in allow:
+        return False
+    allow.append(model_slug)
+    return True
 
 
 def _ensure_heartbeat_default() -> None:
@@ -19017,6 +19052,7 @@ def _apply_provider_to_openclaw(
 
     agents_defaults = cfg.setdefault("agents", {}).setdefault("defaults", {})
     agents_defaults.setdefault("models", {}).setdefault(prefixed_slug, {})
+    _allow_in_model_policy(agents_defaults, prefixed_slug)
     agents_defaults.pop("model", None)  # drop legacy singular key
 
     # Seed default media-generation models so a freshly-provisioned node can
@@ -19146,6 +19182,7 @@ def _apply_models_providers(
     prefixed = _build_prefixed_slug(MODELS_PROVIDER, internal_id)
     defaults = cfg.setdefault("agents", {}).setdefault("defaults", {})
     defaults.setdefault("models", {}).setdefault(prefixed, {})
+    _allow_in_model_policy(defaults, prefixed)
     cur = defaults.get("model") if isinstance(defaults.get("model"), dict) else {}
     if not cur.get("primary"):
         # Solo si no hay ninguno: un primary local (LM Studio) o elegido en
@@ -34016,7 +34053,10 @@ from __future__ import annotations
 # 1.30.0 — las RPC locales que llegan antes del `connect` aceptado se retienen
 #          y se atienden tras el hello-ok, en vez de contestar `ok:false`: la
 #          app toma ese error por rechazo de auth y deja de reconectar.
-__VERSION__ = "1.30.0"
+# 1.30.1 — agent.model.set (vía tnode_agent_model.py) agrega el modelo elegido
+#          a `agents.defaults.modelPolicy.allow` cuando esa lista existe: en
+#          OpenClaw 2026.9 un modelo fuera de ella se ignora (tnode_server#51).
+__VERSION__ = "1.30.1"
 
 # ── tbrain-models (renombre 2026-10) ─────────────────────────────────
 MODELS_PROVIDER = "tbrain-models"
