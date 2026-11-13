@@ -103,7 +103,7 @@ if command -v npm >/dev/null 2>&1; then
 fi
 unset _p
 
-TNODE_SETUP_VERSION="1.154.6"
+TNODE_SETUP_VERSION="1.155.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -12936,7 +12936,7 @@ write_tnode_skill_manager_py() {
 #!/usr/bin/env python3
 """tnode-skill-manager — ciclo de vida de los skills TNode en el nodo.
 
-__VERSION__ = "1.4.1"
+__VERSION__ = "1.5.0"
 
 Saca los skills de config-sync. Antes viajaban embebidos como constantes
 dentro del daemon (~8,000 líneas) y se materializaban en cada arranque; ahora
@@ -12982,7 +12982,7 @@ import sys
 import tarfile
 import time
 
-__VERSION__ = "1.4.1"
+__VERSION__ = "1.5.0"
 
 STATE_SCHEMA = 1
 MANIFEST_SCHEMA = 2
@@ -13508,6 +13508,14 @@ def cmd_verify(args):
             if errs:
                 problems.append({"skill": name, "errors": errs})
         for name, rec in st["skills"].items():
+            if rec.get("source") == STORE_SOURCE:
+                # 1.5.0: las de la Tienda no viven en el cache; se verifican
+                # contra los sha256 por archivo que guardó install-catalog.
+                bad = drift(skill_dir("main", name), rec.get("files") or {})
+                checked.append(name)
+                if bad:
+                    problems.append({"skill": name, "errors": [f"drift@main: {', '.join(bad[:5])}"]})
+                continue
             if name not in (index.get("skills") or {}) and rec.get("source") != "local":
                 problems.append({"skill": name, "errors": ["en state pero no en cache"]})
     _out({"action": "verify", "checked": checked, "problems": problems,
@@ -13705,6 +13713,304 @@ def cmd_fetch(args):
     _out({"action": "fetch", "fetched": fetched, "skipped": skipped, "errors": errors,
           "summary": "%d bajados, %d ya al día, %d con error" % (len(fetched), len(skipped), len(errors))},
          0 if not errors else 1)
+
+
+# ── Tienda: skills del catálogo vectorizado (tnode_server#79, 1.5.0) ─────
+# Las mismas skills que instala el Agente Personal (pi-host), servidas por el
+# Worker `skills-catalog`. Distintas de las de plataforma (cache/skillsCatalog):
+# viven en state con source=store, `sync` no las toca y sólo existen en `main`
+# (audiencia dueño, fail-closed). Paquete: JSON {format, name, version,
+# files:[{path, data(base64)}]} en gzip; las reglas son copia de
+# tnode_server/skills-catalog/src/bundle.ts (cambiar ambas).
+
+STORE_SOURCE = "store"
+STORE_HARNESS = "openclaw"
+BUNDLE_FORMAT = 1
+BUNDLE_MAX_FILES = 100
+BUNDLE_MAX_FILE_BYTES = 512 * 1024
+BUNDLE_MAX_TOTAL_BYTES = 2 * 1024 * 1024
+_STORE_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_STORE_VERSION = re.compile(r"^\d+\.\d+\.\d+$")
+_STORE_SEGMENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
+# Archivos que genera el manager: un paquete de la Tienda no puede traerlos.
+_STORE_RESERVED = {"manifest.json"}
+
+
+def store_url() -> str:
+    return (os.environ.get("TNODE_SKILLS_CATALOG_URL") or "https://skills.tbrain.app").rstrip("/")
+
+
+def store_valid_name(name) -> bool:
+    return isinstance(name, str) and len(name) <= 64 and bool(_STORE_NAME.match(name))
+
+
+def store_safe_path(p) -> bool:
+    if not isinstance(p, str) or not p or len(p) > 200:
+        return False
+    return all(_STORE_SEGMENT.match(s) and s not in (".", "..") for s in p.split("/"))
+
+
+def validate_store_bundle(raw, name: str, version: str | None = None) -> dict:
+    """Valida el paquete (mismas reglas que bundle.ts). Devuelve {rel: bytes}
+    o lanza ValueError con la lista de problemas."""
+    import base64
+    errs = []
+    if not isinstance(raw, dict):
+        raise ValueError("bundle_invalid: paquete vacío")
+    if raw.get("format") != BUNDLE_FORMAT:
+        errs.append(f"format {raw.get('format')!r} no soportado")
+    if raw.get("name") != name:
+        errs.append(f"name {raw.get('name')!r} ≠ {name}")
+    if not _STORE_VERSION.match(str(raw.get("version") or "")):
+        errs.append("version inválida")
+    elif version and raw.get("version") != version:
+        errs.append(f"version {raw.get('version')} ≠ {version}")
+    items = raw.get("files")
+    if not isinstance(items, list) or not items:
+        raise ValueError("bundle_invalid: sin archivos")
+    if len(items) > BUNDLE_MAX_FILES:
+        errs.append(f"más de {BUNDLE_MAX_FILES} archivos")
+    files, seen, total = {}, set(), 0
+    for f in items:
+        path = (f or {}).get("path") if isinstance(f, dict) else None
+        if not store_safe_path(path):
+            errs.append(f"ruta no permitida: {path!r}")
+            continue
+        if path.lower() in seen:
+            errs.append(f"ruta repetida: {path}")
+        seen.add(path.lower())
+        if path in _STORE_RESERVED:
+            errs.append(f"ruta reservada: {path}")
+            continue
+        try:
+            data = base64.b64decode(str(f.get("data") or ""), validate=True)
+        except (ValueError, TypeError):
+            errs.append(f"base64 inválido: {path}")
+            continue
+        if len(data) > BUNDLE_MAX_FILE_BYTES:
+            errs.append(f"archivo grande: {path}")
+        total += len(data)
+        files[path] = data
+    if total > BUNDLE_MAX_TOTAL_BYTES:
+        errs.append("paquete de más de 2 MB")
+    if "SKILL.md" not in files:
+        errs.append("falta SKILL.md en la raíz")
+    else:
+        fm = _frontmatter(files["SKILL.md"].decode("utf-8", errors="replace"))
+        if fm.get("name") != name:
+            errs.append(f"SKILL.md name {fm.get('name')!r} ≠ {name}")
+    if errs:
+        raise ValueError("bundle_invalid: " + "; ".join(errs[:8]))
+    return files
+
+
+def _store_curl(path: str, dest: pathlib.Path | None = None, timeout: int = 60):
+    """GET al Worker con el token del nodo (TNODE_SKILLS_TOKEN). El token va
+    por la config de curl en stdin, nunca en argv (se vería en `ps`).
+    Devuelve (status, headers{lower: value}, body bytes)."""
+    token = os.environ.get("TNODE_SKILLS_TOKEN") or ""
+    if not token:
+        raise OSError("store_no_token: falta TNODE_SKILLS_TOKEN")
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="tnode-store-") as td:
+        hdr = pathlib.Path(td) / "h"
+        body = dest or (pathlib.Path(td) / "b")
+        cfg = 'header = "Authorization: Bearer %s"\n' % token.replace('"', "")
+        proc = subprocess.run(
+            ["curl", "-sS", "--max-time", str(timeout), "-K", "-", "-D", str(hdr), "-o", str(body),
+             "-w", "%{http_code}", store_url() + path],
+            input=cfg, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            raise OSError(f"store_unreachable rc={proc.returncode}: {(proc.stderr or '')[-200:]}")
+        status = int((proc.stdout or "0").strip() or 0)
+        headers = {}
+        try:
+            for line in hdr.read_text(encoding="latin-1").splitlines():
+                k, sep, v = line.partition(":")
+                if sep:
+                    headers[k.strip().lower()] = v.strip()
+        except OSError:
+            pass
+        data = body.read_bytes() if body.is_file() and dest is None else b""
+        return status, headers, data
+
+
+def store_card(name: str) -> dict:
+    status, _, data = _store_curl(f"/skills/{name}")
+    if status == 404:
+        raise LookupError(f"store_not_found: {name}")
+    if status != 200:
+        raise OSError(f"store_http_{status}: {data[:200].decode('utf-8', 'replace')}")
+    return json.loads(data.decode("utf-8"))
+
+
+def store_download(name: str, version: str, want_sha: str | None) -> tuple:
+    """Baja y verifica el paquete. Devuelve (files{rel: bytes}, sha256)."""
+    import gzip
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="tnode-store-") as td:
+        dest = pathlib.Path(td) / "pkg.json.gz"
+        status, headers, _ = _store_curl(f"/skills/{name}/{version}.json.gz", dest=dest, timeout=90)
+        if status != 200:
+            raise OSError(f"store_http_{status}: paquete {name}@{version}")
+        data = dest.read_bytes()
+    got = _sha256_bytes(data)
+    hdr_sha = (headers.get("x-skill-sha256") or "").lower()
+    for label, want in (("cabecera", hdr_sha), ("ficha", (want_sha or "").lower())):
+        if want and want != got:
+            raise ValueError(f"sha_mismatch ({label}): esperado {want[:12]} recibido {got[:12]}")
+    if not hdr_sha and not want_sha:
+        raise ValueError("sha_missing: el catálogo no mandó sha256")
+    try:
+        raw = json.loads(gzip.decompress(data).decode("utf-8"))
+    except (OSError, ValueError) as e:
+        raise ValueError(f"bundle_invalid: no es JSON gzip ({e})")
+    return validate_store_bundle(raw, name, version), got
+
+
+def store_manifest(card: dict, version: str, sha: str, has_scripts: bool) -> dict:
+    """manifest v2 de una skill de la Tienda: sólo dueño, sólo main."""
+    title = card.get("title") or {}
+    summary = card.get("summary") or {}
+    t_es = title.get("es") or _titleize(card.get("name", ""))
+    s_es = summary.get("es") or card.get("description") or ""
+    return {
+        "name": card["name"], "version": version, "type": "openclaw-skill", "entrypoint": "SKILL.md",
+        "manifestSchema": MANIFEST_SCHEMA,
+        "displayName": {"es": t_es, "en": title.get("en") or t_es},
+        "summary": {"es": s_es, "en": summary.get("en") or s_es},
+        "audience": "dueño", "forClients": None, "needsOwnerData": False, "whyOwnerOnly": None,
+        "agents": {"default": ["main"], "allowed": ["main"]},
+        "tools": ["exec"] if has_scripts else [], "client": {"tools": [], "exec": []},
+        "lifecycle": {"install": None, "uninstall": None, "enable": None, "disable": None},
+        "blocks": {"tools": None, "soul": None}, "crons": [], "secrets": [], "requires": {},
+        "origin": STORE_SOURCE, "needsReview": False,
+        "store": {"sha256": sha, "harnesses": list(card.get("harnesses") or [])},
+    }
+
+
+def _replace_dir(dest: pathlib.Path, files: dict) -> None:
+    """Escribe la skill en un dir temporal hermano y lo cambia por el actual:
+    una actualización no deja archivos de la versión anterior."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.parent / f".{dest.name}.new"
+    old = dest.parent / f".{dest.name}.old"
+    for d in (tmp, old):
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+    materialize(tmp, files)
+    if dest.exists():
+        os.replace(dest, old)
+    os.replace(tmp, dest)
+    shutil.rmtree(old, ignore_errors=True)
+
+
+class StoreError(Exception):
+    def __init__(self, msg: str, **extra):
+        super().__init__(msg)
+        self.extra = extra
+
+
+def _store_install(name: str, version: str | None, st: dict, *, by: str, force: bool) -> dict:
+    if not store_valid_name(name):
+        raise StoreError(f"invalid_name: {name!r}")
+    if version and not _STORE_VERSION.match(version):
+        raise StoreError(f"invalid_version: {version!r}")
+    cur = st["skills"].get(name) or {}
+    if cur and cur.get("source") != STORE_SOURCE:
+        raise StoreError(f"name_taken: {name} ya es una skill de plataforma o del Taller")
+    if name in ((load_index().get("skills")) or {}):
+        raise StoreError(f"name_taken: {name} está en el cache de plataforma")
+    removed = (st.get("removedByOwner") or {}).get(name)
+    if removed and by != "owner":
+        raise StoreError(f"removed_by_owner: {name}", hint="el dueño la quitó; sólo él puede reinstalarla", removedAt=removed)
+    card = store_card(name)
+    harnesses = card.get("harnesses") or []
+    if STORE_HARNESS not in harnesses and not force:
+        raise StoreError(f"harness_not_supported: {name} declara {harnesses or 'ninguno'}",
+                         hint="sólo se instalan en Negocio las skills probadas en openclaw")
+    requires = card.get("requires") or []
+    if requires and not force:
+        # Instalar no amplía permisos: los módulos de pi-host no existen aquí.
+        raise StoreError(f"requires_unavailable: {name} necesita {', '.join(requires)}", requires=requires)
+    ver = version or card.get("version")
+    if not ver:
+        raise StoreError(f"store_card_invalid: {name} sin versión")
+    files, sha = store_download(name, ver, card.get("sha256") if ver == card.get("version") else None)
+    has_scripts = any(p.startswith("scripts/") for p in files)
+    manifest = store_manifest({**card, "name": name}, ver, sha, has_scripts)
+    files = dict(files)
+    files["manifest.json"] = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    _replace_dir(skill_dir("main", name), files)
+    prev_enabled = ((cur.get("agents") or {}).get("main") or {}).get("enabled", True)
+    st["skills"][name] = {
+        "version": ver, "sha256": sha, "source": STORE_SOURCE, "origin": STORE_SOURCE,
+        "installedAt": cur.get("installedAt") or _now(), "updatedAt": _now(),
+        "installedBy": cur.get("installedBy") or by,
+        "audience": "dueño", "harnesses": harnesses,
+        "files": {rel: _sha256_bytes(b) for rel, b in files.items()},
+        "agents": {"main": {"enabled": prev_enabled if cur else True}},
+    }
+    (st.get("removedByOwner") or {}).pop(name, None)
+    return {"skill": name, "from": cur.get("version"), "to": ver, "sha256": sha,
+            "files": len(files), "enabled": st["skills"][name]["agents"]["main"]["enabled"]}
+
+
+def cmd_install_catalog(args):
+    name, _, ver = args.skill.partition("@")
+    st = load_state()
+    try:
+        res = _store_install(name, ver or None, st, by=args.by, force=args.force)
+    except StoreError as e:
+        _die(str(e), **e.extra)
+    except (LookupError, OSError, ValueError) as e:
+        _die(str(e)[:300])
+    save_state(st)
+    _out({"action": "install-catalog", **res,
+          "summary": f"{name} {res['to']} instalada desde la Tienda"})
+
+
+def cmd_update_catalog(args):
+    """Sin nombre: todas las de la Tienda. Conserva prendido/apagado."""
+    st = load_state()
+    names = [args.skill] if args.skill else sorted(
+        n for n, r in st["skills"].items() if r.get("source") == STORE_SOURCE)
+    updated, unchanged, errors = [], [], []
+    for name in names:
+        rec = st["skills"].get(name) or {}
+        if rec.get("source") != STORE_SOURCE:
+            errors.append({"skill": name, "error": "not_store_skill"})
+            continue
+        try:
+            card = store_card(name)
+            if card.get("version") == rec.get("version") and card.get("sha256") == rec.get("sha256"):
+                unchanged.append(name)
+                continue
+            updated.append(_store_install(name, None, st, by=rec.get("installedBy") or "owner", force=True))
+        except (StoreError, LookupError, OSError, ValueError) as e:
+            errors.append({"skill": name, "error": str(e)[:200]})
+    if updated:
+        save_state(st)
+    _out({"action": "update-catalog", "updated": updated, "unchanged": unchanged, "errors": errors,
+          "summary": "%d actualizadas, %d al día, %d con error" % (len(updated), len(unchanged), len(errors))},
+         0 if not errors else 1)
+
+
+def cmd_uninstall_catalog(args):
+    st = load_state()
+    rec = st["skills"].get(args.skill)
+    if not rec or rec.get("source") != STORE_SOURCE:
+        _die(f"not_store_skill: {args.skill}")
+    dest = skill_dir("main", args.skill)
+    if dest.is_dir():
+        shutil.rmtree(dest, ignore_errors=True)
+    st["skills"].pop(args.skill, None)
+    if args.by == "owner":
+        # Para que el agente no la reinstale solo (igual que REMOVED_BY_OWNER en pi-host).
+        st.setdefault("removedByOwner", {})[args.skill] = _now()
+    save_state(st)
+    _out({"action": "uninstall-catalog", "skill": args.skill, "by": args.by,
+          "summary": f"{args.skill} quitada"})
 
 
 def workshop_applied_dirs(agent: str) -> list:
@@ -14004,6 +14310,21 @@ def main():
     p = sub.add_parser("fetch", help="baja al cache lo que dicta el catálogo (P2)")
     p.add_argument("--catalog", required=True, help="JSON {skills: {name: {version, sha256, url}}}")
     p.set_defaults(fn=cmd_fetch)
+
+    p = sub.add_parser("install-catalog", help="instala una skill de la Tienda (catálogo vectorizado) en main")
+    p.add_argument("skill", help="<name>[@version]")
+    p.add_argument("--by", choices=("owner", "agent"), default="owner")
+    p.add_argument("--force", action="store_true", help="ignora harness/requires (sólo pruebas)")
+    p.set_defaults(fn=cmd_install_catalog)
+
+    p = sub.add_parser("update-catalog", help="actualiza una (o todas) las skills de la Tienda")
+    p.add_argument("skill", nargs="?", default=None)
+    p.set_defaults(fn=cmd_update_catalog)
+
+    p = sub.add_parser("uninstall-catalog", help="quita una skill de la Tienda")
+    p.add_argument("skill")
+    p.add_argument("--by", choices=("owner", "agent"), default="owner")
+    p.set_defaults(fn=cmd_uninstall_catalog)
 
     p = sub.add_parser("adopt", help="P4: registra skills creados en el Taller")
     p.add_argument("--agent", default="main")
@@ -17586,7 +17907,16 @@ from __future__ import annotations
 #          si esa lista existe y no está vacía. OpenClaw 2026.9 movió ahí la
 #          allowlist; un modelo fuera de ella se ignora y el turno cae al
 #          primary por defecto (Mini en prod, tnode_server#51).
-__VERSION__ = "2.14.2"
+# 2.15.0 — Tienda de skills en Negocio (tnode_server#79 fase 2): comando
+#          `skill.catalog {action: install|update|uninstall, name, version?}`
+#          que corre `tnode-skill-manager install-catalog|update-catalog|
+#          uninstall-catalog` contra el Worker `skills-catalog` del proyecto
+#          (β/prod) con el idToken del nodo. Un solo tipo de comando y no tres:
+#          la consulta de la cola filtra con `type IN`, que admite 30 valores.
+#          Capacidad `skills-catalog` en state/current solo si el manager del
+#          nodo la soporta (≥ 1.5.0). El espejo `installed_skills` lleva
+#          `source` (store | cache | local) y `harnesses`.
+__VERSION__ = "2.15.0"
 
 import hashlib
 import hmac
@@ -18348,6 +18678,8 @@ def push_openclaw_config(token: dict) -> dict:
     # El servidor elige el nombre del comando de key según esta capacidad
     # (functions/src/model_block.ts → applyModelKeyCommandFor).
     state["capabilities"] = [MODEL_KEY_V2_CAP, CRON_TZ_CAP, MODEL_SET_CAP]
+    if _skill_manager_has_store():
+        state["capabilities"].append(SKILLS_CATALOG_CAP)
     write_state(token, state)
     return state
 
@@ -18637,6 +18969,8 @@ MODEL_KEY_V2_CAP = "model-key-v2"
 # chat-sync passes the owner's zone to `openclaw cron add/edit --tz`; the
 # app offers "A una hora" on OpenClaw only when this is announced.
 CRON_TZ_CAP = "cron-tz"
+# 2.15.0: la app muestra la Tienda en Negocio solo con esta capacidad.
+SKILLS_CATALOG_CAP = "skills-catalog"
 GATEWAY_AUTH_HEADER = "cf-aig-authorization"
 # @deprecated transición — nombres previos que aún leen la app 1.14.x
 # (`llmMode`) y que mandan el app/CF viejos (comando). Borrar en limpieza.
@@ -20656,15 +20990,18 @@ es operación sensible: procede sin pedir permiso adicional.
 _SKILL_MANAGER_CLI = OPENCLAW_DIR / "scripts" / "tnode_skill_manager.py"
 
 
-def _run_skill_manager(*args: str, timeout: int = 180) -> dict:
+def _run_skill_manager(*args: str, timeout: int = 180, extra_env: dict | None = None) -> dict:
     """Corre `tnode_skill_manager.py <args>` y parsea su JSON (siempre JSON,
     también en error). OPENCLAW_HOME viaja tal cual: el CLI usa la semántica
-    de los daemons (dir .openclaw), no la del CLI de openclaw."""
+    de los daemons (dir .openclaw), no la del CLI de openclaw. `extra_env`
+    lleva secretos (el token de la Tienda) fuera de argv."""
     if not _SKILL_MANAGER_CLI.is_file():
         return {"ok": False, "error": f"cli_not_found: {_SKILL_MANAGER_CLI}"}
     py = sys.executable or "python3"
     env = os.environ.copy()
     env["OPENCLAW_HOME"] = str(OPENCLAW_DIR)
+    if extra_env:
+        env.update(extra_env)
     try:
         proc = subprocess.run(
             [py, str(_SKILL_MANAGER_CLI), *args],
@@ -20682,6 +21019,63 @@ def _run_skill_manager(*args: str, timeout: int = 180) -> dict:
                 "stdout": raw[-500:], "stderr": (proc.stderr or "")[-500:]}
     payload.setdefault("ok", proc.returncode == 0)
     return payload
+
+
+# ── Tienda de skills (2.15.0, tnode_server#79) ─────────────────
+# El Worker `skills-catalog` (búsqueda vectorial) es por proyecto: β en
+# skills-beta.tbrain.app, prod en skills.tbrain.app. Acepta el idToken del
+# nodo (Firebase del mismo proyecto), el mismo que usa para Firestore.
+_STORE_URLS = {"tbrain-platform-beta": "https://skills-beta.tbrain.app"}
+_STORE_URL_PROD = "https://skills.tbrain.app"
+
+
+def _skills_store_url() -> str:
+    return (os.environ.get("TNODE_SKILLS_CATALOG_URL") or _STORE_URLS.get(PROJECT_ID) or _STORE_URL_PROD).rstrip("/")
+
+
+def _skill_manager_has_store() -> bool:
+    try:
+        return "def cmd_install_catalog(" in _SKILL_MANAGER_CLI.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
+_STORE_ACTIONS = {"install": "install-catalog", "update": "update-catalog", "uninstall": "uninstall-catalog"}
+
+
+def handle_skill_catalog(token: dict, params: dict) -> dict:
+    """`skill.catalog {action, name, version?}` desde la app (lo pide el
+    dueño): instalar, actualizar o quitar una skill de la Tienda en `main`.
+    El manager baja del Worker, verifica sha256 y las reglas del paquete, y
+    rechaza lo que no declara `openclaw` o pide módulos que el nodo no tiene.
+    Nunca toca recepción, invitados ni A2A."""
+    action = str(params.get("action") or "").strip()
+    name = str(params.get("name") or params.get("skillId") or "").strip()
+    version = str(params.get("version") or "").strip()
+    sub = _STORE_ACTIONS.get(action)
+    if not sub or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name or "-"):
+        return {"status": "error", "result": {"error": "bad_params", "action": action, "name": name}}
+    if not _skill_manager_has_store():
+        return {"status": "error", "result": {"error": "skill_manager_without_store"}}
+    args = [sub, f"{name}@{version}" if (action == "install" and version) else name]
+    if action in ("install", "uninstall"):
+        args += ["--by", "owner"]
+    res = _run_skill_manager(*args, timeout=300, extra_env={
+        "TNODE_SKILLS_CATALOG_URL": _skills_store_url(),
+        "TNODE_SKILLS_TOKEN": token["idToken"],
+    })
+    _mirror_installed_skills(token, force=True)
+    if not res.get("ok"):
+        _log(f"store: {action} {name} falló: {(res.get('error') or res.get('summary') or '')[:200]}")
+        return {"status": "error", "result": {"action": action, "name": name,
+                                              "error": res.get("error") or res.get("summary"),
+                                              "errors": res.get("errors")}}
+    _log(f"store: {res.get('summary')}")
+    out = {"action": action, "name": name, "summary": res.get("summary")}
+    for k in ("to", "from", "sha256", "enabled", "updated", "unchanged"):
+        if k in res:
+            out[k] = res[k]
+    return {"status": "done", "result": out}
 
 
 _SKILLS_CATALOG_PATH = OPENCLAW_DIR / "tnode-skills" / "catalog.json"
@@ -20876,6 +21270,8 @@ def _mirror_installed_skills(token: dict, force: bool = False) -> None:
             "allowedAgents": {"arrayValue": {"values": [{"stringValue": a} for a in (sk.get("allowedAgents") or ["main"])]}},
             "clientTools": {"arrayValue": {"values": [{"stringValue": t} for t in ((sk.get("client") or {}).get("tools") or [])]}},
             "origin": {"stringValue": str(sk.get("origin") or "catalog")},
+            "source": {"stringValue": str(sk.get("source") or "cache")},
+            "harnesses": {"arrayValue": {"values": [{"stringValue": h} for h in (((m.get("store") or {}).get("harnesses")) or [])]}},
             "needsReview": {"booleanValue": bool(sk.get("needsReview"))},
             "agents": {"mapValue": {"fields": agents}},
             "skillsUpdatedAt": {"timestampValue": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
@@ -26424,6 +26820,7 @@ _HANDLERS = {
     "a2a.peer.link": handle_a2a_peer_link,
     "skill.enable": handle_skill_enable,
     "skill.disable": handle_skill_disable,
+    "skill.catalog": handle_skill_catalog,
     "a2a.peer.unlink": handle_a2a_peer_unlink,
     "a2a.peer.setEnabled": handle_a2a_peer_set_enabled,
     "decl.refresh": handle_decl_refresh,
