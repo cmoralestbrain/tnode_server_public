@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "builtAt": "cache-91384752468f",
+  "builtAt": "cache-92a14bdb78b1",
   "skills": {
     "tnode-agenda": {
       "version": "1.0.1",
@@ -104,6 +104,17 @@
         "migrations/009_void_out_of_stats.sql": "3a8af30f18c5b021ce7cb12e9ab2921ffa91e758cc4d66535e0aa000ca4e3697",
         "schema.sql": "cfccaa8541bd9de08670bc058111100e9205ce543e02822fcde2bd3e77253de6",
         "seed.sql": "4d1c45063d0ba3c7ea524852b4f27325f6111eda10e9d885c4edb5cf634dfb2e"
+      }
+    },
+    "tnode-skill-store": {
+      "version": "1.0.0",
+      "file": "tnode-skill-store-1.0.0.tgz",
+      "sha256": "2f4b4e95d9bffe774e1ed64f7addecf4a121fa5e0a326530ec5c2ae838a97d75",
+      "audience": "dueño",
+      "files": {
+        "SKILL.md": "05f683bc717f413c7f27056de25d0b4cf57f8d35723a64585c808556dc21c1f5",
+        "bin/store.py": "c718c9c66ce90a0c6335fc8c27da571642a8d1872652620766cce7cb11de46fd",
+        "manifest.json": "4c030198ab0c05069df5c4f4f3a949cdee79bf1fd3e223683ade3ea6cd554460"
       }
     }
   }
