@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "builtAt": "cache-92a14bdb78b1",
+  "builtAt": "cache-f8fa2c1f5583",
   "skills": {
     "tnode-agenda": {
       "version": "1.0.1",
@@ -107,14 +107,14 @@
       }
     },
     "tnode-skill-store": {
-      "version": "1.0.0",
-      "file": "tnode-skill-store-1.0.0.tgz",
-      "sha256": "2f4b4e95d9bffe774e1ed64f7addecf4a121fa5e0a326530ec5c2ae838a97d75",
+      "version": "1.0.1",
+      "file": "tnode-skill-store-1.0.1.tgz",
+      "sha256": "841fee6c66d136137237a18e35d7f1e892760f426476d4400f19b5fdd48f2c72",
       "audience": "dueño",
       "files": {
-        "SKILL.md": "05f683bc717f413c7f27056de25d0b4cf57f8d35723a64585c808556dc21c1f5",
-        "bin/store.py": "c718c9c66ce90a0c6335fc8c27da571642a8d1872652620766cce7cb11de46fd",
-        "manifest.json": "4c030198ab0c05069df5c4f4f3a949cdee79bf1fd3e223683ade3ea6cd554460"
+        "SKILL.md": "bcfff5c17c6ff1f0ce87176d10ff2a5ffedea85e485deeddb2a528c022891edd",
+        "bin/store.py": "b29244a468676c4b75ae53ea58ff502fa79f7614bb23fd926dc124f1bc2f4b8c",
+        "manifest.json": "388a155cdbce7a6d8d9940211d7cbb0ace27f6a210968e96445db62639858f22"
       }
     }
   }
