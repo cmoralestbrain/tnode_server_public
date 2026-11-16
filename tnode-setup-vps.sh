@@ -124,7 +124,7 @@ if command -v npm >/dev/null 2>&1; then
 fi
 unset _p
 
-TNODE_SETUP_VERSION="1.157.0"
+TNODE_SETUP_VERSION="1.158.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -18365,7 +18365,7 @@ from __future__ import annotations
 #          Capacidad `skills-catalog` en state/current solo si el manager del
 #          nodo la soporta (≥ 1.5.0). El espejo `installed_skills` lleva
 #          `source` (store | cache | local) y `harnesses`.
-__VERSION__ = "2.17.0"
+__VERSION__ = "2.18.0"
 
 import hashlib
 import hmac
@@ -23885,6 +23885,18 @@ def _team_shadow_check(token: dict) -> None:
 # tnode_client/functions/src/soul_identity_sync.ts (STATIC_*). Zonas 100%
 # estáticas salvo el bloque "equipo" de IDENTITY (condicional a peers, reusa
 # _team_read_peers). El renderer/marker no cambia; solo el origen del doc.
+# 2.18.0: orden de resolución (TPlugins → skills instaladas → Tienda), regla
+# de tobal 2026-11-16. Byte-idéntica a STATIC_RESOLUTION_ORDER_SOUL de la CF.
+_SOUL_RESOLUTION_ORDER = """## Antes de resolver una petición del dueño
+
+Cuando el dueño te pida algo, sigue este orden y quédate con el primero que sirva:
+
+1. **TPlugins instalados.** Revisa la sección «TPlugins instalados» de este archivo. Si uno hace lo que pide, delégaselo con `sessions_spawn(runtime="subagent", agentId=<id>, task=...)`, aunque tengas una herramienta parecida.
+2. **Skills instaladas.** Si ningún TPlugin sirve, busca entre tus skills instaladas (TOOLS.md y `~/.openclaw/workspace/skills/`) una que haga lo que pide, y úsala.
+3. **Tienda de skills.** Si tampoco hay una skill instalada, busca en la Tienda de skills con la skill `tnode-skill-store`. Si encuentras una que sirva, instálala, dile al dueño cuál instalaste y úsala para resolver su petición.
+
+Solo si nada de lo anterior sirve, resuélvelo con tus herramientas generales o dile al dueño con claridad que no puedes."""
+
 _SOUL_SUBAGENTES = """## Sub-agentes disponibles
 
 Lee `~/.openclaw/agency-agents/AGENTS_INDEX.md` al iniciar tu sesión para conocer el roster completo y sus especialidades. Úsalo para decidir cuándo invocar `sessions_spawn(runtime="subagent", agentId=<id>, task=...)`."""
@@ -24203,6 +24215,7 @@ def _compose_soul_doc() -> dict:
         "schema": 1,
         "target": "SOUL.md",
         "blocks": [
+            {"order": -10, "id": "orden-de-resolucion", "kind": "static", "text": _SOUL_RESOLUTION_ORDER},
             {"order": 0, "id": "subagentes", "kind": "static", "text": _SOUL_SUBAGENTES},
             {"order": 10, "id": "envio-archivos", "kind": "static", "text": _SOUL_SEND_FILE},
             {"order": 20, "id": "entregables", "kind": "static", "text": _SOUL_DOWNLOAD},
@@ -25229,15 +25242,109 @@ def _tplugin_tools_policy(tools_allow) -> dict | None:
 _TPLUGIN_MAIN_DENY_STATE = OPENCLAW_DIR / ".tplugin-main-deny.json"
 
 
+# 2.18.0: además, las tools NATIVAS que el TPlugin declara que reemplaza
+# (`replacesTools`, p. ej. image_generate) — así el main delega en vez de
+# competir (F4). Se guardan junto al agente (no en openclaw.json: su esquema
+# es estricto) y viven lo que viva el agente.
+_TPLUGIN_SIDECAR = ".tplugin.json"
+_TPLUGIN_NEVER_REPLACE = ("sessions_spawn", "sessions_send", "read", "write", "exec")
+
+
+def _tplugin_replaces(agent_id: str) -> list:
+    try:
+        data = json.loads((_AGENTS_DIR / agent_id / "agent" / _TPLUGIN_SIDECAR).read_text())
+    except (OSError, ValueError):
+        return []
+    return [t for t in (data.get("replacesTools") or [])
+            if isinstance(t, str) and t and "*" not in t and "__" not in t
+            and t not in _TPLUGIN_NEVER_REPLACE]
+
+
+def _tplugin_cost_notice(agent_id: str) -> str:
+    try:
+        data = json.loads((_AGENTS_DIR / agent_id / "agent" / _TPLUGIN_SIDECAR).read_text())
+    except (OSError, ValueError):
+        return ""
+    return str(data.get("costNotice") or "").strip().rstrip(".")[:200]
+
+
 def _tplugin_mcp_tools(agents_list: list) -> list:
+    """Tools que el main NO debe tener: las nativas que cada TPlugin
+    reemplaza (las MCP del agente NO: se heredarían al delegarle)."""
     out = set()
     for a in agents_list:
         if not (isinstance(a, dict) and _TPLUGIN_AGENT_ID_RE.match(str(a.get("id") or ""))):
             continue
-        for t in ((a.get("tools") or {}).get("allow") or []):
-            if isinstance(t, str) and "__" in t:
-                out.add(t)
+        # 2.18.0: YA NO se niegan al main las tools MCP del agente: OpenClaw
+        # hereda el deny del solicitante al sub-agente que spawnea
+        # (requester-tool-policy → inheritedToolDeny), así que negárselas al
+        # main dejaba al agente del TPlugin sin tools al delegarle (F4). Solo
+        # se niegan las nativas que el TPlugin reemplaza; que el main delegue
+        # lo pide el bloque de TPlugins de su SOUL.md.
+        out.update(_tplugin_replaces(a["id"]))
     return sorted(out)
+
+
+# 2.18.0 (F4): bloque propio en el SOUL.md del main con los TPlugins
+# instalados. Quitarle al main la tool que el TPlugin reemplaza no basta: su
+# modelo busca otra nativa (visto: video_generate para una portada) en vez de
+# delegar, y no abre AGENTS_INDEX. Este bloque se lo dice en su contexto.
+# Zona marcada y separada de las declarativas (tnode:soul…), que no la tocan.
+_TPLUGINS_ZONE_START = "<!-- tnode:tplugins:start -->"
+_TPLUGINS_ZONE_END = "<!-- tnode:tplugins:end -->"
+
+
+def _tplugins_block(agents_list: list) -> str:
+    rows = []
+    for a in agents_list:
+        aid = str((a or {}).get("id") or "") if isinstance(a, dict) else ""
+        if not _TPLUGIN_AGENT_ID_RE.match(aid):
+            continue
+        tagline = _extract_tagline(_AGENTS_DIR / aid / "agent" / "IDENTITY.md") or aid
+        cost = _tplugin_cost_notice(aid)
+        if cost:
+            rows.append(
+                f"- `{aid}`: {tagline} **Cobra:** {cost}. ANTES de delegarle, pregúntale al dueño si "
+                "acepta el costo; si acepta, delega agregando al encargo «costo confirmado por el dueño». "
+                "Si no acepta, no delegues."
+            )
+        else:
+            rows.append(f"- `{aid}`: {tagline}")
+    if not rows:
+        return ""
+    return "\n".join([
+        "## TPlugins instalados",
+        "",
+        "Estas tareas NO las haces tú, aunque tengas otra herramienta parecida: delégalas SIEMPRE con "
+        "`sessions_spawn(runtime=\"subagent\", agentId=<id>, task=...)`.",
+        "",
+        *rows,
+        "",
+        "Si el sub-agente responde con una propuesta y su costo, pregúntale al dueño. Si acepta, vuelve a "
+        "delegar el mismo encargo agregando «costo confirmado por el dueño». Muéstrale el resultado tal "
+        "cual, con sus enlaces.",
+    ])
+
+
+def _sync_tplugins_soul_block(agents_list: list) -> bool:
+    soul = OPENCLAW_DIR / "workspace" / "SOUL.md"
+    if not soul.is_file():
+        return False
+    text = soul.read_text(encoding="utf-8")
+    body = _tplugins_block(agents_list)
+    pat = re.compile(re.escape(_TPLUGINS_ZONE_START) + r".*?" + re.escape(_TPLUGINS_ZONE_END) + r"\n?", re.S)
+    zone = f"{_TPLUGINS_ZONE_START}\n{body}\n{_TPLUGINS_ZONE_END}\n" if body else ""
+    if pat.search(text):
+        new = pat.sub(lambda _m: zone, text, count=1)
+    elif body:
+        new = text.rstrip("\n") + "\n\n" + zone
+    else:
+        return False
+    if new == text:
+        return False
+    soul.write_text(new, encoding="utf-8")
+    _log("tplugin: bloque de TPlugins del SOUL del main actualizado")
+    return True
 
 
 def _sync_tplugin_main_deny() -> bool:
@@ -25255,6 +25362,10 @@ def _sync_tplugin_main_deny() -> bool:
     except (OSError, ValueError):
         prev = []
     want = _tplugin_mcp_tools(agents_list)
+    try:
+        _sync_tplugins_soul_block(agents_list)
+    except Exception as e:  # noqa: BLE001
+        _log(f"tplugin: bloque del SOUL: {e}")
     tools = main.get("tools") if isinstance(main.get("tools"), dict) else {}
     own = [t for t in (tools.get("deny") or []) if t not in prev]
     new_deny = own + [t for t in want if t not in own]
@@ -25297,6 +25408,12 @@ def handle_install_tplugin_agent(token: dict, params: dict) -> dict:
     ).hexdigest()
     try:
         _materialize_subagent_files(agent_id, {k: files[k] for k in _SUBAGENT_FILES}, files_sha)
+        replaces = params.get("replacesTools") or []
+        (_AGENTS_DIR / agent_id / "agent" / _TPLUGIN_SIDECAR).write_text(json.dumps({
+            "tpluginId": str(params.get("tpluginId") or ""),
+            "replacesTools": [t for t in replaces if isinstance(t, str)],
+            "costNotice": str(params.get("costNotice") or "")[:200],
+        }))
         _update_openclaw_config_for_subagent(agent_id, "install", model)
         cfg = read_openclaw_json()
         agents_section = cfg.setdefault("agents", {})
@@ -25323,6 +25440,7 @@ def handle_install_tplugin_agent(token: dict, params: dict) -> dict:
     return {"status": "done", "result": {
         "agentId": agent_id, "filesSha": files_sha,
         "model": model, "toolsAllow": policy["allow"],
+        "replacesTools": _tplugin_replaces(agent_id),
     }}
 
 
@@ -25330,6 +25448,10 @@ def handle_uninstall_tplugin_agent(token: dict, params: dict) -> dict:
     agent_id = (params.get("agentId") or "").strip()
     if not _TPLUGIN_AGENT_ID_RE.match(agent_id):
         return {"status": "error", "result": {"error": "invalid_agentId"}}
+    try:
+        (_AGENTS_DIR / agent_id / "agent" / _TPLUGIN_SIDECAR).unlink()
+    except OSError:
+        pass
     res = handle_uninstall_subagent(token, {"agentId": agent_id})
     if res.get("status") == "done":
         try:
