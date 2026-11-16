@@ -124,7 +124,7 @@ if command -v npm >/dev/null 2>&1; then
 fi
 unset _p
 
-TNODE_SETUP_VERSION="1.156.1"
+TNODE_SETUP_VERSION="1.157.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -18365,7 +18365,7 @@ from __future__ import annotations
 #          Capacidad `skills-catalog` en state/current solo si el manager del
 #          nodo la soporta (≥ 1.5.0). El espejo `installed_skills` lleva
 #          `source` (store | cache | local) y `harnesses`.
-__VERSION__ = "2.16.0"
+__VERSION__ = "2.17.0"
 
 import hashlib
 import hmac
@@ -18633,42 +18633,42 @@ def query_pending_commands(token: dict) -> list[dict]:
     # needed and command queues never get deep enough for ordering to
     # matter in practice. Callers that care about order can use __name__
     # which has an implicit default index.
-    body = {
-        "structuredQuery": {
-            "from": [{"collectionId": "commands"}],
-            "where": {
-                "compositeFilter": {
-                    "op": "AND",
-                    "filters": [
-                        {"fieldFilter": {
-                            "field": {"fieldPath": "status"},
-                            "op": "EQUAL",
-                            "value": {"stringValue": "pending"},
-                        }},
-                        {"fieldFilter": {
-                            "field": {"fieldPath": "type"},
-                            "op": "IN",
-                            "value": {"arrayValue": {"values": [
-                                {"stringValue": t} for t in _HANDLED_TYPES
-                            ]}},
-                        }},
-                    ],
-                }
-            },
-            "limit": 10,
-        }
-    }
+    # 2.17.0: Firestore limita `IN` a 30 valores y ya hay más tipos manejados
+    # → una consulta por bloque de 30, mismas filas que antes.
     headers = {"Authorization": f"Bearer {token['idToken']}"}
-    resp = _http_request("POST", url, body, headers)
-
-    # runQuery returns a list; each element may have a `document` key or be
-    # an empty row (when no matches).
+    types = list(_HANDLED_TYPES)
+    rows = []
+    for i in range(0, len(types), 30):
+        body = {
+            "structuredQuery": {
+                "from": [{"collectionId": "commands"}],
+                "where": {
+                    "compositeFilter": {
+                        "op": "AND",
+                        "filters": [
+                            {"fieldFilter": {
+                                "field": {"fieldPath": "status"},
+                                "op": "EQUAL",
+                                "value": {"stringValue": "pending"},
+                            }},
+                            {"fieldFilter": {
+                                "field": {"fieldPath": "type"},
+                                "op": "IN",
+                                "value": {"arrayValue": {"values": [
+                                    {"stringValue": t} for t in types[i:i + 30]
+                                ]}},
+                            }},
+                        ],
+                    }
+                },
+                "limit": 10,
+            }
+        }
+        resp = _http_request("POST", url, body, headers)
+        # runQuery returns a list; each element may have a `document` key or
+        # be an empty row (when no matches). Single object = one element.
+        rows.extend(resp if isinstance(resp, list) else [resp])
     cmds = []
-    if isinstance(resp, list):
-        rows = resp
-    else:
-        # Single-object response when the gateway returns only one element.
-        rows = [resp]
     for row in rows:
         doc = row.get("document") if isinstance(row, dict) else None
         if not doc:
@@ -22375,6 +22375,10 @@ def _enforce_client_agents_tools_if_changed() -> None:
         return
     _enforce_client_agents_tools()
     try:
+        _sync_tplugin_main_deny()
+    except Exception as e:  # noqa: BLE001
+        _log(f"tplugin: deny del main en tick: {e}")
+    try:
         _CLIENT_TOOLS_CFG_MTIME = (OPENCLAW_DIR / "openclaw.json").stat().st_mtime
     except OSError:
         _CLIENT_TOOLS_CFG_MTIME = mtime
@@ -25192,6 +25196,149 @@ def handle_uninstall_subagent(token: dict, params: dict) -> dict:
     }
 
 
+# ── TPlugins (bitacoras/tplugins/2026-11-15-tplugin-diseno.md, F3) ──
+#
+# El agente dedicado de un TPlugin llega completo en el comando (lo arma la CF
+# tpluginInstall desde el manifiesto): identidad (SOUL/AGENTS/IDENTITY),
+# modelo ya resuelto y la ALLOWLIST exacta de tools. Se materializa con el
+# mismo camino que un sub-agente del catálogo y luego se le fija
+# `tools.allow` — nunca vacío (allow vacío = todo, ver 2.10.0).
+_TPLUGIN_AGENT_ID_RE = re.compile(r"^tp-[a-z0-9][a-z0-9-]{1,60}$")
+
+
+def _tplugin_tools_policy(tools_allow) -> dict | None:
+    """Allowlist normativa del agente de un TPlugin. None si no es válida:
+    lista no vacía de nombres de tool, sin comodines ni primitivas de
+    delegación (el agente del TPlugin no delega)."""
+    if not isinstance(tools_allow, list):
+        return None
+    allow = sorted({t.strip() for t in tools_allow
+                    if isinstance(t, str) and t.strip()})
+    if not allow or any(("*" in t) or t in ("sessions_spawn", "sessions_send")
+                        for t in allow):
+        return None
+    return {"allow": allow, "deny": ["sessions_spawn", "sessions_send"]}
+
+
+# F3 etapa 2: las tools MCP de un TPlugin son SOLO de su agente. Al main se le
+# niegan (deny exacto) para que no compitan con lo suyo (p. ej. image_generate)
+# y no se salte al agente dedicado. Se recalcula desde el roster: deny del main
+# = (deny propio − lo que este daemon puso antes) ∪ tools MCP (`srv__tool`) de
+# todos los agentes `tp-*`. Lo que pusimos se recuerda en un sidecar para no
+# tocar nunca el deny que el main traiga por otras razones.
+_TPLUGIN_MAIN_DENY_STATE = OPENCLAW_DIR / ".tplugin-main-deny.json"
+
+
+def _tplugin_mcp_tools(agents_list: list) -> list:
+    out = set()
+    for a in agents_list:
+        if not (isinstance(a, dict) and _TPLUGIN_AGENT_ID_RE.match(str(a.get("id") or ""))):
+            continue
+        for t in ((a.get("tools") or {}).get("allow") or []):
+            if isinstance(t, str) and "__" in t:
+                out.add(t)
+    return sorted(out)
+
+
+def _sync_tplugin_main_deny() -> bool:
+    """Aplica el deny de tools de TPlugins al main. True si escribió."""
+    cfg = read_openclaw_json()
+    if not isinstance(cfg, dict):
+        return False
+    agents_section = cfg.setdefault("agents", {})
+    agents_list = _roster_load(agents_section)
+    main = next((a for a in agents_list if isinstance(a, dict) and a.get("id") == "main"), None)
+    if main is None:
+        return False
+    try:
+        prev = json.loads(_TPLUGIN_MAIN_DENY_STATE.read_text()).get("deny") or []
+    except (OSError, ValueError):
+        prev = []
+    want = _tplugin_mcp_tools(agents_list)
+    tools = main.get("tools") if isinstance(main.get("tools"), dict) else {}
+    own = [t for t in (tools.get("deny") or []) if t not in prev]
+    new_deny = own + [t for t in want if t not in own]
+    changed = (tools.get("deny") or []) != new_deny
+    if changed:
+        tools = dict(tools)
+        if new_deny:
+            tools["deny"] = new_deny
+        else:
+            tools.pop("deny", None)
+        if tools:
+            main["tools"] = tools
+        else:
+            main.pop("tools", None)
+        _roster_store(agents_section, agents_list)
+        _write_openclaw_json(cfg)
+        _log(f"tplugin: deny del main = {len(want)} tools de TPlugins")
+    try:
+        _TPLUGIN_MAIN_DENY_STATE.write_text(json.dumps({"deny": want}))
+    except OSError as e:
+        _log(f"tplugin: no se pudo guardar el sidecar de deny: {e}")
+    return changed
+
+
+def handle_install_tplugin_agent(token: dict, params: dict) -> dict:
+    agent_id = (params.get("agentId") or "").strip()
+    if not _TPLUGIN_AGENT_ID_RE.match(agent_id):
+        return {"status": "error", "result": {"error": "invalid_agentId"}}
+    files = params.get("files") or {}
+    if not isinstance(files, dict) or not all(
+            isinstance(files.get(k), str) and files.get(k).strip()
+            for k in _SUBAGENT_FILES):
+        return {"status": "error", "result": {"error": "agent_files_incomplete"}}
+    policy = _tplugin_tools_policy(params.get("toolsAllow"))
+    if policy is None:
+        return {"status": "error", "result": {"error": "invalid_toolsAllow"}}
+    model = _canon_text_slug(params.get("model")) if params.get("model") else None
+    files_sha = hashlib.sha256(
+        "\x00".join(files[k] for k in _SUBAGENT_FILES).encode("utf-8")
+    ).hexdigest()
+    try:
+        _materialize_subagent_files(agent_id, {k: files[k] for k in _SUBAGENT_FILES}, files_sha)
+        _update_openclaw_config_for_subagent(agent_id, "install", model)
+        cfg = read_openclaw_json()
+        agents_section = cfg.setdefault("agents", {})
+        agents_list = _roster_load(agents_section)
+        for a in agents_list:
+            if isinstance(a, dict) and a.get("id") == agent_id:
+                a["tools"] = policy
+                if params.get("name"):
+                    a["name"] = str(params["name"])[:80]
+        _roster_store(agents_section, agents_list)
+        _write_openclaw_json(cfg)
+        _firestore_upsert_installed_subagent(token, agent_id, {
+            "agentId": agent_id,
+            "status": "installed",
+            "filesSha": files_sha,
+            "source": "tplugin",
+            "tpluginId": str(params.get("tpluginId") or ""),
+        })
+        _regenerate_agents_index()
+        _sync_tplugin_main_deny()
+    except Exception as e:  # noqa: BLE001
+        _log(f"install_tplugin_agent {agent_id} failed: {e}")
+        return {"status": "error", "result": {"error": str(e)[:500]}}
+    return {"status": "done", "result": {
+        "agentId": agent_id, "filesSha": files_sha,
+        "model": model, "toolsAllow": policy["allow"],
+    }}
+
+
+def handle_uninstall_tplugin_agent(token: dict, params: dict) -> dict:
+    agent_id = (params.get("agentId") or "").strip()
+    if not _TPLUGIN_AGENT_ID_RE.match(agent_id):
+        return {"status": "error", "result": {"error": "invalid_agentId"}}
+    res = handle_uninstall_subagent(token, {"agentId": agent_id})
+    if res.get("status") == "done":
+        try:
+            _sync_tplugin_main_deny()
+        except Exception as e:  # noqa: BLE001
+            _log(f"tplugin: deny del main tras desinstalar: {e}")
+    return res
+
+
 # Gateway reload for openclaw.json changes (mcp.servers + agents.list) is
 # AUTOMATIC: the gateway watches openclaw.json and hot-reloads on change.
 # Verified on the Mini — the instant config-sync writes the file the gateway
@@ -27308,6 +27455,8 @@ _HANDLERS = {
     "drive_wiki_sync": handle_drive_wiki_sync,
     "install_subagent": handle_install_subagent,
     "uninstall_subagent": handle_uninstall_subagent,
+    "install_tplugin_agent": handle_install_tplugin_agent,
+    "uninstall_tplugin_agent": handle_uninstall_tplugin_agent,
     "restart_gateway_for_subagents": handle_restart_gateway_for_subagents,
     "mcp.install": handle_mcp_install,
     "mcp.remove": handle_mcp_remove,
