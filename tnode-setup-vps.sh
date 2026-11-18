@@ -124,7 +124,7 @@ if command -v npm >/dev/null 2>&1; then
 fi
 unset _p
 
-TNODE_SETUP_VERSION="1.158.0"
+TNODE_SETUP_VERSION="1.159.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -17425,6 +17425,39 @@ def allow_in_model_policy(defaults: Dict[str, Any], model_slug: str) -> bool:
     return True
 
 
+def models_missing_input(config: Dict[str, Any], provider: str) -> bool:
+    """True si algún modelo de `provider` no declara `input` (OpenClaw solo
+    pasa imágenes a un modelo cuyo `input` incluye "image")."""
+    p_block = ((config.get("models") or {}).get("providers") or {}).get(provider)
+    models = p_block.get("models") if isinstance(p_block, dict) else None
+    return isinstance(models, list) and any(
+        isinstance(m, dict) and m.get("id") and not isinstance(m.get("input"), list)
+        for m in models
+    )
+
+
+def apply_model_inputs(config: Dict[str, Any], provider: str,
+                       modalities: Dict[str, Iterable[str]]) -> bool:
+    """Escribe `input` en los modelos de `provider` según `modalities`
+    (id → modalidades de entrada que publica el proveedor). Solo text e image
+    (las que OpenClaw acepta). Un id ausente de `modalities` no se toca.
+    Devuelve True si cambió algo."""
+    p_block = ((config.get("models") or {}).get("providers") or {}).get(provider)
+    models = p_block.get("models") if isinstance(p_block, dict) else None
+    if not isinstance(models, list):
+        return False
+    changed = False
+    for m in models:
+        if not isinstance(m, dict) or m.get("id") not in modalities:
+            continue
+        mods = set(modalities[m["id"]] or ())
+        want = ["text", "image"] if "image" in mods else ["text"]
+        if m.get("input") != want:
+            m["input"] = want
+            changed = True
+    return changed
+
+
 def text_provider_for(config: Dict[str, Any], models_provider: str, legacy_provider: str) -> str:
     """Provider con el que se escribe el cerebro de texto en ESTE nodo:
     `models_provider` si ya existe (o si no hay ninguno); el previo si el nodo
@@ -18365,7 +18398,13 @@ from __future__ import annotations
 #          Capacidad `skills-catalog` en state/current solo si el manager del
 #          nodo la soporta (≥ 1.5.0). El espejo `installed_skills` lleva
 #          `source` (store | cache | local) y `harnesses`.
-__VERSION__ = "2.18.0"
+# 2.19.0 — los modelos de `tbrain-models` declaran `input` (["text","image"]
+#          o ["text"]) según `architecture.input_modalities` de `{baseUrl}/models`.
+#          Sin el campo OpenClaw trata todo modelo como solo texto y le quita
+#          las imágenes (el editor de clips no veía sus fotogramas, skills#33).
+#          Bajo demanda: solo consulta cuando hay un modelo sin `input` y solo
+#          al escribir modelos (key, sub-agente, `agent.model.set`).
+__VERSION__ = "2.19.0"
 
 import hashlib
 import hmac
@@ -19574,6 +19613,47 @@ def _ensure_gateway_policy_floor() -> None:
         _log(f"policy floor: {e}")
 
 
+def _fetch_input_modalities(base_url: str, headers: dict | None = None) -> dict:
+    """id → input_modalities desde `{base_url}/models` (formato OpenRouter:
+    `architecture.input_modalities`). {} si falla: sin dato no se toca nada."""
+    try:
+        req = urllib.request.Request(base_url.rstrip("/") + "/models", method="GET",
+                                     headers={k: v for k, v in (headers or {}).items()
+                                              if isinstance(v, str)})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8") or "{}")
+    except Exception as e:  # red, 4xx/5xx, JSON — nunca rompe la escritura
+        _log(f"model inputs: /models no disponible ({type(e).__name__})")
+        return {}
+    out = {}
+    for m in data.get("data") or []:
+        if isinstance(m, dict) and m.get("id"):
+            mods = (m.get("architecture") or {}).get("input_modalities")
+            if isinstance(mods, list):
+                out[m["id"]] = mods
+    return out
+
+
+def _fill_model_inputs(cfg: dict) -> bool:
+    """Declara `input` (["text","image"] o ["text"]) en los modelos de
+    MODELS_PROVIDER que aún no lo tienen; sin esto OpenClaw les quita las
+    imágenes (skills#33). Bajo demanda: solo consulta `/models` cuando hay
+    algún modelo sin `input`, así que un nodo ya completo no hace red."""
+    try:
+        import tnode_agent_model as lib
+    except ImportError:
+        return False
+    if not lib.models_missing_input(cfg, MODELS_PROVIDER):
+        return False
+    prov = cfg["models"]["providers"][MODELS_PROVIDER]
+    base = prov.get("baseUrl")
+    if not isinstance(base, str) or not base.startswith("http"):
+        return False
+    hdrs = dict(prov.get("headers") or {}) if isinstance(prov.get("headers"), dict) else {}
+    mods = _fetch_input_modalities(base, hdrs)
+    return lib.apply_model_inputs(cfg, MODELS_PROVIDER, mods) if mods else False
+
+
 def _write_openclaw_json(cfg: dict) -> None:
     """Atomically write openclaw.json with the given config dict."""
     tmp = OPENCLAW_JSON_PATH.with_suffix(".json.tmp")
@@ -19988,6 +20068,7 @@ def _apply_models_providers(
         for _slot, _slug in _DEFAULT_MEDIA_MODELS.items():
             defaults.setdefault(_slot, _slug)
 
+    _fill_model_inputs(cfg)
     _write_openclaw_json(cfg)
     if used_ref:
         _secrets_reload()
@@ -20151,6 +20232,7 @@ def handle_agent_model_set(token: dict, params: dict) -> dict:
                                   legacy_provider=_LEGACY_TEXT_PROVIDER)
     except lib.AgentModelError as e:
         return {"status": "error", "result": {"error": e.code, "message": e.message}}
+    _fill_model_inputs(cfg)
     _write_openclaw_json(cfg)
     # En 2.0 la gateway hot-recarga model.primary; reiniciarla la tiraría ~1 min
     # por cada cambio de modelo.
@@ -20859,6 +20941,7 @@ def _update_openclaw_config_for_subagent(
         # was never registered under providers[p].models[] /
         # agents.defaults.models. Idempotent — safe to re-run.
         _ensure_model_registered(cfg, entry["model"]["primary"])
+        _fill_model_inputs(cfg)  # visión del modelo del sub-agente (skills#33)
         # Node-global media-generation models. A card may carry
         # `imageGenerationModel` / `musicGenerationModel` / `videoGenerationModel`
         # (each prefixed with MEDIA_PROVIDER) — set them under agents.defaults
