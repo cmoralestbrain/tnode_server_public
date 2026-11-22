@@ -103,7 +103,7 @@ if command -v npm >/dev/null 2>&1; then
 fi
 unset _p
 
-TNODE_SETUP_VERSION="1.159.0"
+TNODE_SETUP_VERSION="1.160.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -18249,8 +18249,11 @@ from __future__ import annotations
 #          las imágenes (el editor de clips no veía sus fotogramas, skills#33).
 #          Bajo demanda: solo consulta cuando hay un modelo sin `input` y solo
 #          al escribir modelos (key, sub-agente, `agent.model.set`).
-__VERSION__ = "2.19.0"
+# 2.21.0 — recuperación de commands interrumpidos con registro local y
+#          escrituras condicionadas a la versión observada en Firestore (#43).
+__VERSION__ = "2.21.0"
 
+import fcntl
 import hashlib
 import hmac
 import json
@@ -18500,7 +18503,7 @@ def _firestore_base() -> str:
 def query_pending_commands(token: dict) -> list[dict]:
     """Run a structured query for pending commands.
 
-    Returns list of {id, type, params, createdAt, status} dicts.
+    Returns command snapshots including the Firestore update time for claims.
 
     v1.6.0: filtra por `type IN _HANDLED_TYPES` para no agarrar commands
     de otros daemons (tnode-chat-sync maneja cron.* y tasks.*). Antes,
@@ -18552,42 +18555,68 @@ def query_pending_commands(token: dict) -> list[dict]:
         # runQuery returns a list; each element may have a `document` key or
         # be an empty row (when no matches). Single object = one element.
         rows.extend(resp if isinstance(resp, list) else [resp])
-    cmds = []
-    for row in rows:
-        doc = row.get("document") if isinstance(row, dict) else None
-        if not doc:
-            continue
-        name = doc.get("name", "")
-        cmd_id = name.rsplit("/", 1)[-1]
-        fields = doc.get("fields", {})
-        cmds.append(
-            {
-                "id": cmd_id,
-                "type": _fs_decode(fields.get("type", {"stringValue": ""})),
-                "params": _fs_decode(fields.get("params", {"mapValue": {"fields": {}}}))
-                or {},
-                "createdAt": _fs_decode(fields.get("createdAt", {"nullValue": None})),
-                "status": _fs_decode(fields.get("status", {"stringValue": ""})),
-            }
-        )
-    return cmds
+    return [
+        _command_snapshot(row["document"])
+        for row in rows if isinstance(row, dict) and row.get("document")
+    ]
 
 
-def update_command(token: dict, cmd_id: str, patch: dict) -> None:
-    """PATCH a command doc with the given fields (status/result/completedAt)."""
-    uid = token["uid"]
-    node_id = token["nodeId"]
-    # updateMask ensures we only touch these fields (Firestore rule also
-    # enforces immutability of type/params/createdAt).
-    mask_params = "&".join(
-        f"updateMask.fieldPaths={urllib.parse.quote(k)}" for k in patch.keys()
-    )
-    url = (
-        f"{_firestore_base()}/users/{uid}/nodes/{node_id}/commands/{cmd_id}"
-        f"?{mask_params}"
-    )
+def _command_snapshot(doc: dict) -> dict:
+    fields = doc.get("fields", {})
+    return {
+        "id": doc["name"].rsplit("/", 1)[-1],
+        "type": _fs_decode(fields.get("type", {})),
+        "params": _fs_decode(fields.get("params", {})) or {},
+        "status": _fs_decode(fields.get("status", {})),
+        "result": _fs_decode(fields.get("result", {})),
+        "updateTime": doc["updateTime"],
+    }
+
+
+def _command_path(token: dict, cmd_id: str) -> str:
+    return f"users/{token['uid']}/nodes/{token['nodeId']}/commands/{cmd_id}"
+
+
+def _command_url(token: dict, cmd_id: str) -> str:
+    path = urllib.parse.quote(_command_path(token, cmd_id), safe="/")
+    return f"{_firestore_base()}/{path}"
+
+
+def _read_command(token: dict, cmd_id: str) -> dict | None:
+    try:
+        doc = _http_request("GET", _command_url(token, cmd_id),
+                            headers={"Authorization": f"Bearer {token['idToken']}"})
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        raise
+    return _command_snapshot(doc)
+
+
+def update_command(token: dict, cmd: dict, patch: dict) -> str | None:
+    """Write only if the command is still at the observed Firestore version."""
+    path = _command_path(token, cmd["id"])
+    name = f"projects/{PROJECT_ID}/databases/(default)/documents/{path}"
+    body = {"writes": [{
+        "update": {"name": name, **_fs_fields(patch)},
+        "updateMask": {"fieldPaths": list(patch)},
+        "currentDocument": {"updateTime": cmd["updateTime"]},
+    }]}
     headers = {"Authorization": f"Bearer {token['idToken']}"}
-    _http_request("PATCH", url, _fs_fields(patch), headers)
+    try:
+        written = _http_request("POST", f"{_firestore_base()}:commit", body, headers)
+    except urllib.error.HTTPError as error:
+        if error.code in (404, 409, 412):
+            return None
+        if error.code == 400:
+            try:
+                status = json.loads(getattr(error, "server_body", "")).get("error", {}).get("status")
+            except (ValueError, AttributeError):
+                status = None
+            if status == "FAILED_PRECONDITION":
+                return None
+        raise
+    return written["writeResults"][0]["updateTime"]
 
 
 # ── Fase 2/3: inventario de flota + politica de update ─────────
@@ -19010,7 +19039,7 @@ def push_openclaw_config(token: dict) -> dict:
         }
     # El servidor elige el nombre del comando de key según esta capacidad
     # (functions/src/model_block.ts → applyModelKeyCommandFor).
-    state["capabilities"] = [MODEL_KEY_V2_CAP, CRON_TZ_CAP, MODEL_SET_CAP]
+    state["capabilities"] = [MODEL_KEY_V2_CAP, CRON_TZ_CAP, MODEL_SET_CAP, "tplugin-runtime-assets"]
     if _skill_manager_has_store():
         state["capabilities"].append(SKILLS_CATALOG_CAP)
     write_state(token, state)
@@ -20723,6 +20752,7 @@ def _update_openclaw_config_for_subagent(
     image_generation_model: str | None = None,
     music_generation_model: str | None = None,
     video_generation_model: str | None = None,
+    tools_policy: dict | None = None,
 ) -> bool:
     """Add/remove an entry in agents.list[] and update main.subagents
     .allowAgents accordingly. Returns True if the file changed.
@@ -20771,6 +20801,8 @@ def _update_openclaw_config_for_subagent(
         entry.setdefault("name", agent_id)
         entry["workspace"] = agent_dir
         entry["agentDir"] = agent_dir
+        if tools_policy is not None:
+            entry["tools"] = tools_policy
         if recommended_model:
             entry.setdefault("model", {})["primary"] = recommended_model
         elif not entry.get("model", {}).get("primary"):
@@ -25248,6 +25280,12 @@ def _tplugins_block(agents_list: list) -> str:
         "",
         *rows,
         "",
+        "Para un encargo compuesto, coordina los TPlugins por dependencias: recupera o genera el recurso "
+        "primero y pasa al siguiente agente la ruta real que recibiste. Si un render tarda, espera el "
+        "resultado final antes de anunciarlo. Para entregar un archivo al chat, indica al editor una "
+        f"ruta nueva bajo {OPENCLAW_DIR / 'workspace' / 'download'} y usa su marker de adjunto al terminar. "
+        "Un ID de generación ya existente se recupera sin crear un trabajo nuevo.",
+        "",
         "Si el sub-agente responde con una propuesta y su costo, pregúntale al dueño. Si acepta, vuelve a "
         "delegar el mismo encargo agregando «costo confirmado por el dueño». Muéstrale el resultado tal "
         "cual, con sus enlaces.",
@@ -25318,6 +25356,91 @@ def _sync_tplugin_main_deny() -> bool:
     return changed
 
 
+def _tplugin_assets(params: dict):
+    """Validate pinned skills and scripts before changing the agent."""
+    skills, scripts = params.get("skills", []), params.get("exec", [])
+    if not isinstance(skills, list) or not isinstance(scripts, list):
+        raise ValueError("invalid_tplugin_assets")
+    names = {}
+    for skill in skills:
+        if (not isinstance(skill, dict)
+                or not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,63}", str(skill.get("name", "")))
+                or not re.fullmatch(r"\d+\.\d+\.\d+", str(skill.get("version", "")))):
+            raise ValueError("invalid_tplugin_skill")
+        if skill["name"] in names:
+            raise ValueError("duplicate_tplugin_skill")
+        url, sha = skill.get("url"), skill.get("sha256")
+        if ((url is None) != (sha is None)
+                or (url is not None and (not isinstance(url, str) or not url.startswith("https://")
+                    or not isinstance(sha, str) or not re.fullmatch(r"[a-f0-9]{64}", sha)))):
+            raise ValueError("invalid_tplugin_skill_pointer")
+        names[skill["name"]] = dict(skill)
+    for script in scripts:
+        if not isinstance(script, str) or not re.fullmatch(
+                r"[a-z0-9][a-z0-9-]{1,63}/scripts/[A-Za-z0-9_-]+\.py", script):
+            raise ValueError("invalid_tplugin_exec")
+        if script.split("/")[0] not in names:
+            raise ValueError("exec_skill_not_declared")
+    if len(scripts) != len(set(scripts)):
+        raise ValueError("duplicate_tplugin_exec")
+    if ("exec" in params.get("toolsAllow", [])) != bool(scripts):
+        raise ValueError("exec_requires_script_allowlist")
+    return names, scripts
+
+
+def _tplugin_apply_assets(agent_id: str, skills: dict, scripts: list, previous: dict):
+    """Retryable installation. Agent exec stays denied until all assets are ready."""
+    workspace = _AGENTS_DIR / agent_id / "agent"
+    pointers = {name: {key: spec[key] for key in ("version", "url", "sha256")}
+                for name, spec in skills.items() if spec.get("url")}
+    if pointers:
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="tnode-tplugin-") as temp:
+            catalog = Path(temp) / "catalog.json"
+            catalog.write_text(json.dumps({"skills": pointers}))
+            result = _run_skill_manager("fetch", "--catalog", str(catalog), timeout=300)
+            if not result.get("ok"):
+                raise RuntimeError("tplugin_skill_fetch_failed")
+    for name, spec in skills.items():
+        version = spec["version"]
+        result = _run_skill_manager("install", f"{name}@{version}", "--agent", agent_id, timeout=300)
+        hook = result.get("hook")
+        if not result.get("ok") or (hook is not None and not hook.get("ok")):
+            raise RuntimeError(f"tplugin_skill_install_failed: {name}")
+        manifest = json.loads((workspace / "skills" / name / "manifest.json").read_text())
+        if manifest.get("version") != version:
+            raise RuntimeError(f"tplugin_skill_version_mismatch: {name}")
+    paths = []
+    for script in scripts:
+        expected = workspace / "skills" / script
+        if expected.resolve() != expected or not expected.is_file():
+            raise ValueError("tplugin_script_outside_workspace")
+        expected.chmod(expected.stat().st_mode | 0o100)
+        paths.append(str(expected))
+    # Remove only permissions recorded by this TPlugin. CLI operations preserve
+    # other agents and are idempotent when the install command is retried.
+    for old in previous.get("execPaths", []):
+        if old not in paths:
+            result = _run_openclaw("approvals", "allowlist", "remove", "--agent", agent_id, old)
+            if not result.get("ok"):
+                raise RuntimeError("tplugin_exec_revoke_failed")
+    for script in paths:
+        result = _run_openclaw("approvals", "allowlist", "add", "--agent", agent_id, script)
+        if not result.get("ok"):
+            raise RuntimeError("tplugin_exec_allow_failed")
+    removed = set(previous.get("skills", {})) - set(skills)
+    if removed:
+        installed = _run_skill_manager("list", "--agent", agent_id)
+        if not installed.get("ok"):
+            raise RuntimeError("tplugin_skill_list_failed")
+        present = {item.get("name") for item in installed.get("skills", [])}
+        for name in sorted(removed & present):
+            result = _run_skill_manager("uninstall", name, "--agent", agent_id)
+            if not result.get("ok"):
+                raise RuntimeError("tplugin_skill_uninstall_failed")
+    return paths
+
+
 def handle_install_tplugin_agent(token: dict, params: dict) -> dict:
     agent_id = (params.get("agentId") or "").strip()
     if not _TPLUGIN_AGENT_ID_RE.match(agent_id):
@@ -25330,19 +25453,44 @@ def handle_install_tplugin_agent(token: dict, params: dict) -> dict:
     policy = _tplugin_tools_policy(params.get("toolsAllow"))
     if policy is None:
         return {"status": "error", "result": {"error": "invalid_toolsAllow"}}
+    try:
+        skills, scripts = _tplugin_assets(params)
+    except ValueError as error:
+        return {"status": "error", "result": {"error": str(error)}}
     model = _canon_text_slug(params.get("model")) if params.get("model") else None
     files_sha = hashlib.sha256(
         "\x00".join(files[k] for k in _SUBAGENT_FILES).encode("utf-8")
     ).hexdigest()
     try:
         _materialize_subagent_files(agent_id, {k: files[k] for k in _SUBAGENT_FILES}, files_sha)
+        sidecar = _AGENTS_DIR / agent_id / "agent" / _TPLUGIN_SIDECAR
+        previous = json.loads(sidecar.read_text()) if sidecar.is_file() else {}
         replaces = params.get("replacesTools") or []
-        (_AGENTS_DIR / agent_id / "agent" / _TPLUGIN_SIDECAR).write_text(json.dumps({
+        staging_policy = {
+            "allow": ["read"],
+            "deny": ["exec", "sessions_spawn", "sessions_send"],
+            "fs": {"workspaceOnly": True},
+        }
+        _update_openclaw_config_for_subagent(
+            agent_id, "install", model, tools_policy=staging_policy)
+        pending_paths = [str(_AGENTS_DIR / agent_id / "agent" / "skills" / script)
+                         for script in scripts]
+        sidecar.write_text(json.dumps({
+            **previous,
+            "skills": {**previous.get("skills", {}), **skills},
+            "execPaths": sorted(set(previous.get("execPaths", [])) | set(pending_paths)),
+        }))
+        paths = _tplugin_apply_assets(agent_id, skills, scripts, previous)
+        policy["fs"] = {"workspaceOnly": True}
+        if scripts:
+            policy["exec"] = {"mode": "allowlist", "strictInlineEval": True}
+        sidecar.write_text(json.dumps({
             "tpluginId": str(params.get("tpluginId") or ""),
             "replacesTools": [t for t in replaces if isinstance(t, str)],
             "costNotice": str(params.get("costNotice") or "")[:200],
+            "skills": skills,
+            "execPaths": paths,
         }))
-        _update_openclaw_config_for_subagent(agent_id, "install", model)
         cfg = read_openclaw_json()
         agents_section = cfg.setdefault("agents", {})
         agents_list = _roster_load(agents_section)
@@ -25377,9 +25525,11 @@ def handle_uninstall_tplugin_agent(token: dict, params: dict) -> dict:
     if not _TPLUGIN_AGENT_ID_RE.match(agent_id):
         return {"status": "error", "result": {"error": "invalid_agentId"}}
     try:
-        (_AGENTS_DIR / agent_id / "agent" / _TPLUGIN_SIDECAR).unlink()
-    except OSError:
-        pass
+        sidecar = _AGENTS_DIR / agent_id / "agent" / _TPLUGIN_SIDECAR
+        previous = json.loads(sidecar.read_text()) if sidecar.is_file() else {}
+        _tplugin_apply_assets(agent_id, {}, [], previous)
+    except Exception:
+        return {"status": "error", "result": {"error": "tplugin_assets_cleanup_failed"}}
     res = handle_uninstall_subagent(token, {"agentId": agent_id})
     if res.get("status") == "done":
         try:
@@ -28786,44 +28936,117 @@ def run_oneshot() -> int:
         return 1
 
 
-def _drain_commands(token: dict) -> int:
-    """Procesa TODOS los commands pendientes de la cola una vez; devuelve cuántos.
-    Usado por el wake-drain oneshot (camino PRIMARIO) y por el poll-backstop del
-    daemon. Re-lanza HTTPError 401 para que el caller refresque el token."""
-    cmds = query_pending_commands(token)
-    for cmd in cmds:
-        _log(f"handling cmd {cmd['id']} type={cmd['type']}")
+# La baja elimina archivos, skills y permisos ya identificados. El instalador
+# tolera ausencias al repetir. Altas, hooks y llamadas externas requieren una
+# revisión propia antes de permitir que se repitan con resultado incierto.
+_REPLAYABLE_INTERRUPTED_COMMANDS = frozenset({"uninstall_tplugin_agent"})
+
+
+def _command_journal(token: dict) -> Path:
+    scope = json.dumps([PROJECT_ID, token["uid"], token["nodeId"]]).encode()
+    return OPENCLAW_DIR / f".tnode-config-sync-command-{hashlib.sha256(scope).hexdigest()}.json"
+
+
+def _write_command_journal(path: Path, record: dict) -> None:
+    # Los resultados pueden incluir datos de la operación. Escribir en un
+    # temporal privado y sustituir el registro completo antes de continuar.
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as f:
+        staged = Path(f.name)
         try:
-            update_command(token, cmd["id"], {"status": "running"})
-            outcome = handle_command(token, cmd)
-            patch = {
-                "status": outcome.get("status", "done"),
-                "result": outcome.get("result") or {},
-                "completedAt": int(time.time() * 1000),
+            json.dump(record, f, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+            os.replace(staged, path)
+        finally:
+            staged.unlink(missing_ok=True)
+
+
+def _command_outcome(token: dict, cmd: dict) -> dict:
+    _log(f"handling cmd {cmd['id']} type={cmd['type']}")
+    try:
+        return handle_command(token, cmd)
+    except urllib.error.HTTPError as error:
+        if error.code == 401:
+            raise  # el caller refresca el token; se conserva el registro
+        _log(f"cmd {cmd['id']} HTTP error: {error.code} {error.reason}")
+        return {"status": "error", "result": {"error": f"http_{error.code}"}}
+    except Exception as error:  # noqa: BLE001
+        _log(f"cmd {cmd['id']} error: {error}")
+        return {"status": "error", "result": {"error": str(error)[:500]}}
+
+
+def _process_command_record(token: dict, path: Path, record: dict, cmd: dict | None) -> bool:
+    """Solo se llama bajo el bloqueo de la cola. Devuelve si publicó un resultado."""
+    marker = {"configSyncAttempt": record["attempt"]}
+    phase = record["phase"]
+    if (
+        cmd and cmd["status"] == "pending" and phase == "claiming"
+        and cmd["updateTime"] == record["pendingUpdateTime"]
+    ):
+        updated = update_command(token, cmd, {"status": "running", "result": marker})
+        if updated is None:
+            # Otro escritor pudo ganar, o aterrizó el PATCH anterior. Releer
+            # en el siguiente drenado antes de quitar la marca del registro.
+            return False
+        cmd = {**cmd, "status": "running", "result": marker, "updateTime": updated}
+    if not cmd or cmd["status"] != "running" or cmd["result"] != marker:
+        path.unlink()
+        return False
+
+    if phase != "finished":
+        if phase == "started" and (record["replayed"] or cmd["type"] not in _REPLAYABLE_INTERRUPTED_COMMANDS):
+            outcome = {"status": "error", "result": {"error": "command_outcome_unknown", "retryable": False}}
+        else:
+            if phase == "started":
+                record["replayed"] = True
+                _log(f"cmd {cmd['id']} retry after interrupted config-sync")
+            record["phase"] = "started"
+            _write_command_journal(path, record)
+            outcome = _command_outcome(token, cmd)
+        record["phase"] = "finished"
+        record["patch"] = {
+            "status": outcome.get("status", "done"),
+            "result": outcome.get("result") or {},
+            "completedAt": int(time.time() * 1000),
+        }
+        _write_command_journal(path, record)
+
+    patch = record["patch"]
+    if update_command(token, cmd, patch) is None:
+        return False  # conservar el resultado hasta releer la versión del doc
+    path.unlink()
+    _log(f"cmd {cmd['id']} -> {patch['status']}")
+    return True
+
+
+def _drain_commands(token: dict) -> int:
+    """El daemon y el wake comparten un bloqueo local, liberado al salir o morir."""
+    lock_path = OPENCLAW_DIR / ".tnode-config-sync-commands.lock"
+    with lock_path.open("a") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+
+        path = _command_journal(token)
+        processed = 0
+        if path.exists():
+            record = json.loads(path.read_text(encoding="utf-8"))
+            cmd = _read_command(token, record["cmdId"])
+            processed += _process_command_record(token, path, record, cmd)
+            if path.exists():
+                return processed
+
+        for cmd in query_pending_commands(token):
+            record = {
+                "cmdId": cmd["id"], "attempt": py_secrets.token_hex(16),
+                "phase": "claiming", "pendingUpdateTime": cmd["updateTime"], "replayed": False,
             }
-            update_command(token, cmd["id"], patch)
-            _log(f"cmd {cmd['id']} -> {patch['status']}")
-        except urllib.error.HTTPError as e:
-            if e.code == 401:
-                raise  # caller refresca el token
-            _log(f"cmd {cmd['id']} HTTP error: {e.code} {e.reason}")
-            try:
-                update_command(token, cmd["id"], {
-                    "status": "error", "result": {"error": f"http_{e.code}"},
-                    "completedAt": int(time.time() * 1000),
-                })
-            except Exception:
-                pass
-        except Exception as e:  # noqa: BLE001
-            _log(f"cmd {cmd['id']} error: {e}")
-            try:
-                update_command(token, cmd["id"], {
-                    "status": "error", "result": {"error": str(e)[:500]},
-                    "completedAt": int(time.time() * 1000),
-                })
-            except Exception:
-                pass
-    return len(cmds)
+            _write_command_journal(path, record)
+            processed += _process_command_record(token, path, record, cmd)
+            if path.exists():
+                break
+        return processed
 
 
 def run_command_drain_oneshot() -> int:
