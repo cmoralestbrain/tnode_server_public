@@ -124,14 +124,14 @@ if command -v npm >/dev/null 2>&1; then
 fi
 unset _p
 
-TNODE_SETUP_VERSION="1.160.0"
+TNODE_SETUP_VERSION="1.161.0"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
 # even with a valid Ed25519 signature + master token, blocking cloud
 # provisioning E2E. Override with `OPENCLAW_PIN_VERSION=` (empty) to take
 # whatever is current.
-OPENCLAW_PIN_VERSION="${OPENCLAW_PIN_VERSION-2026.9.4}"
+OPENCLAW_PIN_VERSION="${OPENCLAW_PIN_VERSION-2026.11.7}"
 # Canal WhatsApp Personal (Baileys). El pin SIGUE al del core AUTOMATICAMENTE:
 # mismo release train, quitando el sufijo de republish npm del core (p.ej.
 # core "2026.7.1-2" → WA "2026.7.1"), que @openclaw/whatsapp no publica. Cada
@@ -18406,13 +18406,24 @@ from __future__ import annotations
 #          al escribir modelos (key, sub-agente, `agent.model.set`).
 # 2.21.0 — recuperación de commands interrumpidos con registro local y
 #          escrituras condicionadas a la versión observada en Firestore (#43).
-__VERSION__ = "2.21.0"
+# 2.22.0 — provisiona la credencial REST de Leonardo para el Diseñador.
+# 2.24.0 — OpenClaw 2026.11.5+ retira `heartbeat` (pasó a Automations) y la
+#          clave invalida el config (gateway 78/CONFIG). Con core >= 11.5 ya
+#          no se siembra `every: "0m"` en defaults, autor de flujos ni agentes
+#          A2A, y `_write_openclaw_json` quita el `0m` heredado antes de
+#          escribir. Un heartbeat distinto lo migra `doctor --fix` (skills#59).
+# 2.23.0 — el AGENTS.md del agente de un TPlugin lista las rutas absolutas
+#          exactas de sus ejecutables (las mismas del allowlist). Sin ellas el
+#          Diseñador exploraba el disco, el allowlist lo frenaba y el principal
+#          terminaba haciendo el trabajo (tnode_client#172).
+__VERSION__ = "2.24.0"
 
 import fcntl
 import hashlib
 import hmac
 import json
 import os
+import stat
 import platform
 import re
 import secrets as py_secrets
@@ -18754,7 +18765,9 @@ def update_command(token: dict, cmd: dict, patch: dict) -> str | None:
     name = f"projects/{PROJECT_ID}/databases/(default)/documents/{path}"
     body = {"writes": [{
         "update": {"name": name, **_fs_fields(patch)},
-        "updateMask": {"fieldPaths": list(patch)},
+        "updateMask": {"fieldPaths": [*patch, "params"] if (
+            cmd.get("type") == "set_rest_credential" and patch.get("status") in ("done", "error")
+        ) else list(patch)},
         "currentDocument": {"updateTime": cmd["updateTime"]},
     }]}
     headers = {"Authorization": f"Bearer {token['idToken']}"}
@@ -19194,7 +19207,7 @@ def push_openclaw_config(token: dict) -> dict:
         }
     # El servidor elige el nombre del comando de key según esta capacidad
     # (functions/src/model_block.ts → applyModelKeyCommandFor).
-    state["capabilities"] = [MODEL_KEY_V2_CAP, CRON_TZ_CAP, MODEL_SET_CAP, "tplugin-runtime-assets"]
+    state["capabilities"] = [MODEL_KEY_V2_CAP, CRON_TZ_CAP, MODEL_SET_CAP, "tplugin-runtime-assets", "leonardo-rest-credential"]
     if _skill_manager_has_store():
         state["capabilities"].append(SKILLS_CATALOG_CAP)
     write_state(token, state)
@@ -19599,9 +19612,17 @@ def _ensure_heartbeat_default() -> None:
     Se persiste APAGADO (`agents.defaults.heartbeat.every: "0m"`). Solo si la
     key está AUSENTE: un valor explícito (dueño o feature futura de
     proactividad) se respeta. Requiere restart del gateway para aplicar, que
-    en un nodo fresco ocurre naturalmente en el arranque."""
+    en un nodo fresco ocurre naturalmente en el arranque.
+
+    2.24.0: en OpenClaw >= 2026.11.5 la clave ya no existe; en vez de
+    sembrarla se retira el `0m` que dejaron versiones anteriores."""
     try:
         cfg = json.loads(OPENCLAW_JSON_PATH.read_text())
+        if _heartbeat_retired():
+            if _strip_retired_heartbeat(cfg):
+                _write_openclaw_json(cfg)
+                _log("heartbeat: retirado el 0m heredado (OpenClaw >= 2026.11.5)")
+            return
         hb = (
             cfg.setdefault("agents", {})
             .setdefault("defaults", {})
@@ -19684,7 +19705,11 @@ def _fill_model_inputs(cfg: dict) -> bool:
 
 
 def _write_openclaw_json(cfg: dict) -> None:
-    """Atomically write openclaw.json with the given config dict."""
+    """Atomically write openclaw.json with the given config dict.
+
+    En OpenClaw >= 2026.11.5 quita antes el heartbeat `0m` heredado: ningún
+    camino de escritura puede dejar un config que el gateway rechace."""
+    _strip_retired_heartbeat(cfg)
     tmp = OPENCLAW_JSON_PATH.with_suffix(".json.tmp")
     tmp.parent.mkdir(parents=True, exist_ok=True)
     with open(tmp, "w") as f:
@@ -20845,14 +20870,60 @@ def _openclaw_is_v2() -> bool:
                 [_bin, "--version"], capture_output=True, text=True,
                 timeout=20,
             ).stdout or ""
-            m = re.search(r"(\d{4})\.(\d+)\.", out)
+            m = re.search(r"(\d{4})\.(\d+)\.(\d+)", out)
             if m:
-                ver = (int(m.group(1)), int(m.group(2)))
+                ver = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
         except Exception:  # noqa: BLE001
             ver = ""
         _OC_VERSION_CACHE.append(ver)
     v = _OC_VERSION_CACHE[0]
     return bool(v) and v >= (2026, 8)
+
+
+def _openclaw_version() -> tuple:
+    """(año, mes, parche) del core instalado, o () si no se pudo leer."""
+    _openclaw_is_v2()  # llena el cache
+    v = _OC_VERSION_CACHE[0]
+    return v if isinstance(v, tuple) else ()
+
+
+def _heartbeat_retired() -> bool:
+    """2026.11.5+: el heartbeat pasó a Automations y las claves `heartbeat`
+    (incluido `every: "0m"`) invalidan el config: el gateway sale 78/CONFIG.
+    Tampoco existe ya el monitor implícito de 30 min, así que no hace falta
+    apagarlo. Si no se puede leer la versión, se asume el train viejo."""
+    v = _openclaw_version()
+    return bool(v) and v >= (2026, 11, 5)
+
+
+_HEARTBEAT_OFF = {"every": "0m"}
+
+
+def _strip_retired_heartbeat(cfg: dict) -> bool:
+    """Quita el `heartbeat: {every: "0m"}` que TNode sembró en versiones
+    viejas (defaults y cada agente del roster) cuando el core ya no lo acepta.
+    Solo borra ese valor exacto: un heartbeat distinto es del dueño y lo
+    migra `openclaw doctor --fix`. Devuelve True si cambió algo."""
+    if not _heartbeat_retired() or not isinstance(cfg, dict):
+        return False
+    agents = cfg.get("agents")
+    if not isinstance(agents, dict):
+        return False
+    changed = False
+    defaults = agents.get("defaults")
+    if isinstance(defaults, dict) and defaults.get("heartbeat") == _HEARTBEAT_OFF:
+        del defaults["heartbeat"]
+        changed = True
+    rosters = []
+    if isinstance(agents.get("entries"), dict):
+        rosters.extend(v for v in agents["entries"].values() if isinstance(v, dict))
+    if isinstance(agents.get("list"), list):
+        rosters.extend(v for v in agents["list"] if isinstance(v, dict))
+    for entry in rosters:
+        if entry.get("heartbeat") == _HEARTBEAT_OFF:
+            del entry["heartbeat"]
+            changed = True
+    return changed
 
 
 def _roster_load(agents_section: dict) -> list:
@@ -22845,8 +22916,9 @@ def _ensure_platform_agents() -> bool:
         "sandbox": {"mode": "off"},
         "tools": {"deny": list(_WF_AUTHOR_TOOLS_DENY)},
         "subagents": {"allowAgents": []},
-        "heartbeat": {"every": "0m"},
     }
+    if not _heartbeat_retired():
+        author_entry["heartbeat"] = dict(_HEARTBEAT_OFF)
     if author_model_ok:
         author_entry["model"] = {"primary": _WF_AUTHOR_MODEL}
     _ensure_entry(author_entry)
@@ -25420,7 +25492,7 @@ def _tplugins_block(agents_list: list) -> str:
         if cost:
             rows.append(
                 f"- `{aid}`: {tagline} **Cobra:** {cost}. ANTES de delegarle, pregúntale al dueño si "
-                "acepta el costo; si acepta, delega agregando al encargo «costo confirmado por el dueño». "
+                "acepta el costo; si acepta, delega el encargo. "
                 "Si no acepta, no delegues."
             )
         else:
@@ -25442,7 +25514,7 @@ def _tplugins_block(agents_list: list) -> str:
         "Un ID de generación ya existente se recupera sin crear un trabajo nuevo.",
         "",
         "Si el sub-agente responde con una propuesta y su costo, pregúntale al dueño. Si acepta, vuelve a "
-        "delegar el mismo encargo agregando «costo confirmado por el dueño». Muéstrale el resultado tal "
+        "delegar el mismo encargo. Muéstrale el resultado tal "
         "cual, con sus enlaces.",
     ])
 
@@ -25543,6 +25615,18 @@ def _tplugin_assets(params: dict):
     return names, scripts
 
 
+def _tplugin_exec_patterns(agent_id: str) -> set[str]:
+    snapshot = _run_openclaw("approvals", "get", "--json", stdout_limit=0)
+    try:
+        if not snapshot.get("ok"):
+            raise ValueError("approval snapshot failed")
+        agents = json.loads(snapshot["stdout"])["file"]["agents"]
+        agent = agents.get(agent_id, {})
+        return {entry["pattern"] for entry in agent.get("allowlist", [])}
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise RuntimeError("tplugin_exec_snapshot_failed") from None
+
+
 def _tplugin_apply_assets(agent_id: str, skills: dict, scripts: list, previous: dict):
     """Retryable installation. Agent exec stays denied until all assets are ready."""
     workspace = _AGENTS_DIR / agent_id / "agent"
@@ -25572,16 +25656,19 @@ def _tplugin_apply_assets(agent_id: str, skills: dict, scripts: list, previous: 
             raise ValueError("tplugin_script_outside_workspace")
         expected.chmod(expected.stat().st_mode | 0o100)
         paths.append(str(expected))
-    # Remove only permissions recorded by this TPlugin. CLI operations preserve
-    # other agents and are idempotent when the install command is retried.
-    for old in previous.get("execPaths", []):
-        if old not in paths:
-            result = _run_openclaw("approvals", "allowlist", "remove", "--agent", agent_id, old)
-            if not result.get("ok"):
-                raise RuntimeError("tplugin_exec_revoke_failed")
-    for script in paths:
-        result = _run_openclaw("approvals", "allowlist", "add", "--agent", agent_id, script)
-        if not result.get("ok"):
+    # The CLI can report a failure for an operation that did land. Verify
+    # persisted state before publishing a policy that permits execution.
+    previous_paths = set(previous.get("execPaths", []))
+    desired_paths = set(paths)
+    if previous_paths or desired_paths:
+        current_paths = _tplugin_exec_patterns(agent_id)
+        if current_paths - previous_paths - desired_paths:
+            raise RuntimeError("tplugin_exec_unexpected_approval")
+        for old in sorted(current_paths - desired_paths):
+            _run_openclaw("approvals", "allowlist", "remove", "--agent", agent_id, old)
+        for script in sorted(desired_paths - current_paths):
+            _run_openclaw("approvals", "allowlist", "add", "--agent", agent_id, script)
+        if current_paths != desired_paths and _tplugin_exec_patterns(agent_id) != desired_paths:
             raise RuntimeError("tplugin_exec_allow_failed")
     removed = set(previous.get("skills", {})) - set(skills)
     if removed:
@@ -25594,6 +25681,20 @@ def _tplugin_apply_assets(agent_id: str, skills: dict, scripts: list, previous: 
             if not result.get("ok"):
                 raise RuntimeError("tplugin_skill_uninstall_failed")
     return paths
+
+
+def _tplugin_exec_block(paths: list) -> str:
+    """Sección de AGENTS.md con las rutas que el allowlist del agente acepta."""
+    lines = "\n".join(f"- `{p}`" for p in paths)
+    return (
+        "## Ejecutables de este nodo\n\n"
+        "TNode generó esta lista al instalar. Son las únicas rutas que puedes "
+        "ejecutar: úsalas tal cual, con sus argumentos en la misma línea y sin "
+        "anteponer un intérprete. No busques otras rutas ni explores el disco.\n\n"
+        f"{lines}\n\n"
+        "Si una de estas rutas falla, devuelve al agente principal el comando y "
+        "el error exactos. No intentes otra vía.\n"
+    )
 
 
 def handle_install_tplugin_agent(token: dict, params: dict) -> dict:
@@ -25623,7 +25724,7 @@ def handle_install_tplugin_agent(token: dict, params: dict) -> dict:
         replaces = params.get("replacesTools") or []
         staging_policy = {
             "allow": ["read"],
-            "deny": ["exec", "sessions_spawn", "sessions_send"],
+            "deny": ["exec", "process", "sessions_spawn", "sessions_send"],
             "fs": {"workspaceOnly": True},
         }
         _update_openclaw_config_for_subagent(
@@ -25636,6 +25737,10 @@ def handle_install_tplugin_agent(token: dict, params: dict) -> dict:
             "execPaths": sorted(set(previous.get("execPaths", [])) | set(pending_paths)),
         }))
         paths = _tplugin_apply_assets(agent_id, skills, scripts, previous)
+        if paths:
+            (_AGENTS_DIR / agent_id / "agent" / "AGENTS.md").write_text(
+                files["AGENTS.md"].rstrip() + "\n\n" + _tplugin_exec_block(paths),
+                encoding="utf-8")
         policy["fs"] = {"workspaceOnly": True}
         if scripts:
             policy["exec"] = {"mode": "allowlist", "strictInlineEval": True}
@@ -27830,12 +27935,88 @@ _HANDLERS = {
 # tasks.* viven en tnode-chat-sync). Sin este filtro, el handler genérico
 # marcaba como `error: unknown_command_type` antes de que el daemon
 # dueño tuviera chance de procesarlos.
-_HANDLED_TYPES = tuple(sorted(_HANDLERS.keys()))
+_HANDLED_TYPES = tuple(sorted({*_HANDLERS, "set_rest_credential"}))
+
+
+_LEONARDO_CREDENTIAL_OPEN = """
+const { createDecipheriv, createHmac } = require("node:crypto");
+const { readFileSync } = require("node:fs");
+try {
+  const { envelope, nodeSecret, nodeId, commandId } = JSON.parse(readFileSync(0, "utf8"));
+  const purpose = "tnode:leonardo-rest-credential:v1";
+  const iv = Buffer.from(envelope.iv, "base64");
+  const tag = Buffer.from(envelope.tag, "base64");
+  const ciphertext = Buffer.from(envelope.ciphertext, "base64");
+  if (envelope.version !== 1 || iv.length !== 12 || tag.length !== 16 ||
+      ciphertext.length < 1 || ciphertext.length > 512) process.exit(1);
+  const key = createHmac("sha256", nodeSecret).update(purpose).digest();
+  const opener = createDecipheriv("aes-256-gcm", key, iv);
+  opener.setAAD(Buffer.from(JSON.stringify([purpose, nodeId, commandId])));
+  opener.setAuthTag(tag);
+  process.stdout.write(Buffer.concat([opener.update(ciphertext), opener.final()]));
+} catch (_) {
+  process.exitCode = 1;
+}
+"""
+
+
+def _write_leonardo_rest_credential(key: str) -> None:
+    directory = OPENCLAW_DIR / "credentials"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise ValueError("Invalid credentials directory")
+    target = directory / "leonardo-rest.json"
+    try:
+        current = target.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid():
+            raise ValueError("Invalid credentials file")
+    staged_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, delete=False) as staged:
+            staged_path = Path(staged.name)
+            os.fchmod(staged.fileno(), 0o600)
+            json.dump({"apiKey": key}, staged)
+            staged.flush()
+            os.fsync(staged.fileno())
+        os.replace(staged_path, target)
+    finally:
+        if staged_path is not None:
+            staged_path.unlink(missing_ok=True)
+
+
+def _handle_leonardo_rest_credential(token: dict, cmd: dict) -> dict:
+    try:
+        cfg = load_config()
+        if cfg["nodeId"] != token["nodeId"]:
+            raise ValueError("Node mismatch")
+        opened = subprocess.run(
+            ["node", "-e", _LEONARDO_CREDENTIAL_OPEN],
+            input=json.dumps({
+                "envelope": cmd["params"], "nodeSecret": cfg["nodeSecret"],
+                "nodeId": token["nodeId"], "commandId": cmd["id"],
+            }),
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=True,
+        )
+        if not re.fullmatch(r"[!-~]{1,512}", opened.stdout):
+            raise ValueError("Invalid REST credential")
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return {"status": "error", "result": {"error": "credential_unreadable"}}
+    try:
+        _write_leonardo_rest_credential(opened.stdout)
+    except (OSError, ValueError):
+        return {"status": "error", "result": {"error": "credential_write_failed"}}
+    return {"status": "done", "result": {}}
 
 
 def handle_command(token: dict, cmd: dict) -> dict:
     cmd_type = cmd.get("type") or ""
     params = cmd.get("params") or {}
+    if cmd_type == "set_rest_credential":
+        return _handle_leonardo_rest_credential(token, cmd)
     handler = _HANDLERS.get(cmd_type)
     if handler is None:
         return {
@@ -28464,8 +28645,9 @@ def _ensure_a2a_agent(agent_id: str, name: str, description: str) -> bool:
         "sandbox": {"mode": "off"},
         "tools": _client_tools_policy(cfg, agent_id),
         "subagents": {"allowAgents": []},
-        "heartbeat": {"every": "0m"},
     }
+    if not _heartbeat_retired():
+        desired["heartbeat"] = dict(_HEARTBEAT_OFF)
     idx = next((i for i, a in enumerate(agents_list)
                 if isinstance(a, dict) and a.get("id") == agent_id), None)
     changed = False
@@ -28474,7 +28656,7 @@ def _ensure_a2a_agent(agent_id: str, name: str, description: str) -> bool:
         changed = True
     else:
         cur = agents_list[idx]
-        for k in ("name", "workspace", "agentDir", "sandbox", "tools", "subagents", "heartbeat"):
+        for k in desired:
             if cur.get(k) != desired[k]:
                 cur[k] = desired[k]
                 changed = True
@@ -29094,7 +29276,7 @@ def run_oneshot() -> int:
 # La baja elimina archivos, skills y permisos ya identificados. El instalador
 # tolera ausencias al repetir. Altas, hooks y llamadas externas requieren una
 # revisión propia antes de permitir que se repitan con resultado incierto.
-_REPLAYABLE_INTERRUPTED_COMMANDS = frozenset({"uninstall_tplugin_agent"})
+_REPLAYABLE_INTERRUPTED_COMMANDS = frozenset({"uninstall_tplugin_agent", "set_rest_credential"})
 
 
 def _command_journal(token: dict) -> Path:
@@ -38909,15 +39091,103 @@ phase_components_manifest() {
 # Refresh the openclaw npm package + restart the user-level gateway service
 # without touching tunnel.json or openclaw.json (auth token + provider config
 # are preserved). Idempotent. Linux-only (this is the VPS installer).
+# tnode_server#120: desde OpenClaw 2026.11.5 el config de un core anterior
+# puede ser inválido para el nuevo (p. ej. `heartbeat` retirado → el gateway
+# sale 78/CONFIG). Antes del primer arranque del binario nuevo corre
+# `openclaw doctor --fix` con el gateway y los daemons que escriben
+# openclaw.json parados; si no, config-sync re-escribe la clave vieja en
+# segundos y el siguiente reinicio vuelve a morir.
+_TNODE_WRITER_UNITS=(tnode-config-sync-watch.path tnode-config-sync-wake.path tnode-config-sync tnode-chat-sync tnode-telemetry)
+_TNODE_WRITER_LABELS=(com.tbrain.tnode-config-sync-watch com.tbrain.tnode-config-sync com.tbrain.tnode-chat-sync com.tbrain.tnode-telemetry)
+TNODE_WRITERS_PAUSED=()
+
+pause_tnode_writers() {
+    TNODE_WRITERS_PAUSED=()
+    local u plist
+    case "$OS" in
+        Linux)
+            for u in "${_TNODE_WRITER_UNITS[@]}"; do
+                if systemctl is-active --quiet "$u" 2>/dev/null; then
+                    systemctl stop "$u" 2>/dev/null || true
+                    TNODE_WRITERS_PAUSED+=("$u")
+                fi
+            done
+            ;;
+        Darwin)
+            for u in "${_TNODE_WRITER_LABELS[@]}"; do
+                plist="$HOME/Library/LaunchAgents/$u.plist"
+                if [[ -f "$plist" ]] && launchctl list "$u" >/dev/null 2>&1; then
+                    launchctl unload "$plist" 2>/dev/null || true
+                    TNODE_WRITERS_PAUSED+=("$u")
+                fi
+            done
+            ;;
+    esac
+    [[ ${#TNODE_WRITERS_PAUSED[@]} -gt 0 ]] && info "Daemons pausados para el bump: ${TNODE_WRITERS_PAUSED[*]}"
+    return 0
+}
+
+# Reanuda en orden inverso: primero los servicios, al final los .path.
+resume_tnode_writers() {
+    local i u
+    for (( i=${#TNODE_WRITERS_PAUSED[@]}-1; i>=0; i-- )); do
+        u="${TNODE_WRITERS_PAUSED[$i]}"
+        case "$OS" in
+            Linux)  systemctl start "$u" 2>/dev/null || warn "no arrancó $u — revisar systemctl status $u" ;;
+            Darwin) launchctl load "$HOME/Library/LaunchAgents/$u.plist" 2>/dev/null || warn "no cargó $u" ;;
+        esac
+    done
+    TNODE_WRITERS_PAUSED=()
+    return 0
+}
+
+stop_openclaw_gateway() {
+    local tnode_uid
+    tnode_uid="$(id -u "$TNODE_USER" 2>/dev/null || echo "")"
+    case "$OS" in
+        Darwin)
+            run_as_tnode openclaw gateway stop </dev/null >/dev/null 2>&1 || true
+            ;;
+        Linux)
+            if [[ "$(id -u)" == "0" ]] && [[ -n "$tnode_uid" ]]; then
+                su - "$TNODE_USER" -c "export XDG_RUNTIME_DIR=/run/user/$tnode_uid; systemctl --user stop openclaw-gateway" 2>/dev/null || true
+            else
+                systemctl --user stop openclaw-gateway 2>/dev/null || true
+            fi
+            ;;
+    esac
+}
+
 update_openclaw_gateway_only() {
     if ! command_exists npm; then
         die "openclaw-gateway: npm requerido"
     fi
     local npm_target="openclaw"
     [[ -n "$OPENCLAW_PIN_VERSION" ]] && npm_target="openclaw@$OPENCLAW_PIN_VERSION"
-    run_with_progress "Actualizando openclaw kernel ($npm_target)" --estimate 30 npm install -g "$npm_target"
+
+    # config-sync embebido ANTES del kernel: debe saber escribir el config
+    # del core nuevo (skills#59) en cuanto vuelva a arrancar.
+    if [[ -f "$OPENCLAW_HOME/scripts/tnode_config_sync.py" ]]; then
+        install_tnode_config_sync
+    fi
+
+    pause_tnode_writers
+    stop_openclaw_gateway
+    if ! run_with_progress "Actualizando openclaw kernel ($npm_target)" --estimate 30 npm install -g "$npm_target"; then
+        restart_openclaw_gateway_and_wait
+        resume_tnode_writers
+        die "openclaw-gateway: npm install -g $npm_target falló (el binario anterior sigue instalado)"
+    fi
+
+    # Migra el config al schema del core nuevo antes de arrancarlo. Con 1 vCPU
+    # tarda ~5 min (también actualiza los plugins oficiales, p. ej. WhatsApp).
+    if ! run_with_progress "Migrando config al kernel nuevo (doctor --fix)" --estimate 300 \
+            run_as_tnode bash -c "cd \"$OPENCLAW_HOME/..\" && openclaw doctor --fix --non-interactive </dev/null"; then
+        warn "openclaw doctor --fix falló: el gateway puede no arrancar (revisar 'openclaw doctor' a mano)"
+    fi
 
     restart_openclaw_gateway_and_wait
+    resume_tnode_writers
     success "openclaw-gateway refreshed"
     # WA DESPUES del restart real: el CLI del kernel nuevo rehusa tocar el
     # state ("another Gateway owns that state directory") mientras el gateway
@@ -38972,11 +39242,13 @@ restart_openclaw_gateway_and_wait() {
 reinstall_whatsapp_if_stale() {
     [[ -z "${OPENCLAW_WA_PLUGIN_VERSION:-}" ]] && return 0
     local pkg installed=""
-    for pkg in "$OPENCLAW_HOME"/npm/projects/openclaw-whatsapp-*/node_modules/@openclaw/whatsapp/package.json; do
-        [[ -f "$pkg" ]] || continue
+    # 11.x deja el plugin en `<proyecto>__openclaw-generation__g-*` y puede
+    # conservar el proyecto viejo al lado: manda el package.json mas reciente,
+    # no el primero del glob (tnode_server#124).
+    pkg="$(ls -t "$OPENCLAW_HOME"/npm/projects/openclaw-whatsapp-*/node_modules/@openclaw/whatsapp/package.json 2>/dev/null | head -1 || true)"
+    if [[ -n "$pkg" && -f "$pkg" ]]; then
         installed="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('version',''))" "$pkg" 2>/dev/null || true)"
-        break
-    done
+    fi
     [[ -z "$installed" ]] && return 0   # WA no instalado en este nodo: nada que hacer
     [[ "$installed" == "$OPENCLAW_WA_PLUGIN_VERSION" ]] && { info "WhatsApp plugin ya en $installed"; return 0; }
     info "WhatsApp plugin $installed != pin $OPENCLAW_WA_PLUGIN_VERSION — reinstalando (--force)"
