@@ -103,7 +103,7 @@ if command -v npm >/dev/null 2>&1; then
 fi
 unset _p
 
-TNODE_SETUP_VERSION="1.161.0"
+TNODE_SETUP_VERSION="1.161.1"
 CLOUD_MODEL="kimi-k2.5:cloud"
 # Pin OpenClaw to the last known-good release. v2026.4.25 introduced an
 # auto-pair regression where the gateway responds 1008 to unknown devices
@@ -1565,6 +1565,22 @@ _oc_accept_caps_flag() {
         fi
     fi
     printf '%s' "$_OC_ACCEPT_CAPS_FLAG"
+}
+# OpenClaw >= 2026.11.5 instala `<paquete>` desde ClawHub por defecto y `--pin`
+# solo vale para npm: hay que pedir `npm:<paquete>` (tnode_server#127). El CLI
+# 2026.9.x no necesita el prefijo; probe unico y cacheado de la version instalada.
+_OC_WA_NPM_PREFIX=""
+_oc_wa_spec_probed=0
+_oc_wa_spec() {
+    if [[ "$_oc_wa_spec_probed" == "0" ]]; then
+        _oc_wa_spec_probed=1
+        local v
+        v="$(run_as_tnode openclaw --version </dev/null 2>/dev/null | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+' | head -1 || true)"
+        if [[ -n "$v" ]] && python3 -c "import sys; sys.exit(0 if tuple(map(int, sys.argv[1].split('.'))) >= (2026, 11, 5) else 1)" "$v" 2>/dev/null; then
+            _OC_WA_NPM_PREFIX="npm:"
+        fi
+    fi
+    printf '%s@openclaw/whatsapp@%s' "$_OC_WA_NPM_PREFIX" "$1"
 }
 # El exit code del CLI NO es la verdad: en el fire-test #4 (2026-09-02) los
 # enables fallaron EN SILENCIO durante la provision (sospecha: lock SQLite del
@@ -11701,7 +11717,7 @@ install_whatsapp_plugin() {
 
     if compgen -G "$projects_dir/openclaw-whatsapp-*" >/dev/null 2>&1; then
         info "Canal WhatsApp ya presente (snapshot); re-habilitando"
-    elif ! run_as_tnode openclaw plugins install "$wa_pkg@$wa_ver" --pin $(_oc_accept_caps_flag) </dev/null; then
+    elif ! run_as_tnode openclaw plugins install "$(_oc_wa_spec "$wa_ver")" --pin $(_oc_accept_caps_flag) </dev/null; then
         warn "WhatsApp: openclaw plugins install $wa_pkg@$wa_ver falló"
         return 1
     fi
@@ -39143,7 +39159,7 @@ reinstall_whatsapp_if_stale() {
     [[ -z "$installed" ]] && return 0   # WA no instalado en este nodo: nada que hacer
     [[ "$installed" == "$OPENCLAW_WA_PLUGIN_VERSION" ]] && { info "WhatsApp plugin ya en $installed"; return 0; }
     info "WhatsApp plugin $installed != pin $OPENCLAW_WA_PLUGIN_VERSION — reinstalando (--force)"
-    if run_as_tnode bash -c "cd \"$OPENCLAW_HOME/..\" && openclaw plugins install @openclaw/whatsapp@$OPENCLAW_WA_PLUGIN_VERSION --pin --force $(_oc_accept_caps_flag)" </dev/null; then
+    if run_as_tnode bash -c "cd \"$OPENCLAW_HOME/..\" && openclaw plugins install $(_oc_wa_spec "$OPENCLAW_WA_PLUGIN_VERSION") --pin --force $(_oc_accept_caps_flag)" </dev/null; then
         enable_plugin whatsapp || warn "WhatsApp: enable tras reinstalar fallo"
         WA_REINSTALLED=1
         success "WhatsApp plugin @$OPENCLAW_WA_PLUGIN_VERSION reinstalado"
